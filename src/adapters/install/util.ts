@@ -3,9 +3,11 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   renameSync,
+  rmdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -165,23 +167,40 @@ export function renderDiff(
   return out.join("\n");
 }
 
-/** Applies file changes, backing up every existing file under `backupDir` first. */
-export function applyChanges(changes: FileChange[], backupDir: string, home: string): string[] {
-  const done: string[] = [];
+export interface Applied {
+  path: string;
+  action: "wrote" | "created" | "removed" | "linked" | "unlinked";
+}
+
+/**
+ * Applies file changes, backing up every existing file under `backupDir` first. Directories
+ * left empty by a removal are removed too, up to (not including) any of `stopDirs`.
+ */
+export function applyChanges(
+  changes: FileChange[],
+  backupDir: string,
+  home: string,
+  stopDirs: string[] = [],
+): Applied[] {
+  const done: Applied[] = [];
   for (const change of changes) {
     if (change.symlink) {
       if (change.after === null) {
-        if (isSymlinkTo(change.path, change.before)) rmSync(change.path, { force: true });
+        if (isSymlinkTo(change.path, change.before)) {
+          rmSync(change.path, { force: true });
+          done.push({ path: change.path, action: "unlinked" });
+        }
       } else {
         mkdirSync(dirname(change.path), { recursive: true });
         rmSync(change.path, { force: true });
         symlinkSync(change.after, change.path);
+        done.push({ path: change.path, action: "linked" });
       }
-      done.push(change.path);
       continue;
     }
     if (change.before === change.after) continue;
-    if (existsSync(change.path)) {
+    const existed = existsSync(change.path);
+    if (existed) {
       const rel = relative(home, change.path);
       const backup = join(backupDir, rel.startsWith("..") ? change.path.replace(/^\//, "") : rel);
       mkdirSync(dirname(backup), { recursive: true, mode: 0o700 });
@@ -189,15 +208,30 @@ export function applyChanges(changes: FileChange[], backupDir: string, home: str
     }
     if (change.after === null) {
       rmSync(change.path, { force: true });
+      pruneEmptyDirs(dirname(change.path), [home, ...stopDirs]);
+      done.push({ path: change.path, action: "removed" });
     } else {
       mkdirSync(dirname(change.path), { recursive: true });
       const tmp = `${change.path}.agentlink-tmp`;
       writeFileSync(tmp, change.after, { mode: change.mode ?? 0o644 });
       renameSync(tmp, change.path);
+      done.push({ path: change.path, action: existed ? "wrote" : "created" });
     }
-    done.push(change.path);
   }
   return done;
+}
+
+function pruneEmptyDirs(dir: string, stops: string[]): void {
+  let current = dir;
+  while (!stops.includes(current) && current !== dirname(current)) {
+    try {
+      if (readdirSync(current).length > 0) return;
+      rmdirSync(current);
+    } catch {
+      return;
+    }
+    current = dirname(current);
+  }
 }
 
 export function isSymlinkTo(path: string, target: string | null): boolean {

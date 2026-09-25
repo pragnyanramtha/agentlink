@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "../core/quiet-warnings.ts";
 import { resolvePaths } from "../core/paths.ts";
+import { closest } from "../core/suggest.ts";
 import { VERSION } from "../version.ts";
 import type { CliContext, Command } from "./args.ts";
 import { commandHelp, OVERVIEW, wantsHelp } from "./help.ts";
@@ -22,6 +23,7 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   name: async () => (await import("./commands/agents.ts")).name,
   doing: async () => (await import("./commands/agents.ts")).doing,
   register: async () => (await import("./commands/agents.ts")).register,
+  unregister: async () => (await import("./commands/agents.ts")).unregister,
   claim: async () => (await import("./commands/agents.ts")).claim,
   release: async () => (await import("./commands/agents.ts")).release,
   claims: async () => (await import("./commands/agents.ts")).claims,
@@ -41,26 +43,6 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   team: async () => (await import("./commands/team.ts")).team,
   relay: async () => (await import("./commands/team.ts")).relay,
 };
-
-function editDistance(a: string, b: string): number {
-  const dp = Array.from({ length: a.length + 1 }, (_, i) => [
-    i,
-    ...new Array<number>(b.length).fill(0),
-  ]);
-  for (let j = 1; j <= b.length; j++) (dp[0] as number[])[j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      const row = dp[i] as number[];
-      const prev = dp[i - 1] as number[];
-      row[j] = Math.min(
-        (prev[j] ?? 0) + 1,
-        (row[j - 1] ?? 0) + 1,
-        (prev[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1),
-      );
-    }
-  }
-  return (dp[a.length] as number[])[b.length] ?? 99;
-}
 
 /** Pulls global flags out of argv (anywhere on the line). */
 function extractGlobals(argv: string[]): {
@@ -116,7 +98,7 @@ async function main(argv: string[]): Promise<number> {
     process.stdout.write(`${text}\n`);
     return 0;
   }
-  if (command === "version" || command === "--version" || command === "-v") {
+  if (command === "version" || command === "--version" || command === "-v" || command === "-V") {
     process.stdout.write(`${VERSION}\n`);
     return 0;
   }
@@ -134,10 +116,7 @@ async function main(argv: string[]): Promise<number> {
   }
   const load = COMMANDS[command];
   if (!load) {
-    const guess = [...Object.keys(COMMANDS), "mcp", "help", "version"]
-      .map((c) => ({ c, d: editDistance(c, command) }))
-      .filter((x) => x.d <= 2)
-      .sort((a, b) => a.d - b.d)[0]?.c;
+    const guess = closest(command, [...Object.keys(COMMANDS), "mcp", "help", "version"]);
     process.stderr.write(
       `agentlink: unknown command "${command}"${guess ? ` (did you mean "${guess}"?)` : ""}\nRun "agentlink --help" for the list.\n`,
     );

@@ -127,6 +127,46 @@ describe("team relay", () => {
     expect(receipt).toBeTruthy();
   });
 
+  it("suggests the right teammate agent and stops waiting when delivery fails", async () => {
+    const typo = await alice.raw(
+      "POST",
+      "/v1/messages",
+      { to: ["bob/codex-ap"], text: "hi" },
+      { as: "claude-web" },
+    );
+    expect(typo.status).toBe(404);
+    expect(JSON.stringify(typo.data)).toContain("codex-api");
+    const started = Date.now();
+    const asking = alice
+      .client("claude-web")
+      .request<SendRes & { failed?: { state: string }[] }>(
+        "POST",
+        "/v1/messages",
+        { to: [bobAgentName], kind: "ask", text: "are you there?", waitMs: 20_000 },
+        { timeoutMs: 25_000 },
+      );
+    // bob's daemon reports the delivery failed (e.g. the agent vanished)
+    const id = await until(async () => {
+      const log = await alice
+        .client()
+        .request<{ messages: { message: { id: string; preview: string } }[] }>(
+          "GET",
+          "/v1/log?limit=5",
+        );
+      return log.messages.find((m) => m.message.preview === "are you there?")?.message.id;
+    });
+    alice.daemon.services.mailbox.applyReceipt("bob", {
+      messageId: id as string,
+      to: bobAgentName,
+      state: "failed",
+      note: "no agent named codex-api",
+    });
+    const res = await asking;
+    expect(res.reply).toBeUndefined();
+    expect(res.failed?.[0]?.state).toBe("failed");
+    expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
   it("refuses to send likely secrets to teammates unless forced", async () => {
     const res = await alice.raw(
       "POST",

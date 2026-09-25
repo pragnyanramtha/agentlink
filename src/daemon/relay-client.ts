@@ -80,6 +80,8 @@ export class RelayClient {
   #mode: Mode;
   #onWelcome: ((error?: Error) => void) | undefined;
   onInbound?: (msg: Inbound) => void;
+  /** The relay accepted a frame carrying `messageId` for `handle`. */
+  onSent?: (messageId: string, handle: string) => void;
   onRoster?: () => void;
   presenceSource?: () => Omit<RemoteAgent, "member" | "deviceId" | "at">[];
 
@@ -297,10 +299,16 @@ export class RelayClient {
       case "ok":
         this.#waiters.get(`op:${frame.op}`)?.(frame);
         return;
-      case "sent":
+      case "sent": {
+        const row = this.#ctx.store.get<{ message_id: string | null; handle: string | null }>(
+          "SELECT message_id, handle FROM outbox WHERE id = ?",
+          frame.id,
+        );
         this.#ctx.store.run("DELETE FROM outbox WHERE id = ?", frame.id);
+        if (row?.message_id && row.handle) this.onSent?.(row.message_id, row.handle);
         this.#waiters.get(frame.id)?.(frame);
         return;
+      }
       default:
         return;
     }
@@ -401,16 +409,20 @@ export class RelayClient {
     this.#ws?.send(JSON.stringify({ t: "ack", ids: [id] }));
   }
 
-  #frame(frame: Record<string, unknown> & { id: string }): void {
-    if (this.#ready && this.#ws?.readyState === WebSocket.OPEN) {
-      this.#ws.send(JSON.stringify(frame));
-    }
+  #frame(
+    frame: Record<string, unknown> & { id: string },
+    meta?: { messageId: string; handle: string },
+  ): void {
     this.#ctx.store.run(
-      "INSERT OR REPLACE INTO outbox (id, frame, created_at) VALUES (?, ?, ?)",
+      "INSERT OR REPLACE INTO outbox (id, frame, created_at, message_id, handle) VALUES (?, ?, ?, ?, ?)",
       frame.id,
       JSON.stringify(frame),
       new Date().toISOString(),
+      meta?.messageId ?? null,
+      meta?.handle ?? null,
     );
+    if (this.#ready && this.#ws?.readyState === WebSocket.OPEN)
+      this.#ws.send(JSON.stringify(frame));
   }
 
   #flushOutbox(): void {
@@ -431,9 +443,16 @@ export class RelayClient {
     const targets = this.members().filter((m) => m.handle === handle && !m.self);
     const sig = signJson(this.#keys, payload);
     const body = Buffer.from(JSON.stringify({ ...payload, sig }));
+    const messageId =
+      payload.kind === "envelope"
+        ? String((payload.envelope as { messageId?: string }).messageId ?? "")
+        : "";
     for (const m of targets) {
       const blob = seal(m.boxPub, body, aad(this.#team.teamId, this.#keys.deviceId, m.deviceId));
-      this.#frame({ t: "send", id: ulid(), to: m.deviceId, blob });
+      this.#frame(
+        { t: "send", id: ulid(), to: m.deviceId, blob },
+        messageId ? { messageId, handle } : undefined,
+      );
     }
     return targets.length;
   }

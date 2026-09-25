@@ -21,14 +21,14 @@ const RECEIPT_STATES = new Set([
   "failed",
 ]);
 const RANK: Record<string, number> = {
-  delivered: 2,
   held: 2,
-  seen: 3,
-  acked: 4,
-  replied: 5,
-  refused: 5,
-  expired: 5,
-  failed: 5,
+  delivered: 3,
+  seen: 4,
+  acked: 5,
+  replied: 6,
+  refused: 6,
+  expired: 6,
+  failed: 6,
 };
 
 /** Owns the team membership and the relay connection, and plugs them into the mailbox. */
@@ -72,10 +72,13 @@ export class TeamManager {
     this.#client?.stop();
     const client = new RelayClient(this.#ctx, team, deviceKeys(this.#ctx.paths), mode);
     client.onInbound = (msg) => this.#inbound(msg);
+    client.onSent = (messageId, handle) => this.#mailbox.markRelaySent(messageId, handle);
+    // Recently offline agents are listed too, so teammates can still queue mail for them.
     client.presenceSource = () =>
       this.#registry
-        .list()
-        .filter(isLive)
+        .list({ includeOffline: true })
+        .filter((a) => isLive(a) || Date.now() - Date.parse(a.last_seen_at) < 7 * 24 * 3600_000)
+        .slice(0, 100)
         .map((a) => ({
           name: a.name,
           tool: a.tool,
@@ -130,15 +133,23 @@ export class TeamManager {
       "SELECT d.*, m.trust AS m_trust, m.from_addr AS m_from FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.id = ?",
       deliveryId,
     );
-    if (!d || d.m_trust !== "teammate" || !RECEIPT_STATES.has(d.state)) return;
+    if (!d || d.m_trust !== "teammate") return;
+    // A message released from hold (approved) is reported as delivered.
+    const state = d.state === "queued" && d.decided_by ? "delivered" : d.state;
     const last = this.#sentReceipts.get(deliveryId);
-    if (last && (RANK[last] ?? 0) >= (RANK[d.state] ?? 0)) return;
+    if (state === "delivered" ? last !== "held" : !RECEIPT_STATES.has(state)) return;
+    if (last && (RANK[last] ?? 0) >= (RANK[state] ?? 0)) return;
     const handle = remoteHandleOf(d.m_from);
     if (!handle) return;
-    this.#sentReceipts.set(deliveryId, d.state);
+    this.#sentReceipts.set(deliveryId, state);
     const me = this.#client.team.handle;
     const to = d.to_addr.startsWith("@") ? `@${me}` : `${me}/${d.to_addr}`;
-    this.#mailbox.remote?.receipt(handle, { messageId: d.message_id, to, state: d.state });
+    this.#mailbox.remote?.receipt(handle, {
+      messageId: d.message_id,
+      to,
+      state,
+      ...(state === "delivered" ? { note: `approved by ${me}` } : {}),
+    });
   }
 
   status(): Record<string, unknown> {
@@ -199,7 +210,12 @@ export class TeamManager {
 
   async join(inviteText: string, handle?: string): Promise<Record<string, unknown>> {
     if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
-    const invite = decodeInvite(inviteText);
+    let invite: ReturnType<typeof decodeInvite>;
+    try {
+      invite = decodeInvite(inviteText);
+    } catch {
+      throw invalid("that invite is incomplete or damaged; copy the whole al1.… string again");
+    }
     // Handles must be unique per device; joining your own team from a second machine gets
     // "<you>-<hostname>" unless you pick a name.
     const base = slugify(this.#ctx.config.handle, 24);

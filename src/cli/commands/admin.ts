@@ -3,6 +3,7 @@ import { createInterface } from "node:readline/promises";
 import { loadConfig, saveConfig } from "../../core/config.ts";
 import { KINDS } from "../../core/envelope.ts";
 import { POLICY_ACTIONS } from "../../core/policy.ts";
+import { didYouMean } from "../../core/suggest.ts";
 import { type Command, out, parse, UsageError } from "../args.ts";
 import { ApiError, type Health } from "../client.ts";
 import { c, indent, table } from "../format.ts";
@@ -98,7 +99,9 @@ export const daemon: Command = async (ctx) => {
       return 0;
     }
     default:
-      throw new UsageError("usage: agentlink daemon start|stop|restart|status|logs [-f]");
+      throw new UsageError(
+        `unknown daemon command "${sub}"${didYouMean(sub, ["start", "stop", "restart", "status", "logs"])}; use start|stop|restart|status|logs`,
+      );
   }
 };
 
@@ -157,7 +160,7 @@ export const policy: Command = async (ctx) => {
     return 0;
   }
   throw new UsageError(
-    "usage: agentlink policy [list] | set <scope> <kind>=<action> | reset <scope> <kind>",
+    `unknown policy command "${sub}"${didYouMean(sub, ["list", "set", "reset"])}; use: agentlink policy [list] | set <scope> <kind>=<action> | reset <scope> <kind>`,
   );
 };
 
@@ -198,8 +201,19 @@ async function decide(ctx: Parameters<Command>[0], decision: "approve" | "deny")
   await ctx.client.ensureDaemon();
   if (!values.yes) {
     const held = await ctx.client.request<{ items: HeldItem[] }>("GET", "/v1/approvals");
-    const item = held.items.find((i) => String(i.delivery.id) === id);
-    if (!item) throw new UsageError(`no held message #${id} (see: agentlink approvals)`);
+    const key = id.replace(/^#/, "").toUpperCase();
+    const matches = held.items.filter(
+      (i) => String(i.delivery.id) === key || i.message.id.startsWith(key),
+    );
+    if (matches.length === 0) {
+      throw new UsageError(`nothing held matches "${id}" (see: agentlink approvals)`);
+    }
+    if (matches.length > 1) {
+      throw new UsageError(
+        `"${id}" matches several held messages; use a number: ${matches.map((i) => `#${i.delivery.id}`).join(", ")}`,
+      );
+    }
+    const item = matches[0] as HeldItem;
     process.stdout.write(
       `${c.bold(item.message.kind)} from ${item.message.from} to ${item.delivery.to}:\n${indent(item.text)}\n`,
     );
@@ -211,7 +225,9 @@ async function decide(ctx: Parameters<Command>[0], decision: "approve" | "deny")
       return 1;
     }
   }
-  await ctx.client.request("POST", `/v1/approvals/${encodeURIComponent(id)}`, { decision });
+  await ctx.client.request("POST", `/v1/approvals/${encodeURIComponent(id.replace(/^#/, ""))}`, {
+    decision,
+  });
   process.stdout.write(
     `${c.green("✓")} ${decision === "approve" ? "approved; delivering" : "denied"} #${id}\n`,
   );

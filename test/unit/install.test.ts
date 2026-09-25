@@ -111,6 +111,16 @@ describe("install planning", () => {
       "hook copilot post-tool",
     );
     expect(read(".agentlink/bin/agentlink")).toContain("/opt/agentlink/dist/cli/index.js");
+    // the launcher keeps using the home it was installed for, unless AGENTLINK_HOME is set
+    const launcherHome = execFileSync(
+      "sh",
+      [
+        "-c",
+        `${read(".agentlink/bin/agentlink").split("\n").slice(2, 4).join("\n")}\necho "$AGENTLINK_HOME"`,
+      ],
+      { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } },
+    ).trim();
+    expect(launcherHome).toBe(join(home, ".agentlink"));
 
     // second run changes nothing
     const again = new VirtualFs();

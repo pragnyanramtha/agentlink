@@ -27,6 +27,12 @@ export function ago(iso: string | null | undefined, now = Date.now()): string {
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[\\d+m`, "g");
 const visible = (s: string) => s.replace(ANSI, "");
 
+function fit(cell: string, width: number): string {
+  const plain = visible(cell);
+  return plain.length <= width ? cell : `${plain.slice(0, Math.max(1, width - 1))}…`;
+}
+
+/** Column-aligned table; on a terminal, the widest columns shrink so rows don't wrap. */
 export function table(rows: string[][], header?: string[]): string {
   const all = header ? [header.map((h) => c.dim(h)), ...rows] : rows;
   const widths: number[] = [];
@@ -35,12 +41,27 @@ export function table(rows: string[][], header?: string[]): string {
       widths[i] = Math.max(widths[i] ?? 0, visible(cell).length);
     });
   }
+  const columns = process.stdout.isTTY ? process.stdout.columns : undefined;
+  if (columns) {
+    const total = () => widths.reduce((a, b) => a + b, 0) + 2 * (widths.length - 1);
+    while (total() > columns) {
+      let widest = -1;
+      widths.forEach((w, i) => {
+        if (i > 0 && w > 8 && (widest < 0 || w > (widths[widest] ?? 0))) widest = i;
+      });
+      if (widest < 0) break;
+      widths[widest] = (widths[widest] ?? 0) - 1;
+    }
+  }
   return all
     .map((row) =>
       row
-        .map((cell, i) =>
-          i === row.length - 1 ? cell : cell + " ".repeat((widths[i] ?? 0) - visible(cell).length),
-        )
+        .map((raw, i) => {
+          const cell = fit(raw, widths[i] ?? 0);
+          return i === row.length - 1
+            ? cell
+            : cell + " ".repeat(Math.max(0, (widths[i] ?? 0) - visible(cell).length));
+        })
         .join("  ")
         .trimEnd(),
     )

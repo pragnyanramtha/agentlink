@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readlinkSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import type { CanonicalEvent } from "../runtime.ts";
 import { openCodePluginSource } from "./opencode-plugin.ts";
@@ -163,8 +163,9 @@ function editJson(fs: VirtualFs, path: string, edit: (json: Obj) => Obj | null):
   const before = fs.read(path);
   const json = parseJsonConfig(path, before);
   const after = edit(json);
-  if (after === null) {
-    fs.write(path, null);
+  // A config that ends up empty ({}) after removing agentlink is removed as well.
+  if (after === null || Object.keys(after).length === 0) {
+    if (before !== null) fs.write(path, null);
     return;
   }
   const text = toJson(after);
@@ -375,6 +376,8 @@ const cursor: Planner = (ctx, fs, install) => {
         : null,
       (command) => ({ command, timeout: 10 }),
     );
+    const onlyOurs = Object.keys(json).every((k) => k === "version" || k === "hooks");
+    if (!install && Object.keys(hooks).length === 0 && onlyOurs) return null;
     return { version: json.version ?? 1, ...json, hooks };
   });
   if (ctx.mcp)
@@ -553,6 +556,14 @@ export const TOOL_BINARIES: Record<InstallTool, string[]> = {
   gemini: ["gemini"],
 };
 
+function linkTarget(path: string): string | undefined {
+  try {
+    return readlinkSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
 export function onPath(names: string[], env: NodeJS.ProcessEnv = process.env): string | undefined {
   for (const dir of (env.PATH ?? "").split(delimiter)) {
     for (const name of names) {
@@ -570,7 +581,8 @@ export function planCore(
   launcher: { node: string; entry: string },
 ): string[] {
   const notes: string[] = [];
-  const body = `#!/bin/sh\n# agentlink launcher (written by \`agentlink install\`)\nexec ${shq(launcher.node)} ${shq(launcher.entry)} "$@"\n`;
+  // Hooks run with the agent's environment; pin the home this launcher was installed for.
+  const body = `#!/bin/sh\n# agentlink launcher (written by \`agentlink install\`)\n: "\${AGENTLINK_HOME:=${ctx.agentlinkHome.replace(/(["\\$`])/g, "\\$1")}}"\nexport AGENTLINK_HOME\nexec ${shq(launcher.node)} ${shq(launcher.entry)} "$@"\n`;
   fs.write(ctx.shim, install ? body : null, 0o755);
   const localBin = join(ctx.home, ".local", "bin");
   const link = join(localBin, "agentlink");
@@ -580,7 +592,12 @@ export function planCore(
     if (!onPathDir) {
       notes.push(`Add ${join(ctx.agentlinkHome, "bin")} to PATH so agents can run \`agentlink\`.`);
     } else if (existsSync(link) && !isSymlinkTo(link, ctx.shim)) {
-      notes.push(`${link} exists and is not agentlink's; leaving it alone.`);
+      const target = linkTarget(link);
+      notes.push(
+        target?.endsWith("/bin/agentlink")
+          ? `agentlink is already on PATH (${link} → ${target}); leaving it.`
+          : `${link} exists and is not agentlink's; leaving it alone.`,
+      );
     } else if (!isSymlinkTo(link, ctx.shim)) {
       fs.symlink(link, ctx.shim, null);
     }

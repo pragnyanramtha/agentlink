@@ -15,7 +15,8 @@ Coordinate
   doing "<text>"                     tell peers what you are working on
   claim <glob>… · release · claims   advisory file claims
   name <new-name>                    rename this agent
-  register                           register an agent that has no hooks
+  whoami                             which agent this shell is (or: you, the human)
+  register · unregister              add/remove an agent that has no hooks
 
 Teams (other machines, other people)
   team [create|invite|join|leave]    end-to-end encrypted team over a relay
@@ -34,8 +35,12 @@ const H: Record<string, string> = {
   peers: `agentlink peers [--all]
 
 List the agents you can message: this machine's and your teammates' (alice/…).
-REACH says how a message gets in: wake (starts an idle agent), push, mid-turn
-(injected between tool calls) or next-turn.
+REACH says how a message gets in:
+  wake       an idle agent is started with a new turn
+  push       queued straight into the session
+  mid-turn   injected between its tool calls while it works
+  next-turn  shown when its next turn starts
+  cli        only when it runs agentlink inbox itself
 
   -a, --all     include offline agents
 
@@ -140,9 +145,14 @@ Set the status line other agents see in agentlink peers.`,
 
   register: `agentlink register [--tool generic] [--name <name>] [--pid <pid>]
 
-Register an agent whose CLI has no agentlink hooks, so others can message it. It
-finds its agent process in the process tree (or use --pid). It then reads its mail
-with agentlink inbox.`,
+Register an agent whose CLI has no agentlink hooks, so others can message it.
+Run inside the agent's shell, it registers that agent process; from your own terminal,
+pass --pid <agent pid>, then act as it with: agentlink --as <name> inbox.
+Undo with agentlink unregister <name>.`,
+  unregister: `agentlink unregister [<agent-name>]
+
+Forget an agent (default: the one this shell belongs to). Its undelivered messages
+expire. Agents can only unregister themselves.`,
 
   claim: `agentlink claim <path-or-glob>… [--ttl 60m] [--reason "…"]
 
@@ -220,26 +230,33 @@ Stop delivering messages to every agent (they are queued). Any agent may pause.`
 
   resume: `agentlink resume
 
-Resume delivery after pause. Only you (in a terminal) can resume.`,
+Resume delivery after pause. Run it yourself, in an interactive terminal (agents cannot).`,
 
   mute: `agentlink mute <agent>
 
-Queue messages for one agent without delivering them until unmute.`,
+Queue messages for one agent without delivering them until unmute. Run it yourself,
+in a terminal.`,
 
-  unmute: `agentlink unmute <agent>`,
+  unmute: `agentlink unmute <agent>
+
+Deliver an agent's queued messages again. Run it yourself, in a terminal.`,
 
   policy: `agentlink policy [list]
 agentlink policy set <scope> <kind>=<deliver|hold|refuse>…
 agentlink policy reset <scope> <kind>…
 
-Who may send what. Scopes: user, local, teammate, external, or a teammate's handle.
-Held messages wait for your approval (agentlink approvals).
+Who may send what. Changing it needs you, in an interactive terminal.
+  scopes   user (you), local (agents on this machine), teammate (team members' agents),
+           external (A2A, not yet), or one teammate's handle
+  kinds    info ask request handoff reply ack review_request review_result
+  actions  deliver, hold (waits for agentlink approve), refuse
 
 Example: agentlink policy set teammate request=hold handoff=hold`,
 
   approvals: `agentlink approvals
 
-Messages held by policy, waiting for you. Approve or deny each one:
+Messages held by policy, waiting for you. Approve or deny each one by its number
+(#12) or message id:
   agentlink approve <id> · agentlink deny <id>   (interactive terminal only)`,
 
   approve: `agentlink approve <delivery-id> [-y]

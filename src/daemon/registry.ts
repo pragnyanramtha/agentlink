@@ -225,6 +225,23 @@ export class Registry {
     return agent;
   }
 
+  /** Forgets an agent; its undelivered mail expires. */
+  remove(agentId: string): void {
+    const agent = this.byId(agentId);
+    if (!agent) return;
+    this.#ctx.store.tx(() => {
+      this.#ctx.store.run(
+        "UPDATE deliveries SET state = 'expired', note = 'agent unregistered' WHERE to_agent_id = ? AND state IN ('queued','delivered','held')",
+        agentId,
+      );
+      this.#ctx.store.run("DELETE FROM agents WHERE id = ?", agentId);
+    });
+    this.#ctx.events.publish({
+      type: "agent",
+      agent: { ...agentView(agent), state: "offline", removed: true },
+    });
+  }
+
   setStatus(agentId: string, text: string | null): AgentRow {
     this.#ctx.store.run(
       "UPDATE agents SET status_text = ?, last_seen_at = ? WHERE id = ?",

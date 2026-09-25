@@ -124,4 +124,9 @@ export const MIGRATIONS: string[] = [
     first_seen TEXT NOT NULL                          -- TOFU: key changes for a device are refused
   );
   `,
+  // 3: map relay frames back to the deliveries they carry
+  `
+  ALTER TABLE outbox ADD COLUMN message_id TEXT;
+  ALTER TABLE outbox ADD COLUMN handle TEXT;
+  `,
 ];

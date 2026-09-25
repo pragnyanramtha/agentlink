@@ -24,6 +24,9 @@ function launcher(): { node: string; entry: string } {
 
 function context(ctx: CliContext, opts: { project?: string; mcp: boolean }): InstallContext {
   const home = process.env.HOME || homedir();
+  if (opts.project && !existsSync(resolve(opts.project))) {
+    throw new UsageError(`project directory ${opts.project} does not exist`);
+  }
   return {
     home,
     agentlinkHome: ctx.paths.home,
@@ -88,30 +91,40 @@ async function run(ctx: CliContext, install: boolean): Promise<number> {
   }
 
   const backupDir = join(ctx.paths.backupsDir, new Date().toISOString().replace(/[:.]/g, "-"));
-  const written = applyChanges(changes, backupDir, ictx.home);
+  const applied = applyChanges(
+    changes,
+    backupDir,
+    ictx.home,
+    ictx.projectDir ? [ictx.projectDir] : [],
+  );
   const failed: string[] = [];
   for (const step of steps) {
     const r = spawnSync(step.cmd[0] as string, step.cmd.slice(1), {
       encoding: "utf8",
       timeout: 30_000,
     });
-    if (r.status !== 0)
+    if (r.status !== 0) {
       failed.push(
         `${step.cmd.join(" ")}: ${(r.stderr || r.stdout || String(r.error ?? "")).trim().slice(0, 200)}`,
       );
+    }
   }
   if (install) await ctx.client.ensureDaemon().catch(() => undefined);
-  out(ctx, { tools, written, steps, failed, notes, backupDir }, () =>
+  const backedUp = existsSync(backupDir);
+  out(ctx, { tools, applied, steps, failed, notes, ...(backedUp ? { backupDir } : {}) }, () =>
     [
       `${c.green("✓")} ${install ? "installed" : "removed"} agentlink ${install ? "for" : "from"} ${tools.join(", ") || "(no tools found)"}${ictx.scope === "project" ? ` in ${ictx.projectDir}` : ""}`,
-      ...written.map((p) => c.dim(`  wrote ${p}`)),
+      ...applied.map((a) => c.dim(`  ${a.action.padEnd(8)} ${a.path}`)),
       ...steps
-        .filter((s) => !failed.some((f) => f.startsWith(s.cmd.join(" "))))
-        .map((s) => c.dim(`  ran ${s.cmd.join(" ")}`)),
+        .filter((st) => !failed.some((f) => f.startsWith(st.cmd.join(" "))))
+        .map((st) => c.dim(`  ran      ${st.cmd.join(" ")}`)),
       ...failed.map((f) => c.yellow(`  ! ${f}`)),
-      written.length ? c.dim(`  backups: ${backupDir}`) : "",
+      applied.length === 0 && steps.length === 0 ? c.dim("  nothing to change") : "",
+      backedUp ? c.dim(`  backups: ${backupDir}`) : "",
       ...notes.map((n) => `  ${c.yellow("note")} ${n}`),
-      install ? "\nStart (or restart) your agent sessions, then check: agentlink peers" : "",
+      install && applied.length
+        ? "\nStart (or restart) your agent sessions, then check: agentlink peers"
+        : "",
     ]
       .filter(Boolean)
       .join("\n"),
@@ -158,25 +171,43 @@ export const doctor: Command = async (ctx) => {
   });
   for (const tool of INSTALL_TOOLS) {
     const bin = onPath(TOOL_BINARIES[tool]);
-    const fs = new VirtualFs();
     let pending = 0;
+    let present = 0;
     try {
+      const fs = new VirtualFs();
       planTool(tool, { ...ictx, mcp: false }, fs, true);
       pending = fs.changes().length;
+      // Instruction files (AGENTS.md, …) are shared between CLIs; only tool-specific wiring counts.
+      const rm = new VirtualFs();
+      planTool(tool, { ...ictx, mcp: false }, rm, false);
+      present = rm.changes().filter((ch) => !ch.path.endsWith(".md")).length;
     } catch (error) {
       rows.push({ ok: false, label: tool, detail: String((error as Error).message) });
       continue;
     }
-    rows.push({
-      ok: bin ? pending === 0 : null,
-      label: tool,
-      detail: !bin
-        ? "not installed"
-        : pending === 0
-          ? `hooks installed (${bin})`
-          : `not wired up (agentlink install ${tool}${values.project ? ` --project ${values.project}` : ""})`,
-    });
+    const where = values.project ? ` --project ${values.project}` : "";
+    if (!bin)
+      rows.push({
+        ok: null,
+        label: tool,
+        detail: present ? "wired up, but the CLI is not on PATH" : "not installed",
+      });
+    else if (pending === 0) rows.push({ ok: true, label: tool, detail: `wired up (${bin})` });
+    else if (present)
+      rows.push({
+        ok: false,
+        label: tool,
+        detail: `outdated wiring (agentlink install ${tool}${where})`,
+      });
+    else
+      rows.push({
+        ok: null,
+        label: tool,
+        detail: `not set up (agentlink install ${tool}${where})`,
+      });
   }
+  if (health?.paused)
+    rows.push({ ok: false, label: "paused", detail: "delivery is paused (agentlink resume)" });
   const errLog = join(ctx.paths.home, "hook-errors.log");
   if (existsSync(errLog) && Date.now() - statSync(errLog).mtimeMs < 24 * 3600_000) {
     const tail = readFileSync(errLog, "utf8").trimEnd().split("\n").slice(-3);

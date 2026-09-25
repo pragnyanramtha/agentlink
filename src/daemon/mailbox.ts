@@ -22,6 +22,7 @@ import {
 } from "../core/policy.ts";
 import { scanSecrets } from "../core/redact.ts";
 import { type RenderItem, renderInjection } from "../core/render.ts";
+import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import { isLive, type Registry } from "./registry.ts";
 import {
@@ -67,6 +68,11 @@ export interface SendResult {
 
 export type InboxTarget = { agent: AgentRow } | { human: true };
 
+export type WaitOutcome =
+  | { kind: "reply"; message: MessageRow }
+  | { kind: "failed"; deliveries: DeliveryRow[] }
+  | { kind: "timeout" };
+
 /** How the mailbox reaches teammates (implemented by the relay client). */
 export interface RemoteRouter {
   teamName: string;
@@ -86,14 +92,14 @@ const UNREAD: DeliveryState[] = ["queued", "delivered"];
 const RANK: Record<string, number> = {
   queued: 0,
   sent: 1,
-  delivered: 2,
   held: 2,
-  seen: 3,
-  acked: 4,
-  replied: 5,
-  refused: 5,
-  expired: 5,
-  failed: 5,
+  delivered: 3,
+  seen: 4,
+  acked: 5,
+  replied: 6,
+  refused: 6,
+  expired: 6,
+  failed: 6,
 };
 
 export const remoteHandleOf = (fromAddr: string): string | undefined =>
@@ -106,7 +112,7 @@ export const remoteHandleOf = (fromAddr: string): string | undefined =>
 export class Mailbox {
   readonly #ctx: DaemonContext;
   readonly #registry: Registry;
-  readonly #replyWaiters = new Map<string, Set<(m: MessageRow) => void>>();
+  readonly #replyWaiters = new Map<string, Set<(o: WaitOutcome) => void>>();
   readonly #inboxWaiters = new Map<string, Set<() => void>>();
   remote: RemoteRouter | undefined;
 
@@ -135,14 +141,17 @@ export class Mailbox {
     const key = idOrPrefix.trim().toUpperCase();
     const exact = this.#ctx.store.get<MessageRow>("SELECT * FROM messages WHERE id = ?", key);
     if (exact) return exact;
-    if (key.length < 6) throw notFound(`message "${idOrPrefix}"`);
+    if (key.length < 4)
+      throw invalid(`"${idOrPrefix}" is too short; use at least 4 characters of the message id`);
     const rows = this.#ctx.store.all<MessageRow>(
       "SELECT * FROM messages WHERE id LIKE ? ORDER BY id DESC LIMIT 2",
       `${key}%`,
     );
-    if (rows.length === 0) throw notFound(`message "${idOrPrefix}"`);
-    if (rows.length > 1)
-      throw invalid(`message id "${idOrPrefix}" is ambiguous; use more characters`);
+    if (rows.length === 0)
+      throw notFound(`message "${idOrPrefix}" (ids are in agentlink log / inbox)`);
+    if (rows.length > 1) {
+      throw invalid(`"${idOrPrefix}" matches several messages; use more characters of the id`);
+    }
     return rows[0] as MessageRow;
   }
 
@@ -166,6 +175,20 @@ export class Mailbox {
     return Object.fromEntries(rows.map((r) => [r.kind, r.action]));
   }
 
+  #noSuchAgent(name: string): AgentLinkError {
+    const known = [
+      ...this.#registry.list({ includeOffline: true }).map((a) => a.name),
+      ...(this.remote?.handles() ?? []).flatMap((h) =>
+        (this.remote?.agentsOf(h) ?? []).map((a) => `${h}/${a}`),
+      ),
+    ];
+    return new AgentLinkError(
+      "not_found",
+      `no agent named "${name}"${didYouMean(name, known)}; see: agentlink peers`,
+      404,
+    );
+  }
+
   // ---------------------------------------------------------------- sending
 
   #resolveRecipients(sender: Sender, to: string[], original?: MessageRow): Recipient[] {
@@ -183,8 +206,22 @@ export class Mailbox {
     const remoteRecipient = (member: string, agent?: string): Recipient => {
       const remote = this.remote;
       if (!remote) throw teamNotReady(agent ? `${member}/${agent}` : `@${member}`);
-      if (!remote.handles().includes(member))
-        throw notFound(`team member "${member}" (run: agentlink team)`);
+      if (!remote.handles().includes(member)) {
+        throw new AgentLinkError(
+          "not_found",
+          `no team member "${member}"${didYouMean(member, remote.handles())}; see: agentlink team`,
+          404,
+        );
+      }
+      // Presence lists a teammate's agents; catch typos before anything waits on them.
+      const theirs = remote.agentsOf(member);
+      if (agent && theirs.length > 0 && !theirs.includes(agent)) {
+        throw new AgentLinkError(
+          "not_found",
+          `${member} has no agent named "${agent}"${didYouMean(agent, theirs)}; ${member}'s agents: ${theirs.join(", ")}`,
+          404,
+        );
+      }
       return {
         addr: agent
           ? { member, agent, team: remote.teamName, role: "agent" }
@@ -231,7 +268,7 @@ export class Mailbox {
             throw invalid(
               `"${spec.name}" is ambiguous; use one of: ${owners.map((h) => `${h}/${spec.name}`).join(", ")}`,
             );
-          } else throw notFound(`agent "${spec.name}" (run: agentlink peers)`);
+          } else throw this.#noSuchAgent(spec.name);
           break;
         }
         case "member":
@@ -244,7 +281,7 @@ export class Mailbox {
             break;
           }
           const agent = this.#registry.byName(spec.agent);
-          if (!agent) throw notFound(`agent "${spec.agent}" (run: agentlink peers)`);
+          if (!agent) throw this.#noSuchAgent(spec.agent);
           out.push(agentRecipient(agent));
           break;
         }
@@ -467,12 +504,12 @@ export class Mailbox {
       const connected = this.remote?.connected() ?? false;
       store.run(
         `UPDATE deliveries SET state = ?, note = ? WHERE message_id = ? AND (to_addr = ? OR to_addr LIKE ?)`,
-        devices > 0 ? "sent" : "failed",
+        devices === 0 ? "failed" : connected ? "sent" : "queued",
         devices === 0
           ? `${handle} has no devices in the team`
           : connected
             ? `sent to ${handle} (${devices} device${devices > 1 ? "s" : ""}) via the relay`
-            : "relay offline: queued; sends when agentlink reconnects",
+            : "relay offline: queued here; sends when agentlink reconnects",
         envelope.messageId,
         `@${handle}`,
         `${handle}/%`,
@@ -673,6 +710,18 @@ export class Mailbox {
     };
   }
 
+  /** The relay accepted our copy for `handle`: queued (relay was offline) becomes sent. */
+  markRelaySent(messageId: string, handle: string): void {
+    const res = this.#ctx.store.run(
+      `UPDATE deliveries SET state = 'sent', note = NULL
+       WHERE message_id = ? AND state = 'queued' AND to_agent_id IS NULL AND (to_addr = ? OR to_addr LIKE ?)`,
+      messageId,
+      `@${handle}`,
+      `${handle}/%`,
+    );
+    if (res.changes > 0) for (const d of this.deliveriesOf(messageId)) this.#publishDelivery(d);
+  }
+
   /** A teammate's daemon reports progress on a message we sent it. Never moves backwards. */
   applyReceipt(
     fromHandle: string,
@@ -695,7 +744,7 @@ export class Mailbox {
     };
     const col = column[receipt.state];
     this.#ctx.store.run(
-      `UPDATE deliveries SET state = ?, note = COALESCE(?, note)${col ? `, ${col} = COALESCE(${col}, ?)` : ""} WHERE id = ?`,
+      `UPDATE deliveries SET state = ?, note = ?${col ? `, ${col} = COALESCE(${col}, ?)` : ""} WHERE id = ?`,
       ...([receipt.state, receipt.note ?? null, ...(col ? [stamp] : []), d.id] as (
         | string
         | number
@@ -704,22 +753,30 @@ export class Mailbox {
     );
     const updated = this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", d.id);
     if (updated) this.#publishDelivery(updated);
+    this.#checkFailed(receipt.messageId);
     return true;
   }
 
+  /** A thread id, or the id (or unique prefix) of any message in the thread. */
   resolveThread(idOrPrefix: string): string {
     const key = idOrPrefix.trim().toUpperCase();
-    const row =
-      this.#ctx.store.get<{ thread_id: string }>(
-        "SELECT thread_id FROM messages WHERE thread_id = ? LIMIT 1",
-        key,
-      ) ??
-      this.#ctx.store.get<{ thread_id: string }>(
-        "SELECT thread_id FROM messages WHERE thread_id LIKE ? LIMIT 1",
-        `${key}%`,
-      );
-    if (!row) throw notFound(`thread "${idOrPrefix}"`);
-    return row.thread_id;
+    const direct = this.#ctx.store.get<{ thread_id: string }>(
+      "SELECT thread_id FROM messages WHERE thread_id = ? OR id = ? LIMIT 1",
+      key,
+      key,
+    );
+    if (direct) return direct.thread_id;
+    if (key.length < 4)
+      throw invalid(`"${idOrPrefix}" is too short; use at least 4 characters of the id`);
+    const rows = this.#ctx.store.all<{ thread_id: string }>(
+      "SELECT DISTINCT thread_id FROM messages WHERE thread_id LIKE ? OR id LIKE ? LIMIT 2",
+      `${key}%`,
+      `${key}%`,
+    );
+    if (rows.length === 0) throw notFound(`thread or message "${idOrPrefix}"`);
+    if (rows.length > 1)
+      throw invalid(`"${idOrPrefix}" matches several threads; use more characters`);
+    return (rows[0] as { thread_id: string }).thread_id;
   }
 
   // ---------------------------------------------------------------- reading
@@ -867,44 +924,71 @@ export class Mailbox {
     );
   }
 
-  recent(limit: number): MessageRow[] {
+  /** Recent messages; `from` narrows to one local agent (by id, so renames keep history) or you. */
+  recent(limit: number, from?: { agentId: string } | { human: true }): MessageRow[] {
+    const where = !from
+      ? ""
+      : "agentId" in from
+        ? "WHERE from_agent_id = ?"
+        : "WHERE from_agent_id IS NULL AND from_addr = ?";
+    const params = !from ? [] : "agentId" in from ? [from.agentId] : [`@${this.handle}`];
     return this.#ctx.store
-      .all<MessageRow>("SELECT * FROM messages ORDER BY created_at DESC, id DESC LIMIT ?", limit)
+      .all<MessageRow>(
+        `SELECT * FROM messages ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
+        ...params,
+        limit,
+      )
       .reverse();
   }
 
   // ---------------------------------------------------------------- waiting
 
-  /** Resolves with the first answer (reply / review_result / ack) to `messageId`, or undefined on timeout. */
-  waitForReply(
-    messageId: string,
-    timeoutMs: number,
-    signal?: AbortSignal,
-  ): Promise<MessageRow | undefined> {
+  /**
+   * Resolves with the first answer (reply / review_result / ack) to `messageId`, as soon as
+   * every delivery has failed (unknown agent, refused, expired), or on timeout.
+   */
+  waitForReply(messageId: string, timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome> {
     const existing = this.#ctx.store.get<MessageRow>(
       "SELECT * FROM messages WHERE reply_to = ? AND kind IN ('reply','review_result','ack') ORDER BY created_at LIMIT 1",
       messageId,
     );
-    if (existing) return Promise.resolve(existing);
+    if (existing) return Promise.resolve({ kind: "reply", message: existing });
+    const failed = this.#allFailed(messageId);
+    if (failed) return Promise.resolve({ kind: "failed", deliveries: failed });
     return new Promise((resolve) => {
       const set = this.#replyWaiters.get(messageId) ?? new Set();
-      const done = (m?: MessageRow) => {
+      const done = (o: WaitOutcome) => {
         clearTimeout(timer);
-        set.delete(fn);
+        set.delete(done);
         if (set.size === 0) this.#replyWaiters.delete(messageId);
-        resolve(m);
+        resolve(o);
       };
-      const fn = (m: MessageRow) => done(m);
-      const timer = setTimeout(() => done(undefined), timeoutMs);
-      signal?.addEventListener("abort", () => done(undefined), { once: true });
-      set.add(fn);
+      const timer = setTimeout(() => done({ kind: "timeout" }), timeoutMs);
+      signal?.addEventListener("abort", () => done({ kind: "timeout" }), { once: true });
+      set.add(done);
       this.#replyWaiters.set(messageId, set);
     });
   }
 
+  #allFailed(messageId: string): DeliveryRow[] | undefined {
+    const ds = this.deliveriesOf(messageId);
+    return ds.length > 0 && ds.every((d) => ["failed", "refused", "expired"].includes(d.state))
+      ? ds
+      : undefined;
+  }
+
+  /** Ends waits whose every delivery failed. */
+  #checkFailed(messageId: string): void {
+    const waiters = this.#replyWaiters.get(messageId);
+    if (!waiters?.size) return;
+    const failed = this.#allFailed(messageId);
+    if (failed) for (const fn of [...waiters]) fn({ kind: "failed", deliveries: failed });
+  }
+
   #resolveReplyWaiters(originalId: string, reply: MessageRow): void {
     if (!["reply", "review_result", "ack"].includes(reply.kind)) return;
-    for (const fn of this.#replyWaiters.get(originalId) ?? []) fn(reply);
+    for (const fn of [...(this.#replyWaiters.get(originalId) ?? [])])
+      fn({ kind: "reply", message: reply });
   }
 
   hasReplyWaiter(messageId: string): boolean {
@@ -955,6 +1039,7 @@ export class Mailbox {
       deliveryId,
     ) as DeliveryRow;
     this.#publishDelivery(updated);
+    if (decision === "deny") this.#checkFailed(updated.message_id);
     return this.#item(updated);
   }
 
@@ -983,6 +1068,7 @@ export class Mailbox {
         );
       }
     }
+    for (const id of new Set(rows.map((r) => r.message_id))) this.#checkFailed(id);
     return rows.length;
   }
 

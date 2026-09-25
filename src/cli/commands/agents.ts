@@ -1,4 +1,4 @@
-import { ancestry, findToolProcess } from "../../core/proc.ts";
+import { ancestry, detectTool, findToolProcess } from "../../core/proc.ts";
 import { type Command, out, parse, parseDuration, UsageError } from "../args.ts";
 import { ago, c, stateColor, table } from "../format.ts";
 
@@ -49,10 +49,19 @@ export const peers: Command = async (ctx) => {
   const { values } = parse(ctx.argv, { all: { type: "boolean", short: "a" } });
   await ctx.client.ensureDaemon();
   const [res, who] = await Promise.all([
-    ctx.client.request<{ agents: AgentView[] }>("GET", `/v1/agents${values.all ? "?all=1" : ""}`),
+    ctx.client.request<{ agents: AgentView[]; paused?: boolean }>(
+      "GET",
+      `/v1/agents${values.all ? "?all=1" : ""}`,
+    ),
     ctx.client.request<{ agent: AgentView | null }>("GET", "/v1/whoami"),
   ]);
-  out(ctx, res, () => {
+  const banner = res.paused
+    ? `${c.yellow("⏸ agentlink is PAUSED: messages are queued, not delivered (agentlink resume)")}\n`
+    : "";
+  out(ctx, res, () => banner + listing());
+  return 0;
+
+  function listing(): string {
     if (res.agents.length === 0) {
       return c.dim(
         values.all
@@ -68,15 +77,14 @@ export const peers: Command = async (ctx) => {
         a.tool,
         stateColor(a.state),
         reach(a),
-        (a.repo ?? "-").replace(/^github\.com\//, ""),
+        shortRepo(a.repo),
         a.branch ?? "-",
         a.status ?? "",
         c.dim(ago(a.state === "busy" || a.state === "idle" ? a.stateAt : a.lastSeenAt)),
       ]),
       ["NAME", "TOOL", "STATE", "REACH", "REPO", "BRANCH", "DOING", "SINCE"],
     );
-  });
-  return 0;
+  }
 };
 
 export const name: Command = async (ctx) => {
@@ -117,32 +125,77 @@ export const register: Command = async (ctx) => {
   const tool = String(values.tool);
   let pid = values.pid ? Number(values.pid) : undefined;
   let pidStart: string | undefined;
+  let procCmd = "";
+  if (values.pid && (!Number.isInteger(pid) || (pid ?? 0) <= 1))
+    throw new UsageError("--pid must be a process id");
   if (!pid) {
-    const proc = findToolProcess(tool, ancestry(process.pid));
+    const chain = ancestry(process.pid);
+    const detected = detectTool(chain);
+    // From your own terminal, the "agent" would be your shell's parent (the terminal itself),
+    // which would turn every later command from that terminal into that agent. Refuse.
+    if (!detected && tool === "generic" && process.stdin.isTTY) {
+      throw new UsageError(
+        "run agentlink register inside the agent's own shell, or pass --pid <pid of the agent process>",
+      );
+    }
+    const proc = detected?.proc ?? findToolProcess(tool, chain);
     pid = proc?.pid;
     pidStart = proc?.start;
+    procCmd = proc?.cmd.slice(0, 2).join(" ") ?? "";
   }
   await ctx.client.ensureDaemon();
-  const res = await ctx.client.request<{ agent: AgentView; created: boolean; resumed: boolean }>(
-    "POST",
-    "/v1/agents/register",
-    {
-      tool,
-      cwd: process.cwd(),
-      ...(pid ? { pid } : {}),
-      ...(pidStart ? { pidStart } : {}),
-      ...(values.name ? { name: values.name } : {}),
-      ...(values.session ? { sessionId: values.session } : {}),
-    },
-  );
+  const res = await ctx.client.request<{
+    agent: AgentView;
+    created: boolean;
+    resumed: boolean;
+    self?: boolean;
+  }>("POST", "/v1/agents/register", {
+    tool,
+    cwd: process.cwd(),
+    ...(pid ? { pid } : {}),
+    ...(pidStart ? { pidStart } : {}),
+    ...(values.name ? { name: values.name } : {}),
+    ...(values.session ? { sessionId: values.session } : {}),
+  });
   out(ctx, res, () =>
     [
-      `${c.green("✓")} registered ${c.bold(res.agent.name)} (${res.agent.tool})${res.resumed ? c.dim(" · resumed; queued mail will be delivered") : ""}`,
-      c.dim("  check for messages with: agentlink inbox"),
+      `${c.green("✓")} registered ${c.bold(res.agent.name)} (${res.agent.tool}) for process ${pid ?? "?"}${procCmd ? c.dim(` (${procCmd})`) : ""}${res.resumed ? c.dim(" · resumed; queued mail will be delivered") : ""}`,
+      c.dim(
+        res.self
+          ? "  commands from this shell now act as this agent; read mail with: agentlink inbox"
+          : `  act as it from here with --as: agentlink --as ${res.agent.name} inbox   (undo: agentlink unregister ${res.agent.name})`,
+      ),
     ].join("\n"),
   );
   return 0;
 };
+
+export const unregister: Command = async (ctx) => {
+  const { positionals } = parse(ctx.argv, {});
+  await ctx.client.ensureDaemon();
+  let target = positionals[0];
+  if (!target) {
+    const who = await ctx.client.request<{ agent: AgentView | null }>("GET", "/v1/whoami");
+    if (!who.agent) throw new UsageError("usage: agentlink unregister <agent-name>");
+    target = who.agent.name;
+  }
+  const res = await ctx.client.request<{ removed: string }>(
+    "DELETE",
+    `/v1/agents/${encodeURIComponent(target)}`,
+  );
+  out(
+    ctx,
+    res,
+    () => `${c.green("✓")} unregistered ${c.bold(res.removed)}; its undelivered messages expired`,
+  );
+  return 0;
+};
+
+function shortRepo(repo: string | null): string {
+  if (!repo) return "-";
+  const r = repo.replace(/^github\.com\//, "");
+  return r.startsWith("/") ? r.split("/").slice(-2).join("/") || r : r;
+}
 
 interface ClaimView {
   id: string;
@@ -190,6 +243,19 @@ export const release: Command = async (ctx) => {
     ...(positionals.length ? { patterns: positionals } : {}),
     all: Boolean(values.all) || positionals.length === 0,
   });
+  if (res.released === 0 && !ctx.json) {
+    const list = await ctx.client.request<{ claims: ClaimView[] }>("GET", "/v1/claims");
+    process.stdout.write(
+      `${c.dim(positionals.length ? `no claim of yours matches ${positionals.join(", ")}` : "you have no claims")}${
+        list.claims.length
+          ? c.dim(
+              `; active claims: ${list.claims.map((k) => `${k.pattern} (${k.agent})`).join(", ")}`,
+            )
+          : ""
+      }\n`,
+    );
+    return 0;
+  }
   out(ctx, res, () => `${c.green("✓")} released ${res.released} claim(s)`);
   return 0;
 };

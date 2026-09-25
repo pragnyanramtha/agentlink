@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import { createLogger } from "../../core/log.ts";
+import { didYouMean } from "../../core/suggest.ts";
 import { type Command, out, parse, parseDuration, UsageError } from "../args.ts";
 import { ago, c, stateColor, table } from "../format.ts";
 
@@ -145,6 +146,16 @@ export const team: Command = async (ctx) => {
       const { values, positionals } = parse(sub2.argv, { handle: { type: "string" } });
       const [invite] = positionals;
       if (!invite) throw new UsageError("usage: agentlink team join <invite> [--handle <you>]");
+      if (
+        !invite
+          .trim()
+          .replace(/^agentlink:\/\/join\//, "")
+          .startsWith("al1.")
+      ) {
+        throw new UsageError(
+          "that is not an agentlink invite; invites start with al1. (get one with: agentlink team invite)",
+        );
+      }
       await ctx.client.ensureDaemon();
       const s = await ctx.client.request<TeamStatus>(
         "POST",
@@ -171,17 +182,18 @@ export const team: Command = async (ctx) => {
     }
     default:
       throw new UsageError(
-        "usage: agentlink team [status|create|invite|join|leave] (agentlink team --help)",
+        `unknown team command "${sub}"${didYouMean(sub, ["status", "members", "create", "invite", "join", "leave"])}; use status|create|invite|join|leave`,
       );
   }
 };
 
 export const relay: Command = async (ctx) => {
   const [sub, ...rest] = ctx.argv;
-  if (sub !== "serve")
+  if (sub !== "serve") {
     throw new UsageError(
-      "usage: agentlink relay serve [--host 0.0.0.0] [--port 7700] [--data <dir>]",
+      `${sub ? `unknown relay command "${sub}"${didYouMean(sub, ["serve"])}; ` : ""}usage: agentlink relay serve [--host 0.0.0.0] [--port 7700] [--data <dir>]`,
     );
+  }
   const { values } = parse(rest, {
     host: { type: "string", default: "127.0.0.1" },
     port: { type: "string", default: "7700" },

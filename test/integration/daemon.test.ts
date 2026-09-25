@@ -181,6 +181,99 @@ describe("messaging", () => {
   });
 });
 
+describe("usability fixes", () => {
+  it("pause also hides mail from an agent's explicit inbox; you still see yours", async () => {
+    await register("alpha");
+    await register("beta");
+    await t.client("alpha").request("POST", "/v1/messages", { to: ["beta"], text: "while paused" });
+    await t.raw("POST", "/v1/control", { action: "pause" }, { as: "alpha" });
+    const agentView = await t
+      .client("beta")
+      .request<{ items: unknown[]; paused?: boolean }>("GET", "/v1/inbox");
+    expect(agentView.paused).toBe(true);
+    expect(agentView.items).toHaveLength(0);
+    const peers = await t.client().request<{ paused: boolean }>("GET", "/v1/agents");
+    expect(peers.paused).toBe(true);
+    await t.raw("POST", "/v1/control", { action: "resume" }, { tty: true });
+    const after = await t.client("beta").request<{ items: { text: string }[] }>("GET", "/v1/inbox");
+    expect(after.items.map((i) => i.text)).toEqual(["while paused"]);
+  });
+
+  it("rejects unknown policy scopes with a suggestion", async () => {
+    const res = await t.raw(
+      "POST",
+      "/v1/policy",
+      { scope: "teamate", kind: "request", action: "hold" },
+      { tty: true },
+    );
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.data)).toContain('did you mean \\"teammate\\"');
+  });
+
+  it("suggests close agent names and finds threads by any message id", async () => {
+    await register("api");
+    await register("web");
+    const typo = await t.raw("POST", "/v1/messages", { to: ["apii"], text: "hi" }, { as: "web" });
+    expect(typo.status).toBe(404);
+    expect(JSON.stringify(typo.data)).toContain('did you mean \\"api\\"');
+    const ask = await t
+      .client("web")
+      .request<SendRes>("POST", "/v1/messages", { to: ["api"], kind: "ask", text: "port?" });
+    const reply = await t.client("api").request<SendRes>("POST", "/v1/messages", {
+      kind: "reply",
+      replyTo: ask.message.id,
+      text: "8080",
+    });
+    const byReply = await t
+      .client()
+      .request<{ thread: string; messages: unknown[] }>("GET", `/v1/threads/${reply.message.id}`);
+    expect(byReply.thread).toBe(ask.message.thread);
+    expect(byReply.messages).toHaveLength(2);
+    const short = await t.raw("GET", "/v1/messages/01M");
+    expect(short.status).toBe(400);
+    expect(JSON.stringify(short.data)).toContain("too short");
+  });
+
+  it("keeps an agent's sent history across renames and can unregister it", async () => {
+    await register("api");
+    await register("web");
+    await t.client("web").request("POST", "/v1/messages", { to: ["api"], text: "before rename" });
+    await t.client("web").request("POST", "/v1/agents/rename", { name: "frontend" });
+    const mine = await t
+      .client("frontend")
+      .request<{ messages: { message: { preview: string } }[] }>("GET", "/v1/log?mine=1");
+    expect(mine.messages.map((m) => m.message.preview)).toEqual(["before rename"]);
+    await t.client("frontend").request("POST", "/v1/messages", { to: ["api"], text: "second" });
+    const removed = await t.client().request<{ removed: string }>("DELETE", "/v1/agents/api");
+    expect(removed.removed).toBe("api");
+    const agents = await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1");
+    expect(agents.agents.map((a) => a.name)).toEqual(["frontend"]);
+  });
+
+  it("approves held messages by message id", async () => {
+    await register("alpha");
+    await register("beta");
+    await t.raw(
+      "POST",
+      "/v1/policy",
+      { scope: "local", kind: "request", action: "hold" },
+      { tty: true },
+    );
+    const res = await t
+      .client("alpha")
+      .request<SendRes>("POST", "/v1/messages", { to: ["beta"], kind: "request", text: "deploy" });
+    const ok = await t.raw(
+      "POST",
+      `/v1/approvals/${res.message.id.slice(0, 10)}`,
+      { decision: "approve" },
+      { tty: true },
+    );
+    expect(ok.status).toBe(200);
+    const inbox = await t.client("beta").request<{ items: { text: string }[] }>("GET", "/v1/inbox");
+    expect(inbox.items.map((i) => i.text)).toEqual(["deploy"]);
+  });
+});
+
 describe("guards", () => {
   it("stops echo loops and caps threads", async () => {
     await register("alpha");

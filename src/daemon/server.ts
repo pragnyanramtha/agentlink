@@ -3,6 +3,7 @@ import { z } from "zod";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
 import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
 import { DEFAULT_POLICY, POLICY_ACTIONS, TRUSTS } from "../core/policy.ts";
+import { didYouMean } from "../core/suggest.ts";
 import { PROTOCOL_VERSION, VERSION } from "../version.ts";
 import type { Claims } from "./claims.ts";
 import type { DaemonContext } from "./context.ts";
@@ -209,7 +210,17 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       ...(input.adapter ? { adapter: input.adapter } : {}),
       state: input.state ?? "busy",
     });
-    return { agent: agentView(agent), created, resumed };
+    // Does the registering shell belong to the new agent? (Decides the "read your mail" hint.)
+    const self = !!input.pid && req.caller.chain.some((p) => p.pid === input.pid);
+    return { agent: agentView(agent), created, resumed, self };
+  });
+
+  route("DELETE", "/v1/agents/:name", (req) => {
+    const agent = registry.require(req.params.name as string);
+    if (req.agent && req.agent.id !== agent.id)
+      throw forbidden("agents can only unregister themselves");
+    registry.remove(agent.id);
+    return { removed: agent.name };
   });
 
   route("GET", "/v1/agents", (req) => {
@@ -235,7 +246,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         capabilities: {},
         local: false,
       }));
-    return { agents: [...local, ...remote] };
+    return { agents: [...local, ...remote], paused: mailbox.paused };
   });
 
   // ------------------------------------------------------------------ team (relay)
@@ -323,22 +334,48 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
                 : String(d.state)),
     }));
     let reply: ReturnType<typeof replyView> | undefined;
+    let failed: { to: string; state: string; note: string | null }[] | undefined;
+    let timedOut = false;
     const reachable = result.deliveries.some((d) =>
       ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
     );
     if (input.waitMs && reachable) {
-      const m = await mailbox.waitForReply(String(result.message.id), input.waitMs, req.signal);
-      if (m) reply = replyView(m);
+      const outcome = await mailbox.waitForReply(
+        String(result.message.id),
+        input.waitMs,
+        req.signal,
+      );
+      if (outcome.kind === "reply") reply = replyView(outcome.message);
+      else if (outcome.kind === "failed") {
+        failed = outcome.deliveries.map((d) => ({ to: d.to_addr, state: d.state, note: d.note }));
+      } else timedOut = true;
+    } else if (input.waitMs) {
+      failed = result.deliveries.map((d) => ({
+        to: String(d.to),
+        state: String(d.state),
+        note: typeof d.note === "string" ? d.note : null,
+      }));
     }
     return {
       message: result.message,
       deliveries,
       ...(reply ? { reply } : {}),
+      ...(failed ? { failed } : {}),
       waited: !!input.waitMs,
+      timedOut,
+      asHuman: !req.agent,
     };
   });
 
   route("GET", "/v1/inbox", async (req) => {
+    if (req.agent && mailbox.paused) {
+      // The kill switch covers reads too: a paused agent sees nothing until you resume.
+      const text =
+        "agentlink is paused: no messages are delivered until your user runs `agentlink resume`.";
+      return req.query.get("format") === "inject"
+        ? { count: 0, text, paused: true }
+        : { items: [], paused: true };
+    }
     const target = req.agent ? { agent: req.agent } : ({ human: true } as const);
     const unreadOnly = req.query.get("all") !== "1";
     const limit = Math.min(Number(req.query.get("limit") ?? 20) || 20, 200);
@@ -432,8 +469,14 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
 
   route("GET", "/v1/log", (req) => {
     const limit = Math.min(Number(req.query.get("limit") ?? 30) || 30, 500);
+    const mine = req.query.get("mine") === "1";
+    const from = !mine
+      ? undefined
+      : req.agent
+        ? { agentId: req.agent.id }
+        : ({ human: true } as const);
     return {
-      messages: mailbox.recent(limit).map((m) => ({
+      messages: mailbox.recent(limit, from).map((m) => ({
         message: mailbox.messageView(m),
         deliveries: mailbox.deliveriesOf(m.id).map((d) => mailbox.deliveryView(d)),
       })),
@@ -516,8 +559,11 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         action: z.enum(POLICY_ACTIONS).nullable(),
       })
       .parse(req.body);
-    if (!(TRUSTS as readonly string[]).includes(body.scope) && !/^[a-z0-9._-]+$/.test(body.scope)) {
-      throw invalid(`unknown policy scope "${body.scope}"`);
+    const members = s.team.client?.handles() ?? [];
+    if (!(TRUSTS as readonly string[]).includes(body.scope) && !members.includes(body.scope)) {
+      throw invalid(
+        `unknown policy scope "${body.scope}"${didYouMean(body.scope, [...TRUSTS, ...members])}; use ${TRUSTS.join(", ")}${members.length ? `, or a teammate (${members.join(", ")})` : ""}`,
+      );
     }
     if (body.action === null) {
       ctx.store.run(
@@ -542,7 +588,22 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   route("POST", "/v1/approvals/:id", (req) => {
     requireHuman(req);
     const body = z.object({ decision: z.enum(["approve", "deny"]) }).parse(req.body);
-    const item = mailbox.decide(Number(req.params.id), body.decision, ctx.config.handle);
+    const raw = String(req.params.id).replace(/^#/, "");
+    let deliveryId = Number(raw);
+    if (!/^\d+$/.test(raw)) {
+      const held = mailbox
+        .deliveriesOf(mailbox.resolveMessage(raw).id)
+        .filter((d) => d.state === "held");
+      if (held.length !== 1) {
+        throw invalid(
+          held.length === 0
+            ? `message ${raw} has nothing held (see: agentlink approvals)`
+            : `message ${raw} is held for several recipients; use one of #${held.map((d) => d.id).join(", #")}`,
+        );
+      }
+      deliveryId = (held[0] as { id: number }).id;
+    }
+    const item = mailbox.decide(deliveryId, body.decision, ctx.config.handle);
     if (body.decision === "approve") engine.onQueued([item]);
     return { item: itemView(item) };
   });

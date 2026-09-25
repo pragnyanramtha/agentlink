@@ -1,5 +1,6 @@
 import { type ParseArgsConfig, parseArgs } from "node:util";
 import type { Paths } from "../core/paths.ts";
+import { closest } from "../core/suggest.ts";
 import type { Client } from "./client.ts";
 
 export interface CliContext {
@@ -21,11 +22,25 @@ export class UsageError extends Error {
 
 type Options = NonNullable<ParseArgsConfig["options"]>;
 
+/** Like util.parseArgs, but with messages a person can act on ("did you mean --timeout?"). */
 export function parse<O extends Options>(argv: string[], options: O) {
   try {
     return parseArgs({ args: argv, options, allowPositionals: true, strict: true });
   } catch (error) {
-    throw new UsageError((error as Error).message);
+    const message = (error as Error).message;
+    const unknown = /Unknown option '([^']+)'/.exec(message);
+    if (unknown) {
+      const flag = unknown[1] as string;
+      const guess = closest(flag.replace(/^-+/, ""), Object.keys(options));
+      throw new UsageError(`unknown option ${flag}${guess ? ` (did you mean --${guess}?)` : ""}`);
+    }
+    const missing = /Option '([^']+)' argument missing/.exec(message);
+    const flagName = (s: string | undefined) =>
+      (s ?? "").replace(/^-\w, /, "").replace(/ <value>$/, "");
+    if (missing) throw new UsageError(`${flagName(missing[1])} needs a value`);
+    const noValue = /Option '([^']+)' does not take an argument/.exec(message);
+    if (noValue) throw new UsageError(`${flagName(noValue[1])} does not take a value`);
+    throw new UsageError(message.replace(/\. To specify a positional argument[\s\S]*$/, ""));
   }
 }
 

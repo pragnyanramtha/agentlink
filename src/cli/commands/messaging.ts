@@ -32,7 +32,10 @@ interface SendResponse {
   message: MessageView;
   deliveries: DeliveryView[];
   reply?: { message: MessageView; text: string; ack?: string };
+  failed?: { to: string; state: string; note: string | null }[];
   waited: boolean;
+  timedOut?: boolean;
+  asHuman?: boolean;
 }
 interface InboxItemView {
   delivery: DeliveryView;
@@ -53,9 +56,18 @@ const KINDS = [
   "review_result",
 ];
 
-function printSend(ctx: CliContext, res: SendResponse, waitMs: number): void {
+/** Prints the result of a send/ask; returns the exit code (1 when nobody could get it). */
+function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
+  const bad = (state: string) => ["failed", "refused", "expired"].includes(state);
+  const failedAll =
+    (res.failed?.length ?? 0) > 0 ||
+    (res.deliveries.length > 0 && res.deliveries.every((d) => bad(d.state)));
   out(ctx, res, () => {
-    const lines = res.deliveries.map((d) => `${c.cyan("→")} ${c.bold(d.to)}: ${d.note ?? d.state}`);
+    const lines = res.deliveries.map((d) =>
+      bad(d.state)
+        ? `${c.red("✗")} ${c.bold(d.to)}: ${d.state}${d.note ? ` (${d.note})` : ""}`
+        : `${c.cyan("→")} ${c.bold(d.to)}: ${d.note ?? d.state}`,
+    );
     lines.push(
       c.dim(`  message ${res.message.id} (${res.message.kind}, thread ${res.message.thread})`),
     );
@@ -66,15 +78,25 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): void {
         `${c.green("←")} ${r.message.kind} from ${c.bold(r.message.from)} ${c.dim(`(${r.message.id})`)}:`,
       );
       lines.push(r.ack ? `[${r.ack}] ${r.text}` : r.text);
-    } else if (res.waited) {
+    } else if (res.failed?.length) {
+      for (const f of res.failed) {
+        if (!res.deliveries.some((d) => d.to === f.to && d.state === f.state)) {
+          lines.push(`${c.red("✗")} ${c.bold(f.to)}: ${f.state}${f.note ? ` (${f.note})` : ""}`);
+        }
+      }
+      lines.push(c.red("Nobody could receive this message, so there is no answer to wait for."));
+    } else if (res.waited && res.timedOut) {
       lines.push(
         c.yellow(
-          `No answer within ${Math.round(waitMs / 1000)}s. It will reach you automatically when it arrives (or run: agentlink inbox).`,
+          res.asHuman
+            ? `No answer within ${Math.round(waitMs / 1000)}s. Check later: agentlink status ${res.message.id} (answers to you land in: agentlink inbox)`
+            : `No answer within ${Math.round(waitMs / 1000)}s. The answer will be delivered to you automatically when it comes (or run: agentlink inbox).`,
         ),
       );
     }
     return lines.join("\n");
   });
+  return failedAll ? 1 : 0;
 }
 
 async function sendCommon(
@@ -107,8 +129,7 @@ async function sendCommon(
     },
     { timeoutMs: opts.waitMs > 0 ? opts.waitMs + 10_000 : 15_000 },
   );
-  printSend(ctx, res, opts.waitMs);
-  return 0;
+  return printSend(ctx, res, opts.waitMs);
 }
 
 export const send: Command = async (ctx) => {
@@ -246,15 +267,17 @@ export const inbox: Command = async (ctx) => {
     process.stdout.write(`${res.count ? res.text : "No new agentlink messages."}\n`);
     return 0;
   }
-  const res = await ctx.client.request<{ items: InboxItemView[] }>(
+  const res = await ctx.client.request<{ items: InboxItemView[]; paused?: boolean }>(
     "GET",
     `/v1/inbox?${q}`,
     undefined,
-    {
-      timeoutMs: waitMs + 10_000,
-    },
+    { timeoutMs: waitMs + 10_000 },
   );
-  out(ctx, res, () => printItems(res.items));
+  out(ctx, res, () =>
+    res.paused
+      ? c.yellow("agentlink is paused: nothing is delivered until you run agentlink resume.")
+      : printItems(res.items),
+  );
   return 0;
 };
 
@@ -365,8 +388,8 @@ export const status: Command = async (ctx) => {
   const me = who.agent?.name ?? `@${who.handle}`;
   const log = await ctx.client.request<{
     messages: { message: MessageView; deliveries: DeliveryView[] }[];
-  }>("GET", "/v1/log?limit=100");
-  const mine = log.messages.filter((m) => m.message.from === me).slice(-10);
+  }>("GET", "/v1/log?limit=10&mine=1");
+  const mine = log.messages;
   out(ctx, { me, messages: mine }, () =>
     mine.length === 0
       ? c.dim(`No messages sent by ${me} yet.`)
@@ -397,9 +420,11 @@ export const log: Command = async (ctx) => {
       : res.messages
           .map(
             ({ message: m, deliveries }) =>
-              `${c.dim(ago(m.createdAt).padEnd(8))} ${c.bold(m.kind.padEnd(8))} ${c.cyan(m.from)} → ${deliveries
-                .map((d) => `${d.to} ${deliveryColor(d.state)}`)
-                .join(", ")}  ${c.dim(`"${m.preview}"`)}`,
+              `${c.dim(ago(m.createdAt).padEnd(8))} ${c.bold(m.kind.padEnd(8))} ${c.cyan(m.from)} → ${
+                deliveries.length
+                  ? deliveries.map((d) => `${d.to} ${deliveryColor(d.state)}`).join(", ")
+                  : c.dim("(no recipient here)")
+              }  ${c.dim(`"${m.preview}"`)}`,
           )
           .join("\n"),
   );
