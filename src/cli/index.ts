@@ -3,39 +3,7 @@ import "../core/quiet-warnings.ts";
 import { resolvePaths } from "../core/paths.ts";
 import { VERSION } from "../version.ts";
 import type { CliContext, Command } from "./args.ts";
-
-const HELP = `agentlink ${VERSION}: let AI coding agents talk to each other
-
-Talk
-  agentlink peers [--all]                       who is online (busy/idle/offline) and what they do
-  agentlink ask <agent> "<question>"            ask and wait for the answer (--timeout 110s, --no-wait)
-  agentlink send <agent>[,…] "<message>"        send (--kind info|ask|request|handoff, --wait, --stdin)
-  agentlink reply <id> "<answer>"               answer a message
-  agentlink ack <id> [--accept|--decline]       acknowledge / accept or decline a handoff
-  agentlink inbox [--all] [--wait 60s]          read your messages
-  agentlink show <id> [--part N]                show a message (or one attachment)
-  agentlink thread <id>                         show a whole conversation
-  agentlink status [<id>]                       delivery receipts (queued/delivered/seen/replied)
-
-Coordinate
-  agentlink doing "<text>"                      tell peers what you are working on
-  agentlink claim <glob>… [--ttl 60m]           advisory claim on files; release [<glob>…]; claims
-  agentlink name <new-name>                     rename this agent
-  agentlink register [--tool <t>] [--name n]    register an agent that has no hooks
-
-Setup & control
-  agentlink init [--handle <you>]               set up and start the daemon
-  agentlink install <tool…|all> [--dry-run]     wire up claude codex opencode gemini copilot cursor kiro devin
-  agentlink uninstall <tool…|all>               remove agentlink from those tools
-  agentlink doctor                              check everything
-  agentlink daemon start|stop|restart|status|logs
-  agentlink watch | log                         live traffic | recent messages
-  agentlink pause | resume | mute <agent> | unmute <agent>
-  agentlink policy [list|set|reset]             who may send what (deliver/hold/refuse)
-  agentlink approvals | approve <id> | deny <id>
-
-Global flags: --json  --as <agent-name>  --home <dir>
-Docs: agentlink-plan.md · SECURITY.md`;
+import { commandHelp, OVERVIEW, wantsHelp } from "./help.ts";
 
 const COMMANDS: Record<string, () => Promise<Command>> = {
   send: async () => (await import("./commands/messaging.ts")).send,
@@ -70,7 +38,29 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   install: async () => (await import("./commands/setup.ts")).install,
   uninstall: async () => (await import("./commands/setup.ts")).uninstall,
   doctor: async () => (await import("./commands/setup.ts")).doctor,
+  team: async () => (await import("./commands/team.ts")).team,
+  relay: async () => (await import("./commands/team.ts")).relay,
 };
+
+function editDistance(a: string, b: string): number {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [
+    i,
+    ...new Array<number>(b.length).fill(0),
+  ]);
+  for (let j = 1; j <= b.length; j++) (dp[0] as number[])[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      const row = dp[i] as number[];
+      const prev = dp[i - 1] as number[];
+      row[j] = Math.min(
+        (prev[j] ?? 0) + 1,
+        (row[j - 1] ?? 0) + 1,
+        (prev[j - 1] ?? 0) + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+  }
+  return (dp[a.length] as number[])[b.length] ?? 99;
+}
 
 /** Pulls global flags out of argv (anywhere on the line). */
 function extractGlobals(argv: string[]): {
@@ -105,20 +95,37 @@ function extractGlobals(argv: string[]): {
 
 async function main(argv: string[]): Promise<number> {
   // Hooks run on every tool call: keep this path free of heavy imports.
-  if (argv[0] === "hook") {
+  if (argv[0] === "hook" && !wantsHelp(argv)) {
     const { runHook } = await import("./hook.ts");
     return runHook(resolvePaths(), argv[1] ?? "generic", argv[2] ?? "", argv[3]);
   }
   const globals = extractGlobals(argv);
   if (globals.home) process.env.AGENTLINK_HOME = globals.home;
   const [command, ...rest] = globals.rest;
-  if (!command || command === "help" || command === "--help" || command === "-h") {
-    process.stdout.write(`${HELP}\n`);
+  if (!command || command === "--help" || command === "-h") {
+    process.stdout.write(`${OVERVIEW}\n`);
+    return 0;
+  }
+  if (command === "help") {
+    const topic = rest.find((a) => !a.startsWith("-"));
+    const text = topic ? commandHelp(topic) : OVERVIEW;
+    if (!text) {
+      process.stderr.write(`agentlink: no help for "${topic}"\n\n${OVERVIEW}\n`);
+      return 2;
+    }
+    process.stdout.write(`${text}\n`);
     return 0;
   }
   if (command === "version" || command === "--version" || command === "-v") {
     process.stdout.write(`${VERSION}\n`);
     return 0;
+  }
+  if (wantsHelp(rest)) {
+    const text = commandHelp(command);
+    if (text) {
+      process.stdout.write(`${text}\n`);
+      return 0;
+    }
   }
   if (command === "mcp") {
     const { runMcpServer } = await import("../mcp/server.ts");
@@ -127,7 +134,13 @@ async function main(argv: string[]): Promise<number> {
   }
   const load = COMMANDS[command];
   if (!load) {
-    process.stderr.write(`agentlink: unknown command "${command}"\n\n${HELP}\n`);
+    const guess = [...Object.keys(COMMANDS), "mcp", "help", "version"]
+      .map((c) => ({ c, d: editDistance(c, command) }))
+      .filter((x) => x.d <= 2)
+      .sort((a, b) => a.d - b.d)[0]?.c;
+    process.stderr.write(
+      `agentlink: unknown command "${command}"${guess ? ` (did you mean "${guess}"?)` : ""}\nRun "agentlink --help" for the list.\n`,
+    );
     return 2;
   }
   const { Client } = await import("./client.ts");
@@ -150,6 +163,10 @@ main(process.argv.slice(2))
   .catch(async (error: Error & { code?: string }) => {
     const { UsageError } = await import("./args.ts");
     const usage = error instanceof UsageError;
+    const command = process.argv[2];
     process.stderr.write(`agentlink: ${error.message}\n`);
+    if (usage && command && commandHelp(command)) {
+      process.stderr.write(`Run "agentlink ${command} --help" for usage.\n`);
+    }
     process.exitCode = usage ? 2 : 1;
   });

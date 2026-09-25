@@ -19,11 +19,11 @@ interface AgentView {
   member?: string;
 }
 
-function reach(a: AgentView): string {
+function reach(a: AgentView & { wakeVia?: string | null }): string {
   const caps = a.capabilities ?? {};
   const bits = [];
   if (caps.push) bits.push("push");
-  else if (caps.wake || a.tmux) bits.push("wake");
+  else if (a.wakeVia || caps.wake || a.tmux) bits.push("wake");
   if (caps.midTurn) bits.push("mid-turn");
   else if (caps.nextTurn) bits.push("next-turn");
   return bits.join(",") || "cli";

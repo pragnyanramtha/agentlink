@@ -36,17 +36,19 @@ export interface TestDaemon {
     agentProc: { pid: number; start?: string },
     toolBin?: string,
   ): Promise<T>;
-  stop(): Promise<void>;
+  stop(keepHome?: boolean): Promise<void>;
 }
 
-export async function startTestDaemon(opts: { now?: () => Date } = {}): Promise<TestDaemon> {
-  const home = mkdtempSync(join(tmpdir(), "agentlink-test-"));
+export async function startTestDaemon(
+  opts: { now?: () => Date; handle?: string; home?: string } = {},
+): Promise<TestDaemon> {
+  const home = opts.home ?? mkdtempSync(join(tmpdir(), "agentlink-test-"));
   const paths = resolvePaths({ AGENTLINK_HOME: home, HOME: home } as NodeJS.ProcessEnv);
   const { writeFileSync, mkdirSync } = await import("node:fs");
   mkdirSync(home, { recursive: true });
   writeFileSync(
     join(home, "config.json"),
-    JSON.stringify({ handle: "tester", wake: { tmux: false } }),
+    JSON.stringify({ handle: opts.handle ?? "tester", wake: { tmux: false } }),
   );
   const daemon = await startDaemon({
     paths,
@@ -140,10 +142,10 @@ export async function startTestDaemon(opts: { now?: () => Date } = {}): Promise<
     raw,
     fakeAgentProcess,
     hook,
-    async stop() {
+    async stop(keepHome = false) {
       for (const c of children) c.kill("SIGKILL");
       await daemon.close();
-      rmSync(home, { recursive: true, force: true });
+      if (!keepHome) rmSync(home, { recursive: true, force: true });
     },
   };
 }

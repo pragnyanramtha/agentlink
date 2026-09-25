@@ -11,6 +11,7 @@ import type { DeliveryEngine } from "./delivery.ts";
 import { type HookHandler, HookRequestSchema } from "./hooks.ts";
 import type { Mailbox } from "./mailbox.ts";
 import { agentView, type Registry } from "./registry.ts";
+import type { TeamManager } from "./team-manager.ts";
 import type { AgentRow, CallerInfo, InboxItem, MessageRow, Sender } from "./types.ts";
 
 export interface Services {
@@ -21,6 +22,7 @@ export interface Services {
   hooks: HookHandler;
   claims: Claims;
   opencode: OpenCodeBridge;
+  team: TeamManager;
 }
 
 interface Req {
@@ -123,6 +125,7 @@ const SendSchema = z.object({
     .optional(),
   ttlMs: z.number().int().positive().optional(),
   ack: AckSchema.optional(),
+  force: z.boolean().optional(),
 });
 
 const RegisterSchema = z.object({
@@ -209,9 +212,71 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     return { agent: agentView(agent), created, resumed };
   });
 
-  route("GET", "/v1/agents", (req) => ({
-    agents: registry.list({ includeOffline: req.query.get("all") === "1" }).map(agentView),
-  }));
+  route("GET", "/v1/agents", (req) => {
+    const all = req.query.get("all") === "1";
+    const local = registry.list({ includeOffline: all }).map((a) => ({
+      ...agentView(a),
+      wakeVia: engine.delivererFor(a)?.id ?? null,
+    }));
+    const remote = (s.team.client?.remoteAgents() ?? [])
+      .filter((a) => all || a.state === "busy" || a.state === "idle")
+      .map((a) => ({
+        id: `${a.deviceId}:${a.name}`,
+        name: `${a.member}/${a.name}`,
+        member: a.member,
+        tool: a.tool,
+        state: a.state,
+        stateAt: a.stateAt ?? a.at,
+        lastSeenAt: a.at,
+        repo: a.repo ?? null,
+        branch: a.branch ?? null,
+        status: a.status ?? null,
+        muted: false,
+        capabilities: {},
+        local: false,
+      }));
+    return { agents: [...local, ...remote] };
+  });
+
+  // ------------------------------------------------------------------ team (relay)
+  route("GET", "/v1/team", () => s.team.status());
+
+  route("POST", "/v1/team/create", async (req) => {
+    requireHuman(req, false);
+    const body = z
+      .object({ name: z.string().min(1), relay: z.string().min(1), handle: z.string().optional() })
+      .parse(req.body);
+    return s.team.create(body.name, body.relay, body.handle);
+  });
+
+  route("POST", "/v1/team/invite", async (req) => {
+    requireHuman(req, false);
+    const body = z
+      .object({
+        uses: z.number().int().min(1).max(100).default(1),
+        ttlMs: z
+          .number()
+          .int()
+          .positive()
+          .default(24 * 3600_000),
+      })
+      .parse(req.body);
+    return { invite: await s.team.invite(body.uses, body.ttlMs) };
+  });
+
+  route("POST", "/v1/team/join", async (req) => {
+    requireHuman(req, false);
+    const body = z
+      .object({ invite: z.string().min(10), handle: z.string().optional() })
+      .parse(req.body);
+    return s.team.join(body.invite, body.handle);
+  });
+
+  route("POST", "/v1/team/leave", (req) => {
+    requireHuman(req, false);
+    s.team.leave();
+    return { ok: true };
+  });
 
   route("POST", "/v1/agents/rename", (req) => {
     const body = z.object({ name: z.string(), agent: z.string().optional() }).parse(req.body);
@@ -239,6 +304,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       ...(input.taskId ? { taskId: input.taskId } : {}),
       ...(input.ttlMs ? { ttlMs: input.ttlMs } : {}),
       ...(input.ack ? { ack: input.ack } : {}),
+      ...(input.force ? { force: true } : {}),
       wait: !!input.waitMs,
     });
     const notes = engine.onQueued(result.queued);
@@ -258,7 +324,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     }));
     let reply: ReturnType<typeof replyView> | undefined;
     const reachable = result.deliveries.some((d) =>
-      ["queued", "delivered", "seen"].includes(String(d.state)),
+      ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
     );
     if (input.waitMs && reachable) {
       const m = await mailbox.waitForReply(String(result.message.id), input.waitMs, req.signal);

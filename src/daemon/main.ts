@@ -31,6 +31,7 @@ import { Mailbox } from "./mailbox.ts";
 import { Registry } from "./registry.ts";
 import { createDaemonServer, type Services } from "./server.ts";
 import { Store } from "./store/db.ts";
+import { TeamManager } from "./team-manager.ts";
 
 export interface RunningDaemon {
   services: Services;
@@ -127,13 +128,15 @@ export async function startDaemon(
   engine.use(tmuxDeliverer(ctx));
   const hooks = new HookHandler(ctx, registry, mailbox, engine);
   const claims = new Claims(ctx);
-  const services: Services = { ctx, registry, mailbox, engine, hooks, claims, opencode };
+  const team = new TeamManager(ctx, registry, mailbox, engine);
+  const services: Services = { ctx, registry, mailbox, engine, hooks, claims, opencode, team };
 
   let closing: Promise<void> | undefined;
   const close = (): Promise<void> => {
     closing ??= new Promise<void>((resolve) => {
       clearInterval(sweep);
       clearInterval(expiry);
+      team.stop();
       server.close(() => {
         rmSync(paths.socket, { force: true });
         rmSync(paths.pidFile, { force: true });
@@ -163,6 +166,7 @@ export async function startDaemon(
 
   registry.sweep();
   engine.refreshAll();
+  team.resume();
   const sweep = setInterval(() => {
     try {
       registry.sweep();

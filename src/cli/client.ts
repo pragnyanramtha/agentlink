@@ -101,6 +101,15 @@ export class Client {
             }
             if ((res.statusCode ?? 500) >= 400) {
               const err = (data as { error?: { code?: string; message?: string } }).error;
+              if (err?.code === "no_route") {
+                return reject(
+                  new ApiError(
+                    "daemon_outdated",
+                    "the running agentlink daemon is older than this CLI; restart it: agentlink daemon restart",
+                    res.statusCode ?? 404,
+                  ),
+                );
+              }
               return reject(
                 new ApiError(
                   err?.code ?? "error",

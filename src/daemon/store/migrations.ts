@@ -107,4 +107,21 @@ export const MIGRATIONS: string[] = [
     extra_allowance INTEGER NOT NULL DEFAULT 0          -- messages allowed beyond the cap (granted by a human)
   );
   `,
+  // 2: team relay (M2)
+  `
+  CREATE TABLE outbox (
+    id TEXT PRIMARY KEY,                               -- frame id
+    frame TEXT NOT NULL,                               -- JSON relay frame waiting for a connection
+    created_at TEXT NOT NULL
+  );
+
+  CREATE TABLE members (
+    device_id TEXT PRIMARY KEY,
+    handle TEXT NOT NULL,
+    sign_pub TEXT NOT NULL,
+    box_pub TEXT NOT NULL,
+    device_name TEXT,
+    first_seen TEXT NOT NULL                          -- TOFU: key changes for a device are refused
+  );
+  `,
 ];

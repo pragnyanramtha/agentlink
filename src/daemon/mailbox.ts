@@ -20,6 +20,7 @@ import {
   type PolicyOverrides,
   type Trust,
 } from "../core/policy.ts";
+import { scanSecrets } from "../core/redact.ts";
 import { type RenderItem, renderInjection } from "../core/render.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import { isLive, type Registry } from "./registry.ts";
@@ -45,6 +46,8 @@ export interface SendInput {
   ttlMs?: number;
   hops?: number;
   ack?: AckValue;
+  /** Send to teammates even though the text looks like it contains a secret. */
+  force?: boolean;
 }
 
 interface Recipient {
@@ -52,6 +55,8 @@ interface Recipient {
   toAddr: string;
   agent?: AgentRow;
   human?: boolean;
+  /** Team member handle for recipients on other machines. */
+  remote?: string;
 }
 
 export interface SendResult {
@@ -62,13 +67,48 @@ export interface SendResult {
 
 export type InboxTarget = { agent: AgentRow } | { human: true };
 
+/** How the mailbox reaches teammates (implemented by the relay client). */
+export interface RemoteRouter {
+  teamName: string;
+  connected(): boolean;
+  handles(): string[];
+  agentsOf(handle: string): string[];
+  deliver(handle: string, envelope: Envelope): number;
+  receipt(
+    handle: string,
+    receipt: { messageId: string; to: string; state: string; note?: string },
+  ): void;
+}
+
 const UNREAD: DeliveryState[] = ["queued", "delivered"];
+
+/** Delivery progress order; receipts never move a delivery backwards. */
+const RANK: Record<string, number> = {
+  queued: 0,
+  sent: 1,
+  delivered: 2,
+  held: 2,
+  seen: 3,
+  acked: 4,
+  replied: 5,
+  refused: 5,
+  expired: 5,
+  failed: 5,
+};
+
+export const remoteHandleOf = (fromAddr: string): string | undefined =>
+  fromAddr.startsWith("@")
+    ? fromAddr.slice(1)
+    : fromAddr.includes("/")
+      ? fromAddr.split("/")[0]
+      : undefined;
 
 export class Mailbox {
   readonly #ctx: DaemonContext;
   readonly #registry: Registry;
   readonly #replyWaiters = new Map<string, Set<(m: MessageRow) => void>>();
   readonly #inboxWaiters = new Map<string, Set<() => void>>();
+  remote: RemoteRouter | undefined;
 
   constructor(ctx: DaemonContext, registry: Registry) {
     this.#ctx = ctx;
@@ -117,7 +157,8 @@ export class Mailbox {
     );
   }
 
-  #overrides(scope: Trust): PolicyOverrides {
+  /** Policy overrides for a trust class (user/local/teammate/external) or a teammate's handle. */
+  #overrides(scope: string): PolicyOverrides {
     const rows = this.#ctx.store.all<{ kind: Kind; action: PolicyAction }>(
       "SELECT kind, action FROM policy_overrides WHERE scope = ?",
       scope,
@@ -139,15 +180,33 @@ export class Mailbox {
       toAddr: agent.name,
       agent,
     });
+    const remoteRecipient = (member: string, agent?: string): Recipient => {
+      const remote = this.remote;
+      if (!remote) throw teamNotReady(agent ? `${member}/${agent}` : `@${member}`);
+      if (!remote.handles().includes(member))
+        throw notFound(`team member "${member}" (run: agentlink team)`);
+      return {
+        addr: agent
+          ? { member, agent, team: remote.teamName, role: "agent" }
+          : { member, team: remote.teamName, role: "human" },
+        toAddr: agent ? `${member}/${agent}` : `@${member}`,
+        remote: member,
+      };
+    };
 
     if (to.length === 0) {
       if (!original) throw invalid("no recipient given");
       const author = original.from_agent_id
         ? this.#registry.byId(original.from_agent_id)
         : undefined;
+      const origin = this.envelopeOf(original).from;
       if (author) out.push(agentRecipient(author));
       else if (original.from_addr === `@${this.handle}`) out.push(humanRecipient());
-      else throw invalid(`cannot route a reply to ${original.from_addr} yet`);
+      else if (origin.member !== this.handle && origin.role !== "system") {
+        out.push(
+          remoteRecipient(origin.member, origin.role === "agent" ? origin.agent : undefined),
+        );
+      } else throw invalid(`cannot route a reply to ${original.from_addr}`);
     }
 
     for (const raw of to) {
@@ -155,17 +214,35 @@ export class Mailbox {
       switch (spec.kind) {
         case "name": {
           const agent = this.#registry.byName(spec.name);
-          if (agent) out.push(agentRecipient(agent));
-          else if (spec.name === this.handle) out.push(humanRecipient());
-          else throw notFound(`agent "${spec.name}" (run: agentlink peers)`);
+          if (agent) {
+            out.push(agentRecipient(agent));
+            break;
+          }
+          if (spec.name === this.handle) {
+            out.push(humanRecipient());
+            break;
+          }
+          // A bare name can also mean a teammate's agent, when it is unambiguous.
+          const owners = (this.remote?.handles() ?? []).filter((h) =>
+            this.remote?.agentsOf(h).includes(spec.name),
+          );
+          if (owners.length === 1) out.push(remoteRecipient(owners[0] as string, spec.name));
+          else if (owners.length > 1) {
+            throw invalid(
+              `"${spec.name}" is ambiguous; use one of: ${owners.map((h) => `${h}/${spec.name}`).join(", ")}`,
+            );
+          } else throw notFound(`agent "${spec.name}" (run: agentlink peers)`);
           break;
         }
         case "member":
-          if (spec.member === this.handle && !spec.team) out.push(humanRecipient());
-          else throw teamNotReady(raw);
+          if (spec.member === this.handle) out.push(humanRecipient());
+          else out.push(remoteRecipient(spec.member));
           break;
         case "member-agent": {
-          if (spec.member !== this.handle || spec.team) throw teamNotReady(raw);
+          if (spec.member !== this.handle) {
+            out.push(remoteRecipient(spec.member, spec.agent));
+            break;
+          }
           const agent = this.#registry.byName(spec.agent);
           if (!agent) throw notFound(`agent "${spec.agent}" (run: agentlink peers)`);
           out.push(agentRecipient(agent));
@@ -249,12 +326,12 @@ export class Mailbox {
     }
     const since = iso(new Date(this.#ctx.now().getTime() - LIMITS.pairRateWindowMs));
     for (const r of recipients) {
-      if (!r.agent) continue;
+      if (!r.agent && !r.remote) continue;
       const n = store.get<{ n: number }>(
         `SELECT COUNT(*) AS n FROM messages m JOIN deliveries d ON d.message_id = m.id
-         WHERE m.from_agent_id = ? AND d.to_agent_id = ? AND m.created_at > ?`,
+         WHERE m.from_agent_id = ? AND ${r.agent ? "d.to_agent_id = ?" : "d.to_addr = ?"} AND m.created_at > ?`,
         sender.agent.id,
-        r.agent.id,
+        r.agent ? r.agent.id : r.toAddr,
         since,
       )?.n;
       if ((n ?? 0) >= LIMITS.pairRateMax) {
@@ -286,6 +363,14 @@ export class Mailbox {
       original?.thread_id ?? (input.thread ? this.resolveThread(input.thread) : undefined);
     const key = echoKey(`${input.kind}:${text}`);
     this.#checkGuards(sender, recipients, thread, original, key, input.hops ?? 0);
+    if (recipients.some((r) => r.remote) && !input.force) {
+      const secrets = scanSecrets(text);
+      if (secrets.length > 0) {
+        throw invalid(
+          `refusing to send what looks like a secret to a teammate (${[...new Set(secrets.map((s) => s.type))].join(", ")}); remove it, or resend with --force`,
+        );
+      }
+    }
 
     const now = this.#ctx.now();
     const trust: Trust = sender.kind === "human" ? "user" : "local";
@@ -344,7 +429,10 @@ export class Mailbox {
         let state: DeliveryState;
         let note: string | null = null;
         let method: string | null = null;
-        if (answersWaiter && isOriginalAuthor(r)) {
+        if (r.remote) {
+          state = "queued";
+          method = "relay";
+        } else if (answersWaiter && isOriginalAuthor(r)) {
           state = "seen";
           method = "longpoll";
         } else if (r.human) {
@@ -372,6 +460,24 @@ export class Mailbox {
       if (original) this.#markAnswered(original, sender, envelope.messageId, input.kind, stamp);
       return ids;
     });
+
+    // Teammates: one sealed copy per member (their daemon picks out its own recipients).
+    for (const handle of new Set(recipients.flatMap((r) => (r.remote ? [r.remote] : [])))) {
+      const devices = this.remote?.deliver(handle, envelope) ?? 0;
+      const connected = this.remote?.connected() ?? false;
+      store.run(
+        `UPDATE deliveries SET state = ?, note = ? WHERE message_id = ? AND (to_addr = ? OR to_addr LIKE ?)`,
+        devices > 0 ? "sent" : "failed",
+        devices === 0
+          ? `${handle} has no devices in the team`
+          : connected
+            ? `sent to ${handle} (${devices} device${devices > 1 ? "s" : ""}) via the relay`
+            : "relay offline: queued; sends when agentlink reconnects",
+        envelope.messageId,
+        `@${handle}`,
+        `${handle}/%`,
+      );
+    }
 
     const message = store.get<MessageRow>(
       "SELECT * FROM messages WHERE id = ?",
@@ -422,6 +528,183 @@ export class Mailbox {
     if (updated.changes > 0) {
       for (const d of this.deliveriesOf(original.id)) this.#publishDelivery(d);
     }
+  }
+
+  // ---------------------------------------------------------------- teammates
+
+  /**
+   * Accepts a verified envelope from teammate `fromHandle` (the relay client checked the device
+   * signature). Returns local deliveries to plan and "delivered/held/…" receipts to send back.
+   */
+  receiveRemote(
+    raw: unknown,
+    fromHandle: string,
+  ): {
+    queued: InboxItem[];
+    receipts: { to: string; state: string; note?: string }[];
+    messageId?: string;
+  } {
+    const { store } = this.#ctx;
+    const envelope = EnvelopeSchema.parse(raw);
+    if (envelope.from.member !== fromHandle || envelope.from.role === "system") {
+      throw invalid(
+        `envelope claims to be from ${envelope.from.member}, but ${fromHandle} sent it`,
+      );
+    }
+    if (store.get("SELECT 1 FROM messages WHERE id = ?", envelope.messageId)) {
+      return { queued: [], receipts: [] }; // duplicate (relay retry)
+    }
+    const mine = envelope.to.filter((a) => a.member === this.handle);
+    if (mine.length === 0) return { queued: [], receipts: [] };
+    const text = textOf(envelope);
+    const fromAddr =
+      envelope.from.role === "agent" && envelope.from.agent
+        ? `${envelope.from.member}/${envelope.from.agent}`
+        : `@${envelope.from.member}`;
+    const original = envelope.replyTo
+      ? store.get<MessageRow>("SELECT * FROM messages WHERE id = ?", envelope.replyTo)
+      : undefined;
+    const answersWaiter =
+      !!original &&
+      ["reply", "review_result", "ack"].includes(envelope.kind) &&
+      this.hasReplyWaiter(original.id);
+    const overrides = { ...this.#overrides("teammate"), ...this.#overrides(fromHandle) };
+    const stamp = iso(this.#ctx.now());
+    const receipts: { to: string; state: string; note?: string }[] = [];
+
+    const ids = store.tx(() => {
+      store.run(
+        `INSERT INTO messages (id, thread_id, reply_to, task_id, kind, from_addr, from_agent_id, trust, envelope,
+           preview, echo_key, wait, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, NULL, 'teammate', ?, ?, ?, ?, ?, ?)`,
+        envelope.messageId,
+        envelope.contextId,
+        envelope.replyTo ?? null,
+        envelope.taskId ?? null,
+        envelope.kind,
+        fromAddr,
+        JSON.stringify(envelope),
+        preview(text),
+        echoKey(`${envelope.kind}:${text}`),
+        envelope.meta.wait ? 1 : 0,
+        envelope.createdAt,
+        envelope.meta.expiresAt,
+      );
+      const out: number[] = [];
+      for (const addr of mine) {
+        const human = addr.role === "human" || !addr.agent;
+        const agent = human ? undefined : this.#registry.byName(addr.agent as string);
+        const theirAddr = human ? `@${this.handle}` : `${this.handle}/${addr.agent}`;
+        if (!human && !agent) {
+          receipts.push({
+            to: theirAddr,
+            state: "failed",
+            note: `no agent named ${addr.agent} on ${this.handle}'s machine`,
+          });
+          continue;
+        }
+        let state: DeliveryState;
+        let method: string | null = null;
+        let note: string | null = null;
+        if (answersWaiter && agent && agent.id === original?.from_agent_id) {
+          state = "seen";
+          method = "longpoll";
+        } else if (human) {
+          state = "delivered";
+        } else {
+          const action = decidePolicy("teammate", envelope.kind, overrides);
+          state = action === "deliver" ? "queued" : action === "hold" ? "held" : "refused";
+          if (action !== "deliver") note = `policy: ${action}`;
+        }
+        const res = store.run(
+          `INSERT INTO deliveries (message_id, to_addr, to_agent_id, state, method, note, created_at, delivered_at, seen_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          envelope.messageId,
+          human ? `@${this.handle}` : (agent as AgentRow).name,
+          agent?.id ?? null,
+          state,
+          method,
+          note,
+          stamp,
+          state === "delivered" || state === "seen" ? stamp : null,
+          state === "seen" ? stamp : null,
+        );
+        out.push(res.lastInsertRowid);
+        receipts.push({
+          to: theirAddr,
+          state: state === "queued" ? "delivered" : state,
+          ...(note ? { note } : {}),
+        });
+      }
+      if (original) {
+        const isAck = envelope.kind === "ack";
+        store.run(
+          `UPDATE deliveries SET state = ?, ${isAck ? "acked_at" : "replied_at"} = ?, reply_id = COALESCE(reply_id, ?)
+           WHERE message_id = ? AND to_addr = ? AND state NOT IN ('refused','expired','replied')`,
+          isAck ? "acked" : "replied",
+          stamp,
+          envelope.messageId,
+          original.id,
+          fromAddr,
+        );
+      }
+      return out;
+    });
+
+    const message = store.get<MessageRow>(
+      "SELECT * FROM messages WHERE id = ?",
+      envelope.messageId,
+    ) as MessageRow;
+    const deliveries = ids.map(
+      (id) => store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", id) as DeliveryRow,
+    );
+    this.#ctx.events.publish({ type: "message", message: this.messageView(message) });
+    for (const d of deliveries) this.#publishDelivery(d);
+    if (original) {
+      for (const d of this.deliveriesOf(original.id)) this.#publishDelivery(d);
+      this.#resolveReplyWaiters(original.id, message);
+    }
+    for (const d of deliveries) this.#notifyInbox(d.to_agent_id ?? "human");
+    return {
+      queued: deliveries
+        .filter((d) => d.state === "queued")
+        .map((d) => ({ delivery: d, message, envelope })),
+      receipts,
+      messageId: envelope.messageId,
+    };
+  }
+
+  /** A teammate's daemon reports progress on a message we sent it. Never moves backwards. */
+  applyReceipt(
+    fromHandle: string,
+    receipt: { messageId: string; to: string; state: string; note?: string },
+  ): boolean {
+    if (receipt.to !== `@${fromHandle}` && !receipt.to.startsWith(`${fromHandle}/`)) return false;
+    const d = this.#ctx.store.get<DeliveryRow>(
+      "SELECT * FROM deliveries WHERE message_id = ? AND to_addr = ?",
+      receipt.messageId,
+      receipt.to,
+    );
+    if (!d || (RANK[receipt.state] ?? -1) <= (RANK[d.state] ?? 0)) return false;
+    const stamp = iso(this.#ctx.now());
+    const column: Record<string, string> = {
+      delivered: "delivered_at",
+      held: "delivered_at",
+      seen: "seen_at",
+      acked: "acked_at",
+      replied: "replied_at",
+    };
+    const col = column[receipt.state];
+    this.#ctx.store.run(
+      `UPDATE deliveries SET state = ?, note = COALESCE(?, note)${col ? `, ${col} = COALESCE(${col}, ?)` : ""} WHERE id = ?`,
+      ...([receipt.state, receipt.note ?? null, ...(col ? [stamp] : []), d.id] as (
+        | string
+        | number
+        | null
+      )[]),
+    );
+    const updated = this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", d.id);
+    if (updated) this.#publishDelivery(updated);
+    return true;
   }
 
   resolveThread(idOrPrefix: string): string {

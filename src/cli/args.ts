@@ -55,7 +55,7 @@ export function splitRecipients(value: string): string[] {
 export function parseDuration(
   value: string | undefined,
   fallbackMs: number,
-  unit: "s" | "m" = "s",
+  unit: "s" | "m" | "h" = "s",
 ): number {
   if (value === undefined || value === "") return fallbackMs;
   const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/.exec(value.trim());

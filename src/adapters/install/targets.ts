@@ -102,8 +102,9 @@ interface HookCmd {
 export function hookCommand(ctx: InstallContext, h: HookCmd): string {
   const shim = shq(ctx.shim);
   const bail = h.json ? "{ echo '{}'; exit 0; }" : "exit 0";
+  // Run Node only if mail is pending, the agent is idle (so it gets marked busy), or unknown.
   const fast = h.fast
-    ? `D=${shq(ctx.pendingDir)}; [ -e "$D/pid-$PPID" ] || [ ! -e "$D/known-$PPID" ] || ${bail}; `
+    ? `D=${shq(ctx.pendingDir)}; [ -e "$D/pid-$PPID" ] || [ -e "$D/idle-$PPID" ] || [ ! -e "$D/known-$PPID" ] || ${bail}; `
     : "";
   return `${fast}[ -x ${shim} ] || ${bail}; exec ${shim} hook ${h.tool} ${h.event}`;
 }

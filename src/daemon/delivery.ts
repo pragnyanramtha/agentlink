@@ -246,15 +246,20 @@ export class DeliveryEngine {
     const active = count > 0 && live && !agent?.muted && !this.#mailbox.paused;
     try {
       // Drop flags that belonged to this agent under another pid (e.g. after a restart).
+      const idle = live && agent?.state === "idle";
       for (const file of readdirSync(dir)) {
-        if (!file.startsWith("pid-") && !file.startsWith("known-")) continue;
+        if (!/^(pid|known|idle)-/.test(file)) continue;
         if (safeRead(join(dir, file)) !== agentId) continue;
         const keep =
-          (live && file === `known-${agent?.pid}`) || (active && file === `pid-${agent?.pid}`);
+          (live && file === `known-${agent?.pid}`) ||
+          (active && file === `pid-${agent?.pid}`) ||
+          (idle && file === `idle-${agent?.pid}`);
         if (!keep) rmSync(join(dir, file), { force: true });
       }
       if (live && agent?.pid) {
         writeFileSync(join(dir, `known-${agent.pid}`), agentId, { mode: 0o600 });
+        // An idle agent's next hook must reach the daemon so it can be marked busy.
+        if (idle) writeFileSync(join(dir, `idle-${agent.pid}`), agentId, { mode: 0o600 });
       }
       if (active && agent) {
         writeFileSync(join(dir, agentId), String(count), { mode: 0o600 });

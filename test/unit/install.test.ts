@@ -188,6 +188,12 @@ describe("hook fast path", () => {
     expect(runSh()).toBe("");
     writeFileSync(join(pending, `pid-${process.pid}`), "agent-1");
     expect(runSh()).toBe("RAN hook claude post-tool");
+    // an idle agent must reach the daemon once so it is marked busy
+    rmSync(join(pending, `pid-${process.pid}`));
+    writeFileSync(join(pending, `idle-${process.pid}`), "agent-1");
+    expect(runSh()).toBe("RAN hook claude post-tool");
+    rmSync(join(pending, `idle-${process.pid}`));
+    writeFileSync(join(pending, `pid-${process.pid}`), "agent-1");
     // JSON-contract tools print {} when skipping
     rmSync(join(pending, `pid-${process.pid}`));
     const jsonCmd = hookCommand(
