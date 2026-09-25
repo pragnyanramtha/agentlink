@@ -1,11 +1,7 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-.env
-.agentmesh/
-agentmesh.db
+node_modules/
 dist/
-build/
-.pytest_cache/
-
+coverage/
+*.log
+.agentlink-dev/
+spikes/**/out/
+.DS_Store

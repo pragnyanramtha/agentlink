@@ -1,0 +1,44 @@
+{
+  "name": "agentlink",
+  "version": "0.1.0-dev.0",
+  "description": "Let AI coding agents (Claude Code, Codex, OpenCode, Gemini, Copilot, …) message each other, on one machine and across teammates' machines.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "agentlink": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "plugins",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "packageManager": "pnpm@11.17.0",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:security": "vitest run test/security",
+    "test:all": "vitest run",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "dev": "node src/cli/index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "ws": "8.21.3",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@types/node": "24.13.5",
+    "@types/ws": "8.18.1",
+    "typescript": "7.0.2",
+    "vitest": "5.0.1"
+  }
+}

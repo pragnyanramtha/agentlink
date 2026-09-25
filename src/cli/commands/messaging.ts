@@ -1,0 +1,441 @@
+import { LIMITS } from "../../core/limits.ts";
+import {
+  type CliContext,
+  type Command,
+  out,
+  parse,
+  parseDuration,
+  readText,
+  splitRecipients,
+  UsageError,
+} from "../args.ts";
+import { ago, c, deliveryColor, indent } from "../format.ts";
+
+interface DeliveryView {
+  id: number;
+  to: string;
+  state: string;
+  note?: string;
+  method?: string | null;
+  toState?: string;
+}
+interface MessageView {
+  id: string;
+  thread: string;
+  kind: string;
+  from: string;
+  preview: string;
+  createdAt: string;
+  replyTo?: string | null;
+}
+interface SendResponse {
+  message: MessageView;
+  deliveries: DeliveryView[];
+  reply?: { message: MessageView; text: string; ack?: string };
+  waited: boolean;
+}
+interface InboxItemView {
+  delivery: DeliveryView;
+  message: MessageView;
+  text: string;
+  attachments: string[];
+  ack?: string;
+}
+
+const KINDS = [
+  "info",
+  "ask",
+  "request",
+  "handoff",
+  "reply",
+  "ack",
+  "review_request",
+  "review_result",
+];
+
+function printSend(ctx: CliContext, res: SendResponse, waitMs: number): void {
+  out(ctx, res, () => {
+    const lines = res.deliveries.map((d) => `${c.cyan("→")} ${c.bold(d.to)}: ${d.note ?? d.state}`);
+    lines.push(
+      c.dim(`  message ${res.message.id} (${res.message.kind}, thread ${res.message.thread})`),
+    );
+    if (res.reply) {
+      const r = res.reply;
+      lines.push("");
+      lines.push(
+        `${c.green("←")} ${r.message.kind} from ${c.bold(r.message.from)} ${c.dim(`(${r.message.id})`)}:`,
+      );
+      lines.push(r.ack ? `[${r.ack}] ${r.text}` : r.text);
+    } else if (res.waited) {
+      lines.push(
+        c.yellow(
+          `No answer within ${Math.round(waitMs / 1000)}s. It will reach you automatically when it arrives (or run: agentlink inbox).`,
+        ),
+      );
+    }
+    return lines.join("\n");
+  });
+}
+
+async function sendCommon(
+  ctx: CliContext,
+  opts: {
+    to?: string[];
+    kind: string;
+    text: string;
+    replyTo?: string;
+    thread?: string;
+    waitMs: number;
+    ttl?: string;
+  },
+): Promise<number> {
+  if (!opts.text.trim()) throw new UsageError("message text is empty");
+  if (!KINDS.includes(opts.kind))
+    throw new UsageError(`unknown --kind "${opts.kind}" (use: ${KINDS.join(", ")})`);
+  await ctx.client.ensureDaemon();
+  const res = await ctx.client.request<SendResponse>(
+    "POST",
+    "/v1/messages",
+    {
+      ...(opts.to ? { to: opts.to } : {}),
+      kind: opts.kind,
+      text: opts.text,
+      ...(opts.replyTo ? { replyTo: opts.replyTo } : {}),
+      ...(opts.thread ? { thread: opts.thread } : {}),
+      ...(opts.waitMs > 0 ? { waitMs: opts.waitMs } : {}),
+      ...(opts.ttl ? { ttlMs: parseDuration(opts.ttl, 0, "m") } : {}),
+    },
+    { timeoutMs: opts.waitMs > 0 ? opts.waitMs + 10_000 : 15_000 },
+  );
+  printSend(ctx, res, opts.waitMs);
+  return 0;
+}
+
+export const send: Command = async (ctx) => {
+  const { values, positionals } = parse(ctx.argv, {
+    kind: { type: "string", short: "k", default: "info" },
+    thread: { type: "string", short: "t" },
+    wait: { type: "string", short: "w" },
+    stdin: { type: "boolean" },
+    ttl: { type: "string" },
+  });
+  const [to, ...rest] = positionals;
+  if (!to)
+    throw new UsageError(
+      'usage: agentlink send <agent>[,<agent>…] "<message>" [--kind ask|request|handoff]',
+    );
+  const kind = String(values.kind);
+  const waitMs =
+    values.wait !== undefined ? parseDuration(values.wait, LIMITS.cliAskDefaultWaitMs) : 0;
+  return sendCommon(ctx, {
+    to: splitRecipients(to),
+    kind,
+    text: await readText(rest, Boolean(values.stdin)),
+    ...(values.thread ? { thread: values.thread } : {}),
+    waitMs,
+    ...(values.ttl ? { ttl: values.ttl } : {}),
+  });
+};
+
+export const ask: Command = async (ctx) => {
+  const { values, positionals } = parse(ctx.argv, {
+    timeout: { type: "string" },
+    "no-wait": { type: "boolean" },
+    thread: { type: "string", short: "t" },
+    stdin: { type: "boolean" },
+  });
+  const [to, ...rest] = positionals;
+  if (!to)
+    throw new UsageError('usage: agentlink ask <agent> "<question>" [--timeout 110s] [--no-wait]');
+  return sendCommon(ctx, {
+    to: splitRecipients(to),
+    kind: "ask",
+    text: await readText(rest, Boolean(values.stdin)),
+    ...(values.thread ? { thread: values.thread } : {}),
+    waitMs: values["no-wait"] ? 0 : parseDuration(values.timeout, LIMITS.cliAskDefaultWaitMs),
+  });
+};
+
+export const reply: Command = async (ctx) => {
+  const { values, positionals } = parse(ctx.argv, {
+    wait: { type: "string", short: "w" },
+    stdin: { type: "boolean" },
+    kind: { type: "string", short: "k", default: "reply" },
+  });
+  const [id, ...rest] = positionals;
+  if (!id) throw new UsageError('usage: agentlink reply <message-id> "<answer>"');
+  return sendCommon(ctx, {
+    kind: String(values.kind),
+    replyTo: id,
+    text: await readText(rest, Boolean(values.stdin)),
+    waitMs: values.wait !== undefined ? parseDuration(values.wait, LIMITS.cliAskDefaultWaitMs) : 0,
+  });
+};
+
+export const ack: Command = async (ctx) => {
+  const { values, positionals } = parse(ctx.argv, {
+    accept: { type: "boolean" },
+    decline: { type: "boolean" },
+  });
+  const [id, ...rest] = positionals;
+  if (!id) throw new UsageError('usage: agentlink ack <message-id> [--accept|--decline] ["note"]');
+  if (values.accept && values.decline)
+    throw new UsageError("choose --accept or --decline, not both");
+  const ackValue = values.accept ? "accept" : values.decline ? "decline" : "processed";
+  await ctx.client.ensureDaemon();
+  const res = await ctx.client.request<{ message: MessageView; deliveries: DeliveryView[] }>(
+    "POST",
+    `/v1/messages/${encodeURIComponent(id)}/ack`,
+    { ack: ackValue, ...(rest.length ? { note: rest.join(" ") } : {}) },
+  );
+  out(
+    ctx,
+    res,
+    () => `${c.green("✓")} ${ackValue} sent to ${res.deliveries.map((d) => d.to).join(", ")}`,
+  );
+  return 0;
+};
+
+function printItems(items: InboxItemView[]): string {
+  if (items.length === 0) return c.dim("No new messages.");
+  return items
+    .map((i) => {
+      const m = i.message;
+      const head = `${c.bold(m.kind)} from ${c.cyan(m.from)} ${c.dim(`· ${ago(m.createdAt)} · ${m.id}`)}`;
+      const body = indent(i.ack ? `[${i.ack}] ${i.text}` : i.text);
+      const atts = i.attachments.map((a) => c.dim(`  [${a}]`));
+      const hint = ["ask", "request", "review_request"].includes(m.kind)
+        ? c.dim(`  reply: agentlink reply ${m.id} "<answer>"`)
+        : m.kind === "handoff"
+          ? c.dim(
+              `  accept: agentlink ack ${m.id} --accept   decline: agentlink ack ${m.id} --decline`,
+            )
+          : "";
+      return [head, body, ...atts, hint].filter(Boolean).join("\n");
+    })
+    .join("\n\n");
+}
+
+export const inbox: Command = async (ctx) => {
+  const { values } = parse(ctx.argv, {
+    all: { type: "boolean", short: "a" },
+    peek: { type: "boolean" },
+    wait: { type: "string", short: "w" },
+    limit: { type: "string", short: "n" },
+    format: { type: "string" },
+  });
+  const format = values.format ?? (process.stdout.isTTY || ctx.json ? "text" : "inject");
+  if (!["text", "inject"].includes(format)) throw new UsageError("--format must be text or inject");
+  await ctx.client.ensureDaemon();
+  const q = new URLSearchParams();
+  if (values.all) q.set("all", "1");
+  if (values.peek) q.set("peek", "1");
+  if (values.limit) q.set("limit", values.limit);
+  const waitMs = values.wait !== undefined ? parseDuration(values.wait, 60_000) : 0;
+  if (waitMs) q.set("waitMs", String(waitMs));
+  if (format === "inject" && !ctx.json) {
+    q.set("format", "inject");
+    const res = await ctx.client.request<{ count: number; text: string }>(
+      "GET",
+      `/v1/inbox?${q}`,
+      undefined,
+      {
+        timeoutMs: waitMs + 10_000,
+      },
+    );
+    process.stdout.write(`${res.count ? res.text : "No new agentlink messages."}\n`);
+    return 0;
+  }
+  const res = await ctx.client.request<{ items: InboxItemView[] }>(
+    "GET",
+    `/v1/inbox?${q}`,
+    undefined,
+    {
+      timeoutMs: waitMs + 10_000,
+    },
+  );
+  out(ctx, res, () => printItems(res.items));
+  return 0;
+};
+
+export const show: Command = async (ctx) => {
+  const { values, positionals } = parse(ctx.argv, {
+    part: { type: "string", short: "p" },
+    raw: { type: "boolean" },
+  });
+  const [id] = positionals;
+  if (!id) throw new UsageError("usage: agentlink show <message-id> [--part N] [--raw]");
+  await ctx.client.ensureDaemon();
+  const q = new URLSearchParams();
+  if (values.part) q.set("part", values.part);
+  if (values.raw) q.set("raw", "1");
+  const res = await ctx.client.request<{
+    message: MessageView;
+    text?: string;
+    part?: {
+      kind: string;
+      text?: string;
+      data?: unknown;
+      file?: { name?: string; bytes?: string };
+    };
+    attachments?: string[];
+    deliveries?: DeliveryView[];
+  }>("GET", `/v1/messages/${encodeURIComponent(id)}?${q}`);
+  out(ctx, res, () => {
+    if (res.part) {
+      const p = res.part;
+      if (p.kind === "text") return p.text ?? "";
+      if (p.kind === "data") return JSON.stringify(p.data, null, 2);
+      return p.file?.bytes
+        ? Buffer.from(p.file.bytes, "base64").toString("utf8")
+        : JSON.stringify(p.file);
+    }
+    const m = res.message;
+    const lines = [
+      `${c.bold(m.kind)} from ${c.cyan(m.from)} ${c.dim(`· ${ago(m.createdAt)} · ${m.id} · thread ${m.thread}`)}`,
+      m.replyTo ? c.dim(`  in reply to ${m.replyTo}`) : "",
+      "",
+      res.text ?? "",
+      ...(res.attachments ?? []).map((a) => c.dim(`[${a}]`)),
+      "",
+      ...(res.deliveries ?? []).map(
+        (d) =>
+          `${c.dim("to")} ${d.to}: ${deliveryColor(d.state)}${d.method ? c.dim(` via ${d.method}`) : ""}`,
+      ),
+    ];
+    return lines.filter((l, i) => l !== "" || i > 1).join("\n");
+  });
+  return 0;
+};
+
+export const thread: Command = async (ctx) => {
+  const { values, positionals } = parse(ctx.argv, { allow: { type: "string" } });
+  const [id] = positionals;
+  if (!id) throw new UsageError("usage: agentlink thread <thread-or-message-id> [--allow N]");
+  await ctx.client.ensureDaemon();
+  if (values.allow) {
+    await ctx.client.request("POST", `/v1/threads/${encodeURIComponent(id)}/allow`, {
+      extra: Number(values.allow),
+    });
+    process.stdout.write(
+      `${c.green("✓")} thread ${id} may continue for ${values.allow} more messages\n`,
+    );
+    return 0;
+  }
+  const res = await ctx.client.request<{
+    thread: string;
+    messages: { message: MessageView; text: string; deliveries: DeliveryView[] }[];
+  }>("GET", `/v1/threads/${encodeURIComponent(id)}`);
+  out(ctx, res, () =>
+    [
+      c.dim(`thread ${res.thread} · ${res.messages.length} message(s)`),
+      ...res.messages.map(
+        ({ message: m, text, deliveries }) =>
+          `\n${c.bold(m.kind)} ${c.cyan(m.from)} → ${deliveries.map((d) => `${d.to} (${deliveryColor(d.state)})`).join(", ")} ${c.dim(`· ${ago(m.createdAt)} · ${m.id}`)}\n${indent(text)}`,
+      ),
+    ].join("\n"),
+  );
+  return 0;
+};
+
+export const status: Command = async (ctx) => {
+  const { positionals } = parse(ctx.argv, {});
+  await ctx.client.ensureDaemon();
+  const [id] = positionals;
+  if (id) {
+    const res = await ctx.client.request<{ message: MessageView; deliveries: DeliveryView[] }>(
+      "GET",
+      `/v1/messages/${encodeURIComponent(id)}?peek=1`,
+    );
+    out(ctx, res, () =>
+      [
+        `${c.bold(res.message.kind)} ${res.message.id} ${c.dim(`from ${res.message.from} · ${ago(res.message.createdAt)}`)}`,
+        ...res.deliveries.map(
+          (d) =>
+            `  ${d.to}: ${deliveryColor(d.state)}${d.method ? c.dim(` via ${d.method}`) : ""}${d.note ? c.dim(` (${d.note})`) : ""}`,
+        ),
+      ].join("\n"),
+    );
+    return 0;
+  }
+  const who = await ctx.client.request<{ agent: { name: string } | null; handle: string }>(
+    "GET",
+    "/v1/whoami",
+  );
+  const me = who.agent?.name ?? `@${who.handle}`;
+  const log = await ctx.client.request<{
+    messages: { message: MessageView; deliveries: DeliveryView[] }[];
+  }>("GET", "/v1/log?limit=100");
+  const mine = log.messages.filter((m) => m.message.from === me).slice(-10);
+  out(ctx, { me, messages: mine }, () =>
+    mine.length === 0
+      ? c.dim(`No messages sent by ${me} yet.`)
+      : mine
+          .map(
+            ({ message: m, deliveries }) =>
+              `${c.bold(m.kind)} ${c.dim(m.id)} "${m.preview}"\n${deliveries
+                .map(
+                  (d) =>
+                    `  → ${d.to}: ${deliveryColor(d.state)}${d.method ? c.dim(` via ${d.method}`) : ""}`,
+                )
+                .join("\n")}`,
+          )
+          .join("\n"),
+  );
+  return 0;
+};
+
+export const log: Command = async (ctx) => {
+  const { values } = parse(ctx.argv, { limit: { type: "string", short: "n", default: "30" } });
+  await ctx.client.ensureDaemon();
+  const res = await ctx.client.request<{
+    messages: { message: MessageView; deliveries: DeliveryView[] }[];
+  }>("GET", `/v1/log?limit=${encodeURIComponent(String(values.limit))}`);
+  out(ctx, res, () =>
+    res.messages.length === 0
+      ? c.dim("No messages yet.")
+      : res.messages
+          .map(
+            ({ message: m, deliveries }) =>
+              `${c.dim(ago(m.createdAt).padEnd(8))} ${c.bold(m.kind.padEnd(8))} ${c.cyan(m.from)} → ${deliveries
+                .map((d) => `${d.to} ${deliveryColor(d.state)}`)
+                .join(", ")}  ${c.dim(`"${m.preview}"`)}`,
+          )
+          .join("\n"),
+  );
+  return 0;
+};
+
+export const watch: Command = async (ctx) => {
+  parse(ctx.argv, {});
+  await ctx.client.ensureDaemon();
+  const controller = new AbortController();
+  process.on("SIGINT", () => controller.abort());
+  if (!ctx.json) process.stdout.write(c.dim("watching agentlink events (Ctrl-C to stop)…\n"));
+  await ctx.client.events((event) => {
+    if (ctx.json) {
+      process.stdout.write(`${JSON.stringify(event)}\n`);
+      return;
+    }
+    const time = c.dim(new Date().toLocaleTimeString());
+    if (event.type === "agent") {
+      const a = event.agent as Record<string, string>;
+      process.stdout.write(
+        `${time} agent   ${c.bold(a.name ?? "?")} ${a.state}${a.status ? c.dim(` · ${a.status}`) : ""}\n`,
+      );
+    } else if (event.type === "message") {
+      const m = event.message as Record<string, string>;
+      process.stdout.write(
+        `${time} message ${c.bold(m.kind ?? "")} ${c.cyan(m.from ?? "")} ${c.dim(`"${m.preview}"`)}\n`,
+      );
+    } else if (event.type === "delivery") {
+      const d = event.delivery as Record<string, string>;
+      process.stdout.write(
+        `${time} deliver ${d.to} ${deliveryColor(d.state ?? "")}${d.method ? c.dim(` via ${d.method}`) : ""}\n`,
+      );
+    } else if (event.type === "notice") {
+      process.stdout.write(`${time} notice  ${String(event.text)}\n`);
+    }
+  }, controller.signal);
+  return 0;
+};
