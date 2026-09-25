@@ -242,7 +242,7 @@ export const relay: Command = async (ctx) => {
   });
   process.stdout.write(
     [
-      `${c.green("✓")} agentlink relay on ${running.url} (data: ${values.data ?? join(ctx.paths.home, "relay")})`,
+      `${c.green("✓")} agentlink relay on ${["0.0.0.0", "::"].includes(String(values.host)) ? `port ${running.port}, all interfaces` : running.url} (data: ${values.data ?? join(ctx.paths.home, "relay")})`,
       c.dim("  It stores and forwards sealed blobs; it cannot read messages. Ctrl-C to stop."),
       String(values.host) === "127.0.0.1"
         ? c.dim(

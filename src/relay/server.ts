@@ -413,8 +413,11 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   });
   const address = http.address();
   const port = typeof address === "object" && address ? address.port : (opts.port ?? 7700);
-  const url = `ws://${opts.host && opts.host !== "0.0.0.0" ? opts.host : "127.0.0.1"}:${port}`;
-  log.info(`agentlink relay listening on ${url}`);
+  const allInterfaces = !opts.host || opts.host === "0.0.0.0" || opts.host === "::";
+  const url = `ws://${allInterfaces ? "127.0.0.1" : opts.host}:${port}`;
+  log.info(
+    `agentlink relay listening on ${allInterfaces ? `port ${port} on all interfaces` : url}`,
+  );
   return {
     url,
     port,
