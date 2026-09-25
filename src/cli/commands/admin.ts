@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, statSync, watch } from "node:fs";
 import { createInterface } from "node:readline/promises";
+import { NAME_RE, slugify } from "../../core/addr.ts";
 import { loadConfig, saveConfig } from "../../core/config.ts";
 import { KINDS } from "../../core/envelope.ts";
 import { POLICY_ACTIONS } from "../../core/policy.ts";
@@ -11,9 +12,18 @@ import { c, indent, table } from "../format.ts";
 export const init: Command = async (ctx) => {
   const { values } = parse(ctx.argv, { handle: { type: "string" } });
   const config = loadConfig(ctx.paths);
-  if (values.handle) config.handle = values.handle.toLowerCase();
+  if (values.handle) {
+    const handle = values.handle.trim().toLowerCase();
+    if (!NAME_RE.test(handle)) {
+      throw new UsageError(
+        `a handle uses lowercase letters, digits, "." "_" "-" (try: ${slugify(values.handle, 32)})`,
+      );
+    }
+    config.handle = handle;
+  }
   saveConfig(ctx.paths, config);
   const health = await ctx.client.ensureDaemon();
+  await ctx.client.request("POST", "/v1/config/reload", {}).catch(() => undefined);
   out(ctx, { config, health }, () =>
     [
       `${c.green("✓")} agentlink is ready. You are ${c.bold(`@${config.handle}`)} (home: ${ctx.paths.home}).`,

@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readlinkSync } from "node:fs";
 
 export interface ProcInfo {
   pid: number;
@@ -119,4 +119,13 @@ export function findToolProcess(tool: string, chain: ProcInfo[]): ProcInfo | und
   const byName = above.find((p) => matchesTool(tool, p));
   if (byName) return byName;
   return above.find((p) => !SHELLS.test(p.cmd[0] ?? "") && !/agentlink/.test(p.cmd.join(" ")));
+}
+
+/** A process's working directory (Linux; undefined elsewhere or when not permitted). */
+export function procCwd(pid: number): string | undefined {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return undefined;
+  }
 }

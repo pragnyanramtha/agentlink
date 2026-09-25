@@ -66,6 +66,32 @@ export function splitRecipients(value: string): string[] {
     .filter(Boolean);
 }
 
+const DURATION = /^\d+(?:\.\d+)?\s*(ms|s|m|h)?$/;
+
+/**
+ * Lets a string option be given without a value (`--wait` alone means "the default"):
+ * when the next word is not a duration, it is left as a positional.
+ */
+export function optionalValue(argv: string[], long: string, short?: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] as string;
+    if (arg === "--") {
+      out.push(...argv.slice(i));
+      break;
+    }
+    if (arg === `--${long}` || (short && arg === `-${short}`)) {
+      const next = argv[i + 1];
+      if (next === undefined || !DURATION.test(next)) {
+        out.push(`--${long}=`);
+        continue;
+      }
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
 /** Parses "90", "90s", "10m", "2h" into milliseconds. */
 export function parseDuration(
   value: string | undefined,

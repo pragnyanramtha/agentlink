@@ -120,6 +120,13 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
 
   const welcome = (c: Conn) => {
     const teamId = c.teamId as string;
+    // One live connection per device: a newer one replaces the old (e.g. a restarted daemon).
+    for (const other of conns) {
+      if (other !== c && other.teamId === teamId && other.deviceId === c.deviceId) {
+        other.teamId = undefined;
+        other.ws.close(4000, "replaced by a newer connection");
+      }
+    }
     send(c, { t: "welcome", teamId, deviceId: c.deviceId as string, ...roster(teamId) });
     for (const p of q<{ device_id: string; box: string; at: string }>(
       "SELECT device_id, box, at FROM presence WHERE team_id = ? AND device_id != ?",
@@ -187,6 +194,21 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
             t: "error",
             code: "invite",
             message: "invite is invalid, used up or expired",
+          });
+        }
+        const taken = q<{ member: string; device_id: string }>(
+          "SELECT member, device_id FROM devices WHERE team_id = ? AND removed_at IS NULL",
+          frame.teamId,
+        ).some(
+          (r) =>
+            r.device_id !== frame.device.deviceId &&
+            (JSON.parse(r.member) as SignedMember).record.handle === frame.member.record.handle,
+        );
+        if (taken) {
+          return send(c, {
+            t: "error",
+            code: "handle_taken",
+            message: `@${frame.member.record.handle} is already a member on another device; join with --handle <another name>`,
           });
         }
         run(

@@ -58,6 +58,8 @@ An idle recipient is woken when its CLI allows it (Claude Code, Codex, OpenCode)
   --stdin         read the question (or extra context) from stdin
   --force         send to teammates even if it looks like it contains a secret
 
+Exit codes: 0 answered, 1 nobody could receive it, 3 no answer in time.
+
 Examples:
   agentlink ask codex-api "What's the test command?"
   git diff | agentlink ask claude-web --stdin "Anything wrong with this diff?"

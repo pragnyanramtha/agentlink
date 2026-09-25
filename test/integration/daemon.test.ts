@@ -274,6 +274,122 @@ describe("usability fixes", () => {
   });
 });
 
+describe("usability fixes, round 2", () => {
+  it("only recipients answer, and a handoff gets one final decision", async () => {
+    await register("lead");
+    await register("dev");
+    await register("bystander");
+    const handoff = await t.client("lead").request<SendRes>("POST", "/v1/messages", {
+      to: ["dev"],
+      kind: "handoff",
+      text: "take over the auth refactor",
+    });
+    const stranger = await t.raw(
+      "POST",
+      `/v1/messages/${handoff.message.id}/ack`,
+      { ack: "accept" },
+      { as: "bystander" },
+    );
+    expect(stranger.status).toBe(403);
+    const ok = await t.raw(
+      "POST",
+      `/v1/messages/${handoff.message.id}/ack`,
+      { ack: "accept" },
+      { as: "dev" },
+    );
+    expect(ok.status).toBe(200);
+    const flip = await t.raw(
+      "POST",
+      `/v1/messages/${handoff.message.id}/ack`,
+      { ack: "decline" },
+      { as: "dev" },
+    );
+    expect(flip.status).toBe(400);
+    expect(JSON.stringify(flip.data)).toContain("already accepted");
+  });
+
+  it("thread --allow also lifts the reply-depth limit", async () => {
+    await register("a1");
+    await register("b1");
+    let last = await t
+      .client("a1")
+      .request<SendRes>("POST", "/v1/messages", { to: ["b1"], kind: "ask", text: "step 0" });
+    let nextReplier = "b1";
+    let refused: { status: number; data: unknown } | undefined;
+    for (let i = 1; i <= 14; i++) {
+      const res = await t.raw<SendRes>(
+        "POST",
+        "/v1/messages",
+        { kind: "reply", replyTo: last.message.id, text: `step ${i}` },
+        { as: nextReplier },
+      );
+      if (res.status !== 200) {
+        refused = res;
+        break;
+      }
+      last = res.data;
+      nextReplier = nextReplier === "b1" ? "a1" : "b1";
+    }
+    expect(refused?.status).toBe(429);
+    expect(JSON.stringify(refused?.data)).toContain("--allow");
+    await t.raw("POST", `/v1/threads/${last.message.thread}/allow`, { extra: 5 }, { tty: true });
+    const next = await t.raw(
+      "POST",
+      "/v1/messages",
+      { kind: "reply", replyTo: last.message.id, text: "after allow" },
+      { as: nextReplier },
+    );
+    expect(next.status).toBe(200);
+  });
+
+  it("an ask to several agents waits for every answer", async () => {
+    await register("asker");
+    await register("r1");
+    await register("r2");
+    const asking = t
+      .client("asker")
+      .request<SendRes & { replies?: { text: string }[] }>(
+        "POST",
+        "/v1/messages",
+        { to: ["r1", "r2"], kind: "ask", text: "ready?", waitMs: 8_000 },
+        { timeoutMs: 12_000 },
+      );
+    const id = await until(async () => {
+      const r = await t
+        .client("r1")
+        .request<{ items: { message: { id: string } }[] }>("GET", "/v1/inbox?peek=1");
+      return r.items[0]?.message.id;
+    });
+    await t
+      .client("r1")
+      .request("POST", "/v1/messages", { kind: "reply", replyTo: id, text: "r1 ready" });
+    await t
+      .client("r2")
+      .request("POST", "/v1/messages", { kind: "reply", replyTo: id, text: "r2 ready" });
+    const res = await asking;
+    expect(res.replies?.map((r) => r.text).sort()).toEqual(["r1 ready", "r2 ready"]);
+  });
+
+  it("register --pid rejects dead processes and uses the process's own directory", async () => {
+    const dead = await t.raw("POST", "/v1/agents/register", {
+      tool: "generic",
+      name: "ghost",
+      pid: 2 ** 22 + 4321,
+    });
+    expect(dead.status).toBe(400);
+    const proc = t.fakeAgentProcess("generic");
+    const res = await t
+      .client()
+      .request<{ agent: { cwd: string } }>("POST", "/v1/agents/register", {
+        tool: "generic",
+        name: "cwdcheck",
+        pid: proc.pid,
+        cwd: "/definitely/not/here",
+      });
+    expect(res.agent.cwd).not.toBe("/definitely/not/here");
+  });
+});
+
 describe("guards", () => {
   it("stops echo loops and caps threads", async () => {
     await register("alpha");

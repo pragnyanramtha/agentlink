@@ -6,6 +6,8 @@ import {
   INSTALL_TOOLS,
   type InstallContext,
   type InstallTool,
+  instructionPath,
+  isWired,
   onPath,
   planCore,
   planTool,
@@ -67,9 +69,17 @@ async function run(ctx: CliContext, install: boolean): Promise<number> {
   });
   const fs = new VirtualFs();
   const notes: string[] = [];
-  if (install || positionals.includes("all"))
-    notes.push(...planCore(ictx, fs, install, launcher()));
+  // The launcher is shared by every hook on this machine; only a user-level "uninstall all" removes it.
+  const removeCore = !install && positionals.includes("all") && ictx.scope === "user";
+  if (install || removeCore) notes.push(...planCore(ictx, fs, install, launcher()));
   const plans = tools.map((tool) => planTool(tool, ictx, fs, install));
+  if (!install) {
+    // Keep instruction blocks that tools we are not removing still use (e.g. a shared AGENTS.md).
+    for (const other of INSTALL_TOOLS.filter((t) => !tools.includes(t))) {
+      const path = instructionPath(other, ictx);
+      if (path && isWired(other, ictx)) fs.revert(path);
+    }
+  }
   const changes = fs.changes();
   const steps = plans.flatMap((p) => p.steps);
   notes.push(...plans.flatMap((p) => p.notes.map((n) => `${p.tool}: ${n}`)));
@@ -208,6 +218,22 @@ export const doctor: Command = async (ctx) => {
   }
   if (health?.paused)
     rows.push({ ok: false, label: "paused", detail: "delivery is paused (agentlink resume)" });
+  if (health) {
+    const t = await ctx.client
+      .request<{
+        team: { name: string; handle: string; relay: string; connected: boolean } | null;
+      }>("GET", "/v1/team")
+      .catch(() => ({ team: null }));
+    rows.push(
+      t.team
+        ? {
+            ok: t.team.connected,
+            label: "team",
+            detail: `${t.team.name} as @${t.team.handle} · relay ${t.team.relay} · ${t.team.connected ? "connected" : "not connected"}`,
+          }
+        : { ok: null, label: "team", detail: "not in a team (agentlink team --help)" },
+    );
+  }
   const errLog = join(ctx.paths.home, "hook-errors.log");
   if (existsSync(errLog) && Date.now() - statSync(errLog).mtimeMs < 24 * 3600_000) {
     const tail = readFileSync(errLog, "utf8").trimEnd().split("\n").slice(-3);

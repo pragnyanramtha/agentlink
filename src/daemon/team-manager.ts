@@ -127,9 +127,26 @@ export class TeamManager {
       msg.envelope,
       msg.from.handle,
     );
-    this.#engine.onQueued(queued);
-    if (messageId) {
-      for (const r of receipts) this.#mailbox.remote?.receipt(msg.from.handle, { messageId, ...r });
+    const notes = this.#engine.onQueued(queued);
+    if (!messageId) return;
+    const me = this.#client?.team.handle ?? this.#ctx.config.handle;
+    for (const { deliveryId, ...r } of receipts) {
+      // "delivered" only if the agent is running here; otherwise it waits in our queue.
+      const d = deliveryId
+        ? this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", deliveryId)
+        : undefined;
+      const agent = d?.to_agent_id ? this.#registry.byId(d.to_agent_id) : undefined;
+      const receipt =
+        r.state === "delivered" && agent && !isLive(agent)
+          ? {
+              ...r,
+              state: "sent",
+              note: `on ${me}'s machine; ${agent.name} is offline, queued there`,
+            }
+          : r.state === "delivered" && deliveryId && notes.get(deliveryId)
+            ? { ...r, note: notes.get(deliveryId) as string }
+            : r;
+      this.#mailbox.remote?.receipt(msg.from.handle, { messageId, ...receipt });
     }
   }
 
@@ -253,8 +270,10 @@ export class TeamManager {
   }
 
   leave(): void {
-    this.#client?.removeSelf();
-    setTimeout(() => this.#client?.stop(), 300).unref();
+    // Stop this client even if a new one is attached before the timer fires.
+    const old = this.#client;
+    old?.removeSelf();
+    setTimeout(() => old?.stop(), 300).unref();
     this.#client = undefined;
     this.#mailbox.remote = undefined;
     clearInterval(this.#heartbeat);

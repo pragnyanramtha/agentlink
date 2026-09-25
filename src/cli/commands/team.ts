@@ -123,6 +123,9 @@ export const team: Command = async (ctx) => {
         uses: { type: "string", default: "1" },
         ttl: { type: "string", default: "24h" },
       });
+      const uses = Number(values.uses);
+      if (!Number.isInteger(uses) || uses < 1 || uses > 100)
+        throw new UsageError("--uses must be a whole number from 1 to 100");
       await ctx.client.ensureDaemon();
       const res = await ctx.client.request<{ invite: string }>("POST", "/v1/team/invite", {
         uses: Number(values.uses),

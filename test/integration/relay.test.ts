@@ -204,6 +204,44 @@ describe("team relay", () => {
     expect(inbox).toBeTruthy();
   }, 30_000);
 
+  it("recovers after leaving and re-joining, and refuses a handle already in use", async () => {
+    await bob.raw("POST", "/v1/team/leave", {});
+    const inv = await alice.raw<{ invite: string }>("POST", "/v1/team/invite", { uses: 2 });
+    // another device may not take @alice
+    const carol = await startTestDaemon({ handle: "carol" });
+    const clash = await carol.raw("POST", "/v1/team/join", {
+      invite: inv.data.invite,
+      handle: "alice",
+    });
+    expect(clash.status).toBeGreaterThanOrEqual(400);
+    expect(JSON.stringify(clash.data)).toContain("already a member");
+    await carol.stop();
+    const again = await bob.raw("POST", "/v1/team/join", { invite: inv.data.invite });
+    expect(again.status).toBe(200);
+    const connected = await until(async () => {
+      const s = await bob.client().request<{ team: { connected: boolean } }>("GET", "/v1/team");
+      return s.team.connected;
+    }, 8_000);
+    expect(connected).toBe(true);
+    await until(async () => {
+      const { agents } = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+      return agents.find((a) => a.name === bobAgentName);
+    }, 8_000);
+    // traffic flows both ways again
+    const res = await bob.client("codex-api").request<SendRes>("POST", "/v1/messages", {
+      to: ["alice/claude-web"],
+      text: "back online",
+    });
+    expect(res.deliveries[0]?.state).toBe("sent");
+    const got = await until(async () => {
+      const r = await alice
+        .client("claude-web")
+        .request<{ items: { text: string }[] }>("GET", "/v1/inbox?all=1");
+      return r.items.find((i) => i.text === "back online");
+    }, 8_000);
+    expect(got).toBeTruthy();
+  }, 40_000);
+
   it("rejects unknown team members and needs a team for team addresses", async () => {
     const res = await alice.raw(
       "POST",

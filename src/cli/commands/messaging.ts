@@ -2,6 +2,7 @@ import { LIMITS } from "../../core/limits.ts";
 import {
   type CliContext,
   type Command,
+  optionalValue,
   out,
   parse,
   parseDuration,
@@ -32,7 +33,9 @@ interface SendResponse {
   message: MessageView;
   deliveries: DeliveryView[];
   reply?: { message: MessageView; text: string; ack?: string };
+  replies?: { message: MessageView; text: string; ack?: string }[];
   failed?: { to: string; state: string; note: string | null }[];
+  paused?: boolean;
   waited: boolean;
   timedOut?: boolean;
   asHuman?: boolean;
@@ -72,12 +75,22 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
       c.dim(`  message ${res.message.id} (${res.message.kind}, thread ${res.message.thread})`),
     );
     if (res.reply) {
-      const r = res.reply;
-      lines.push("");
-      lines.push(
-        `${c.green("←")} ${r.message.kind} from ${c.bold(r.message.from)} ${c.dim(`(${r.message.id})`)}:`,
-      );
-      lines.push(r.ack ? `[${r.ack}] ${r.text}` : r.text);
+      const all = res.replies ?? [res.reply];
+      for (const r of all) {
+        lines.push("");
+        lines.push(
+          `${c.green("←")} ${r.message.kind} from ${c.bold(r.message.from)} ${c.dim(`(${r.message.id})`)}:`,
+        );
+        lines.push(r.ack ? `[${r.ack}] ${r.text}` : r.text);
+      }
+      const answered = new Set(all.map((r) => r.message.from));
+      const silent = res.deliveries
+        .filter((d) => !answered.has(d.to) && !bad(d.state))
+        .map((d) => d.to);
+      if (silent.length && res.timedOut)
+        lines.push(c.yellow(`No answer yet from ${silent.join(", ")}.`));
+    } else if (res.paused && res.waited) {
+      lines.push(c.yellow("agentlink is paused, so nothing was delivered yet (agentlink resume)."));
     } else if (res.failed?.length) {
       for (const f of res.failed) {
         if (!res.deliveries.some((d) => d.to === f.to && d.state === f.state)) {
@@ -96,7 +109,8 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
     }
     return lines.join("\n");
   });
-  return failedAll ? 1 : 0;
+  // Exit codes: 0 sent/answered, 1 nobody could receive it, 3 no answer in time.
+  return failedAll ? 1 : res.waited && res.timedOut ? 3 : 0;
 }
 
 async function sendCommon(
@@ -133,7 +147,7 @@ async function sendCommon(
 }
 
 export const send: Command = async (ctx) => {
-  const { values, positionals } = parse(ctx.argv, {
+  const { values, positionals } = parse(optionalValue(ctx.argv, "wait", "w"), {
     kind: { type: "string", short: "k", default: "info" },
     thread: { type: "string", short: "t" },
     wait: { type: "string", short: "w" },
@@ -178,7 +192,7 @@ export const ask: Command = async (ctx) => {
 };
 
 export const reply: Command = async (ctx) => {
-  const { values, positionals } = parse(ctx.argv, {
+  const { values, positionals } = parse(optionalValue(ctx.argv, "wait", "w"), {
     wait: { type: "string", short: "w" },
     stdin: { type: "boolean" },
     kind: { type: "string", short: "k", default: "reply" },
@@ -223,7 +237,9 @@ function printItems(items: InboxItemView[]): string {
     .map((i) => {
       const m = i.message;
       const head = `${c.bold(m.kind)} from ${c.cyan(m.from)} ${c.dim(`· ${ago(m.createdAt)} · ${m.id}`)}`;
-      const body = indent(i.ack ? `[${i.ack}] ${i.text}` : i.text);
+      const body = indent(
+        i.ack ? (i.text === i.ack ? `[${i.ack}]` : `[${i.ack}] ${i.text}`) : i.text,
+      );
       const atts = i.attachments.map((a) => c.dim(`  [${a}]`));
       const hint = ["ask", "request", "review_request"].includes(m.kind)
         ? c.dim(`  reply: agentlink reply ${m.id} "<answer>"`)
@@ -238,7 +254,7 @@ function printItems(items: InboxItemView[]): string {
 }
 
 export const inbox: Command = async (ctx) => {
-  const { values } = parse(ctx.argv, {
+  const { values } = parse(optionalValue(ctx.argv, "wait", "w"), {
     all: { type: "boolean", short: "a" },
     peek: { type: "boolean" },
     wait: { type: "string", short: "w" },
@@ -264,7 +280,9 @@ export const inbox: Command = async (ctx) => {
         timeoutMs: waitMs + 10_000,
       },
     );
-    process.stdout.write(`${res.count ? res.text : "No new agentlink messages."}\n`);
+    process.stdout.write(
+      `${res.count || (res as { paused?: boolean }).paused ? res.text : "No new agentlink messages."}\n`,
+    );
     return 0;
   }
   const res = await ctx.client.request<{ items: InboxItemView[]; paused?: boolean }>(
@@ -312,6 +330,9 @@ export const show: Command = async (ctx) => {
       return p.file?.bytes
         ? Buffer.from(p.file.bytes, "base64").toString("utf8")
         : JSON.stringify(p.file);
+    }
+    if (values.raw && (res as { envelope?: unknown }).envelope) {
+      return JSON.stringify((res as { envelope?: unknown }).envelope, null, 2);
     }
     const m = res.message;
     const lines = [
@@ -410,6 +431,7 @@ export const status: Command = async (ctx) => {
 
 export const log: Command = async (ctx) => {
   const { values } = parse(ctx.argv, { limit: { type: "string", short: "n", default: "30" } });
+  if (!/^\d+$/.test(String(values.limit))) throw new UsageError("-n must be a number");
   await ctx.client.ensureDaemon();
   const res = await ctx.client.request<{
     messages: { message: MessageView; deliveries: DeliveryView[] }[];

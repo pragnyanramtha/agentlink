@@ -148,6 +148,8 @@ export class DeliveryEngine {
         ? `busy: queued into its session (${deliverer.id})`
         : `idle: added to its session without waking it (${deliverer.id})`;
     }
+    const hookless = !caps.midTurn && !caps.nextTurn && !caps.push && !caps.wake;
+    if (hookless && !deliverer) return `queued: ${agent.name} reads it with agentlink inbox`;
     if (agent.state === "busy") {
       if (caps.midTurn) return "busy: injected at its next tool call";
       return "busy: delivered when its next turn starts";

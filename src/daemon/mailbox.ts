@@ -112,7 +112,7 @@ export const remoteHandleOf = (fromAddr: string): string | undefined =>
 export class Mailbox {
   readonly #ctx: DaemonContext;
   readonly #registry: Registry;
-  readonly #replyWaiters = new Map<string, Set<(o: WaitOutcome) => void>>();
+  readonly #replyWaiters = new Map<string, Set<() => void>>();
   readonly #inboxWaiters = new Map<string, Set<() => void>>();
   remote: RemoteRouter | undefined;
 
@@ -310,6 +310,38 @@ export class Mailbox {
     return [...unique.values()];
   }
 
+  /** Only a recipient answers a message, and a handoff gets one final accept/decline. */
+  #checkAnswerer(sender: Sender, original: MessageRow, ack?: AckValue): void {
+    const mine = this.deliveriesOf(original.id).find((d) =>
+      sender.kind === "agent"
+        ? d.to_agent_id === sender.agent.id
+        : d.to_agent_id === null && d.to_addr === `@${this.handle}`,
+    );
+    if (!mine) {
+      throw new AgentLinkError(
+        "forbidden",
+        `only a recipient of ${original.id} can answer it (it went to ${
+          this.deliveriesOf(original.id)
+            .map((d) => d.to_addr)
+            .join(", ") || "nobody here"
+        })`,
+        403,
+      );
+    }
+    if (ack === "accept" || ack === "decline") {
+      const decided = this.#ctx.store.all<{ envelope: string }>(
+        `SELECT envelope FROM messages WHERE reply_to = ? AND kind = 'ack' AND ${sender.kind === "agent" ? "from_agent_id = ?" : "from_agent_id IS NULL AND from_addr = ?"}`,
+        original.id,
+        sender.kind === "agent" ? sender.agent.id : `@${this.handle}`,
+      );
+      const prior = decided
+        .map((r) => this.envelopeOf({ envelope: r.envelope } as MessageRow).meta.ack)
+        .find((a) => a === "accept" || a === "decline");
+      if (prior)
+        throw invalid(`you already ${prior === "accept" ? "accepted" : "declined"} ${original.id}`);
+    }
+  }
+
   #checkGuards(
     sender: Sender,
     recipients: Recipient[],
@@ -321,16 +353,18 @@ export class Mailbox {
     if (hops > LIMITS.maxHops) throw invalid(`too many forwarding hops (max ${LIMITS.maxHops})`);
     if (sender.kind !== "agent") return; // humans are never throttled
     const { store } = this.#ctx;
+    // `agentlink thread <id> --allow N` (by a human) raises both the thread cap and reply depth.
+    const allowance = thread
+      ? (store.get<{ extra_allowance: number }>(
+          "SELECT extra_allowance FROM thread_state WHERE thread_id = ?",
+          thread,
+        )?.extra_allowance ?? 0)
+      : 0;
     if (thread) {
       const count = store.get<{ n: number }>(
         "SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?",
         thread,
       )?.n;
-      const allowance =
-        store.get<{ extra_allowance: number }>(
-          "SELECT extra_allowance FROM thread_state WHERE thread_id = ?",
-          thread,
-        )?.extra_allowance ?? 0;
       if ((count ?? 0) >= LIMITS.threadMaxMessages + allowance) {
         throw limited(
           "thread_cap",
@@ -354,10 +388,10 @@ export class Mailbox {
          ) SELECT MAX(depth) AS d FROM chain`,
         original.id,
       )?.d;
-      if ((depth ?? 0) >= LIMITS.replyMaxDepth) {
+      if ((depth ?? 0) >= LIMITS.replyMaxDepth + allowance) {
         throw limited(
           "reply_depth",
-          `reply chain is ${depth} deep (max ${LIMITS.replyMaxDepth}); summarise and start a new thread, or ask your user`,
+          `reply chain is ${depth} deep (max ${LIMITS.replyMaxDepth + allowance}); summarise and start a new thread, or ask your user to allow more (agentlink thread ${original.thread_id} --allow 10)`,
         );
       }
     }
@@ -394,6 +428,9 @@ export class Mailbox {
     const original = input.replyTo ? this.resolveMessage(input.replyTo) : undefined;
     if (!original && ["reply", "ack", "review_result"].includes(input.kind)) {
       throw invalid(`a ${input.kind} must answer a message (replyTo)`);
+    }
+    if (original && ["reply", "ack", "review_result"].includes(input.kind)) {
+      this.#checkAnswerer(sender, original, input.ack);
     }
     const recipients = this.#resolveRecipients(sender, input.to ?? [], original);
     const thread =
@@ -578,7 +615,7 @@ export class Mailbox {
     fromHandle: string,
   ): {
     queued: InboxItem[];
-    receipts: { to: string; state: string; note?: string }[];
+    receipts: { to: string; state: string; note?: string; deliveryId?: number }[];
     messageId?: string;
   } {
     const { store } = this.#ctx;
@@ -607,7 +644,7 @@ export class Mailbox {
       this.hasReplyWaiter(original.id);
     const overrides = { ...this.#overrides("teammate"), ...this.#overrides(fromHandle) };
     const stamp = iso(this.#ctx.now());
-    const receipts: { to: string; state: string; note?: string }[] = [];
+    const receipts: { to: string; state: string; note?: string; deliveryId?: number }[] = [];
 
     const ids = store.tx(() => {
       store.run(
@@ -670,6 +707,7 @@ export class Mailbox {
           to: theirAddr,
           state: state === "queued" ? "delivered" : state,
           ...(note ? { note } : {}),
+          deliveryId: res.lastInsertRowid,
         });
       }
       if (original) {
@@ -733,7 +771,15 @@ export class Mailbox {
       receipt.messageId,
       receipt.to,
     );
-    if (!d || (RANK[receipt.state] ?? -1) <= (RANK[d.state] ?? 0)) return false;
+    if (!d) return false;
+    const rank = RANK[receipt.state] ?? -1;
+    const current = RANK[d.state] ?? 0;
+    if (
+      rank < current ||
+      (rank === current && (receipt.state !== d.state || receipt.note === (d.note ?? undefined)))
+    ) {
+      return false;
+    }
     const stamp = iso(this.#ctx.now());
     const column: Record<string, string> = {
       delivered: "delivered_at",
@@ -788,6 +834,7 @@ export class Mailbox {
   }
 
   inbox(target: InboxTarget, opts: { unreadOnly?: boolean; limit?: number } = {}): InboxItem[] {
+    this.expireSweep(); // never hand out mail past its TTL
     const [clause, param] = this.#targetClause(target);
     const states = opts.unreadOnly ? UNREAD : null;
     const rows = this.#ctx.store.all<DeliveryRow & { m_envelope: string }>(
@@ -823,6 +870,7 @@ export class Mailbox {
   /** Takes queued deliveries for injection and marks them seen. Nothing while paused/muted. */
   drain(agent: AgentRow, method: string, filter?: (item: InboxItem) => boolean): InboxItem[] {
     if (this.paused || agent.muted) return [];
+    this.expireSweep();
     const items = this.pending(agent.id, filter).slice(0, LIMITS.maxInboxBatch);
     this.markSeen(
       items.map((i) => i.delivery.id),
@@ -944,51 +992,70 @@ export class Mailbox {
   // ---------------------------------------------------------------- waiting
 
   /**
-   * Resolves with the first answer (reply / review_result / ack) to `messageId`, as soon as
-   * every delivery has failed (unknown agent, refused, expired), or on timeout.
+   * Waits for answers (reply / review_result / ack) to `messageId` from `expected` recipients.
+   * Ends early when every recipient has answered or failed (unknown agent, refused, expired).
    */
-  waitForReply(messageId: string, timeoutMs: number, signal?: AbortSignal): Promise<WaitOutcome> {
-    const existing = this.#ctx.store.get<MessageRow>(
-      "SELECT * FROM messages WHERE reply_to = ? AND kind IN ('reply','review_result','ack') ORDER BY created_at LIMIT 1",
-      messageId,
-    );
-    if (existing) return Promise.resolve({ kind: "reply", message: existing });
-    const failed = this.#allFailed(messageId);
-    if (failed) return Promise.resolve({ kind: "failed", deliveries: failed });
+  waitForReplies(
+    messageId: string,
+    expected: number,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ replies: MessageRow[]; failed: DeliveryRow[]; timedOut: boolean }> {
+    const snapshot = () => {
+      const replies = this.#ctx.store.all<MessageRow>(
+        "SELECT * FROM messages WHERE reply_to = ? AND kind IN ('reply','review_result','ack') ORDER BY created_at",
+        messageId,
+      );
+      const deliveries = this.deliveriesOf(messageId);
+      const failed = deliveries.filter((d) => ["failed", "refused", "expired"].includes(d.state));
+      const answered = new Set(replies.map((r) => r.from_agent_id ?? r.from_addr)).size;
+      const done =
+        (deliveries.length > 0 && failed.length === deliveries.length) ||
+        answered >= Math.max(1, expected - failed.length);
+      return { replies, failed, done };
+    };
+    const first = snapshot();
+    if (first.done)
+      return Promise.resolve({ replies: first.replies, failed: first.failed, timedOut: false });
     return new Promise((resolve) => {
       const set = this.#replyWaiters.get(messageId) ?? new Set();
-      const done = (o: WaitOutcome) => {
+      const finish = (timedOut: boolean) => {
         clearTimeout(timer);
-        set.delete(done);
+        set.delete(poke);
         if (set.size === 0) this.#replyWaiters.delete(messageId);
-        resolve(o);
+        const { replies, failed } = snapshot();
+        resolve({ replies, failed, timedOut });
       };
-      const timer = setTimeout(() => done({ kind: "timeout" }), timeoutMs);
-      signal?.addEventListener("abort", () => done({ kind: "timeout" }), { once: true });
-      set.add(done);
+      const poke = () => {
+        if (snapshot().done) finish(false);
+      };
+      const timer = setTimeout(() => finish(true), timeoutMs);
+      signal?.addEventListener("abort", () => finish(true), { once: true });
+      set.add(poke);
       this.#replyWaiters.set(messageId, set);
     });
   }
 
-  #allFailed(messageId: string): DeliveryRow[] | undefined {
-    const ds = this.deliveriesOf(messageId);
-    return ds.length > 0 && ds.every((d) => ["failed", "refused", "expired"].includes(d.state))
-      ? ds
-      : undefined;
+  /** Single-recipient form of waitForReplies. */
+  async waitForReply(
+    messageId: string,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<WaitOutcome> {
+    const r = await this.waitForReplies(messageId, 1, timeoutMs, signal);
+    if (r.replies[0]) return { kind: "reply", message: r.replies[0] };
+    if (r.failed.length && !r.timedOut) return { kind: "failed", deliveries: r.failed };
+    return { kind: "timeout" };
   }
 
-  /** Ends waits whose every delivery failed. */
+  /** Re-checks waits on `messageId` (a delivery failed). */
   #checkFailed(messageId: string): void {
-    const waiters = this.#replyWaiters.get(messageId);
-    if (!waiters?.size) return;
-    const failed = this.#allFailed(messageId);
-    if (failed) for (const fn of [...waiters]) fn({ kind: "failed", deliveries: failed });
+    for (const poke of [...(this.#replyWaiters.get(messageId) ?? [])]) poke();
   }
 
   #resolveReplyWaiters(originalId: string, reply: MessageRow): void {
     if (!["reply", "review_result", "ack"].includes(reply.kind)) return;
-    for (const fn of [...(this.#replyWaiters.get(originalId) ?? [])])
-      fn({ kind: "reply", message: reply });
+    for (const poke of [...(this.#replyWaiters.get(originalId) ?? [])]) poke();
   }
 
   hasReplyWaiter(messageId: string): boolean {

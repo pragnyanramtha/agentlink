@@ -1,8 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { z } from "zod";
+import { loadConfig } from "../core/config.ts";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
 import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
 import { DEFAULT_POLICY, POLICY_ACTIONS, TRUSTS } from "../core/policy.ts";
+import { isAlive, procCwd, procInfo } from "../core/proc.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { PROTOCOL_VERSION, VERSION } from "../version.ts";
 import type { Claims } from "./claims.ts";
@@ -190,6 +192,13 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     paused: mailbox.paused,
   }));
 
+  route("POST", "/v1/config/reload", (req) => {
+    requireHuman(req, false);
+    const before = ctx.config.handle;
+    ctx.config = loadConfig(ctx.paths);
+    return { handle: ctx.config.handle, changed: before !== ctx.config.handle };
+  });
+
   route("POST", "/v1/shutdown", (req) => {
     requireHuman(req, false);
     setTimeout(shutdown, 50);
@@ -199,12 +208,17 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   // ------------------------------------------------------------------ agents
   route("POST", "/v1/agents/register", (req) => {
     const input = RegisterSchema.parse(req.body);
+    if (input.pid && !isAlive(input.pid)) throw invalid(`no running process with pid ${input.pid}`);
+    const previous = input.pid ? registry.byLivePid(input.tool, input.pid) : undefined;
+    // The agent's own working directory decides its repo, not the shell that registered it.
+    const cwd = (input.pid ? procCwd(input.pid) : undefined) ?? input.cwd;
+    const pidStart = input.pidStart ?? (input.pid ? procInfo(input.pid)?.start : undefined);
     const { agent, created, resumed } = registry.register({
       tool: input.tool,
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.pid ? { pid: input.pid } : {}),
-      ...(input.pidStart ? { pidStart: input.pidStart } : {}),
-      ...(input.cwd ? { cwd: input.cwd } : {}),
+      ...(pidStart ? { pidStart } : {}),
+      ...(cwd ? { cwd } : {}),
       ...(input.name ? { name: input.name } : {}),
       ...(input.capabilities ? { capabilities: input.capabilities } : {}),
       ...(input.adapter ? { adapter: input.adapter } : {}),
@@ -212,7 +226,14 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     });
     // Does the registering shell belong to the new agent? (Decides the "read your mail" hint.)
     const self = !!input.pid && req.caller.chain.some((p) => p.pid === input.pid);
-    return { agent: agentView(agent), created, resumed, self };
+    const renamedFrom = previous && previous.name !== agent.name ? previous.name : undefined;
+    return {
+      agent: agentView(agent),
+      created,
+      resumed,
+      self,
+      ...(renamedFrom ? { renamedFrom } : {}),
+    };
   });
 
   route("DELETE", "/v1/agents/:name", (req) => {
@@ -340,16 +361,27 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     const reachable = result.deliveries.some((d) =>
       ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
     );
-    if (input.waitMs && reachable) {
-      const outcome = await mailbox.waitForReply(
+    let replies: ReturnType<typeof replyView>[] | undefined;
+    if (input.waitMs && reachable && mailbox.paused) {
+      timedOut = true; // nothing is delivered while paused, so there is nothing to wait for
+    } else if (input.waitMs && reachable) {
+      const expected = result.deliveries.filter((d) =>
+        ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
+      ).length;
+      const outcome = await mailbox.waitForReplies(
         String(result.message.id),
+        expected,
         input.waitMs,
         req.signal,
       );
-      if (outcome.kind === "reply") reply = replyView(outcome.message);
-      else if (outcome.kind === "failed") {
-        failed = outcome.deliveries.map((d) => ({ to: d.to_addr, state: d.state, note: d.note }));
-      } else timedOut = true;
+      if (outcome.replies.length) {
+        replies = outcome.replies.map(replyView);
+        reply = replies[0];
+      }
+      if (outcome.failed.length && !outcome.replies.length) {
+        failed = outcome.failed.map((d) => ({ to: d.to_addr, state: d.state, note: d.note }));
+      }
+      timedOut = outcome.timedOut;
     } else if (input.waitMs) {
       failed = result.deliveries.map((d) => ({
         to: String(d.to),
@@ -361,7 +393,9 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       message: result.message,
       deliveries,
       ...(reply ? { reply } : {}),
+      ...(replies && replies.length > 1 ? { replies } : {}),
       ...(failed ? { failed } : {}),
+      ...(mailbox.paused ? { paused: true } : {}),
       waited: !!input.waitMs,
       timedOut,
       asHuman: !req.agent,
@@ -518,13 +552,16 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       body.ttlMinutes,
       body.reason,
     );
-    return {
-      claims,
-      conflicts: conflicts.map((c) => ({
-        ...c,
-        agent: registry.byId(c.agent_id)?.name ?? c.agent_id,
-      })),
-    };
+    const view = (c: (typeof claims)[number]) => ({
+      id: c.id,
+      pattern: c.pattern,
+      agent: registry.byId(c.agent_id)?.name ?? c.agent_id,
+      reason: c.reason,
+      repo: c.repo_key,
+      createdAt: c.created_at,
+      expiresAt: c.expires_at,
+    });
+    return { claims: claims.map(view), conflicts: conflicts.map(view) };
   });
 
   route("POST", "/v1/claims/release", (req) => {
@@ -538,9 +575,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   });
 
   route("GET", "/v1/claims", () => ({
-    claims: s.claims
-      .active()
-      .map((c) => ({ ...c, agent: registry.byId(c.agent_id)?.name ?? c.agent_id })),
+    claims: s.claims.active().map((c) => ({
+      id: c.id,
+      pattern: c.pattern,
+      agent: registry.byId(c.agent_id)?.name ?? c.agent_id,
+      reason: c.reason,
+      repo: c.repo_key,
+      createdAt: c.created_at,
+      expiresAt: c.expires_at,
+    })),
   }));
 
   // ------------------------------------------------------------------ policy / approvals / control

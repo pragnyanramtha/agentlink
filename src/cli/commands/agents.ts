@@ -1,4 +1,4 @@
-import { ancestry, detectTool, findToolProcess } from "../../core/proc.ts";
+import { ancestry, detectTool, findToolProcess, procInfo } from "../../core/proc.ts";
 import { type Command, out, parse, parseDuration, UsageError } from "../args.ts";
 import { ago, c, stateColor, table } from "../format.ts";
 
@@ -72,11 +72,9 @@ export const peers: Command = async (ctx) => {
     }
     return table(
       res.agents.map((a) => [
-        c.bold(a.name) +
-          (who.agent?.id === a.id ? c.dim(" (you)") : "") +
-          (a.muted ? c.red(" muted") : ""),
+        c.bold(a.name) + (who.agent?.id === a.id ? c.dim(" (you)") : ""),
         a.tool,
-        stateColor(a.state),
+        stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
         reach(a),
         shortRepo(a.repo),
         a.branch ?? "-",
@@ -129,6 +127,7 @@ export const register: Command = async (ctx) => {
   let procCmd = "";
   if (values.pid && (!Number.isInteger(pid) || (pid ?? 0) <= 1))
     throw new UsageError("--pid must be a process id");
+  if (pid) procCmd = procInfo(pid)?.cmd.slice(0, 2).join(" ") ?? "";
   if (!pid) {
     const chain = ancestry(process.pid);
     const detected = detectTool(chain);
@@ -150,6 +149,7 @@ export const register: Command = async (ctx) => {
     created: boolean;
     resumed: boolean;
     self?: boolean;
+    renamedFrom?: string;
   }>("POST", "/v1/agents/register", {
     tool,
     cwd: process.cwd(),
@@ -160,7 +160,7 @@ export const register: Command = async (ctx) => {
   });
   out(ctx, res, () =>
     [
-      `${c.green("✓")} registered ${c.bold(res.agent.name)} (${res.agent.tool}) for process ${pid ?? "?"}${procCmd ? c.dim(` (${procCmd})`) : ""}${res.resumed ? c.dim(" · resumed; queued mail will be delivered") : ""}`,
+      `${c.green("✓")} registered ${c.bold(res.agent.name)} (${res.agent.tool}) for process ${pid ?? "?"}${procCmd ? c.dim(` (${procCmd})`) : ""}${res.renamedFrom ? c.yellow(` · renamed from ${res.renamedFrom}`) : ""}${res.resumed ? c.dim(" · resumed; queued mail will be delivered") : ""}`,
       c.dim(
         res.self
           ? "  commands from this shell now act as this agent; read mail with: agentlink inbox"
@@ -203,8 +203,8 @@ interface ClaimView {
   pattern: string;
   agent: string;
   reason: string | null;
-  expires_at: string;
-  repo_key: string;
+  expiresAt: string;
+  repo: string;
 }
 
 export const claim: Command = async (ctx) => {
@@ -226,7 +226,7 @@ export const claim: Command = async (ctx) => {
   );
   out(ctx, res, () =>
     [
-      `${c.green("✓")} claimed ${positionals.join(", ")} ${c.dim(`(advisory, until ${new Date(res.claims[0]?.expires_at ?? Date.now()).toLocaleTimeString()})`)}`,
+      `${c.green("✓")} claimed ${positionals.join(", ")} ${c.dim(`(advisory, until ${new Date(res.claims[0]?.expiresAt ?? Date.now()).toLocaleTimeString()})`)}`,
       ...res.conflicts.map((k) =>
         c.yellow(
           `  ! overlaps ${k.pattern} claimed by ${k.agent}${k.reason ? ` (${k.reason})` : ""}; coordinate with them first`,
@@ -273,8 +273,8 @@ export const claims: Command = async (ctx) => {
             k.pattern,
             c.bold(k.agent),
             k.reason ?? "",
-            c.dim(`until ${new Date(k.expires_at).toLocaleTimeString()}`),
-            c.dim(k.repo_key),
+            c.dim(`until ${new Date(k.expiresAt).toLocaleTimeString()}`),
+            c.dim(k.repo),
           ]),
           ["PATTERN", "AGENT", "REASON", "EXPIRES", "REPO"],
         ),

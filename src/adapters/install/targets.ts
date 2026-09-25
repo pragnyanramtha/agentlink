@@ -65,6 +65,11 @@ export class VirtualFs {
     this.#files.set(path, { before: current, after: target, symlink: true });
   }
 
+  /** Drops a planned change (the file stays as it is). */
+  revert(path: string): void {
+    this.#files.delete(path);
+  }
+
   changes(): FileChange[] {
     return [...this.#files.entries()]
       .filter(([, f]) => f.symlink || f.before !== f.after)
@@ -533,6 +538,38 @@ const gemini: Planner = (ctx, fs, install) => {
   editBlock(fs, join(base, "GEMINI.md"), install);
   return { steps: [], notes: [] };
 };
+
+/** Where each tool's instruction block lives (several tools can share one file). */
+export function instructionPath(tool: InstallTool, ctx: InstallContext): string | undefined {
+  const project = ctx.scope === "project";
+  const dir = dirOf(ctx);
+  switch (tool) {
+    case "claude":
+      return project ? join(dir, "CLAUDE.md") : join(ctx.home, ".claude", "CLAUDE.md");
+    case "codex":
+      return project ? join(dir, "AGENTS.md") : join(ctx.home, ".codex", "AGENTS.md");
+    case "opencode":
+      return project ? join(dir, "AGENTS.md") : join(ctx.home, ".config", "opencode", "AGENTS.md");
+    case "cursor":
+    case "devin":
+      return project ? join(dir, "AGENTS.md") : undefined;
+    case "agy":
+      return project ? join(dir, "AGENTS.md") : join(ctx.home, ".gemini", "GEMINI.md");
+    case "copilot":
+      return project
+        ? join(dir, "AGENTS.md")
+        : join(ctx.home, ".copilot", "copilot-instructions.md");
+    case "gemini":
+      return join(dir, ".gemini", "GEMINI.md");
+  }
+}
+
+/** True if the tool has agentlink wiring (hooks, plugin, MCP) beyond instruction files. */
+export function isWired(tool: InstallTool, ctx: InstallContext): boolean {
+  const fs = new VirtualFs();
+  planTool(tool, { ...ctx, mcp: false }, fs, false);
+  return fs.changes().some((ch) => !ch.path.endsWith(".md"));
+}
 
 const PLANNERS: Record<InstallTool, Planner> = {
   claude,

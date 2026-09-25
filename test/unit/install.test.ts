@@ -7,11 +7,14 @@ import {
   hookCommand,
   INSTALL_TOOLS,
   type InstallContext,
+  instructionPath,
+  isWired,
   planCore,
   planTool,
   VirtualFs,
 } from "../../src/adapters/install/targets.ts";
 import { applyChanges, removeBlock, upsertBlock } from "../../src/adapters/install/util.ts";
+import { optionalValue } from "../../src/cli/args.ts";
 
 let home: string;
 let ctx: InstallContext;
@@ -217,5 +220,35 @@ describe("hook fast path", () => {
       { tool: "claude", event: "stop" },
     );
     expect(execFileSync("sh", ["-c", gone], { encoding: "utf8" }).trim()).toBe("");
+  });
+});
+
+describe("shared instruction files", () => {
+  it("keeps AGENTS.md while another installed tool still uses it", () => {
+    const project = join(home, "proj2");
+    mkdirSync(project);
+    const pctx: InstallContext = { ...ctx, scope: "project", projectDir: project };
+    const fs = new VirtualFs();
+    for (const tool of ["codex", "cursor"] as const) planTool(tool, pctx, fs, true);
+    applyChanges(fs.changes(), join(home, "b1"), home, [project]);
+    const rm = new VirtualFs();
+    planTool("cursor", pctx, rm, false);
+    // what `agentlink uninstall cursor` does for tools that stay installed
+    if (isWired("codex", pctx)) rm.revert(instructionPath("codex", pctx) as string);
+    applyChanges(rm.changes(), join(home, "b2"), home, [project]);
+    expect(readFileSync(join(project, "AGENTS.md"), "utf8")).toContain("agentlink:start");
+    expect(() => readFileSync(join(project, ".cursor", "hooks.json"))).toThrow();
+  });
+});
+
+describe("optional option values", () => {
+  it("treats --wait without a duration as the default", () => {
+    expect(optionalValue(["db", "--wait", "hello"], "wait", "w")).toEqual([
+      "db",
+      "--wait=",
+      "hello",
+    ]);
+    expect(optionalValue(["--wait", "30s", "x"], "wait", "w")).toEqual(["--wait", "30s", "x"]);
+    expect(optionalValue(["-w"], "wait", "w")).toEqual(["--wait="]);
   });
 });

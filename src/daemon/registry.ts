@@ -4,6 +4,7 @@ import { AgentLinkError, invalid, notFound } from "../core/errors.ts";
 import { repoInfo } from "../core/git.ts";
 import { ulid } from "../core/ids.ts";
 import { isAlive } from "../core/proc.ts";
+import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import {
   type AgentRow,
@@ -70,7 +71,14 @@ export class Registry {
 
   require(nameOrId: string): AgentRow {
     const agent = this.byName(nameOrId) ?? this.byId(nameOrId);
-    if (!agent) throw notFound(`agent "${nameOrId}"`);
+    if (!agent) {
+      const names = this.list({ includeOffline: true }).map((a) => a.name);
+      throw new AgentLinkError(
+        "not_found",
+        `no agent named "${nameOrId}"${didYouMean(nameOrId, names)}; see: agentlink peers --all`,
+        404,
+      );
+    }
     return agent;
   }
 

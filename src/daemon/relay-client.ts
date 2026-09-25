@@ -203,22 +203,32 @@ export class RelayClient {
     this.#ws = ws;
     ws.on("open", () => ws.send(JSON.stringify(this.#firstFrame())));
     ws.on("message", (data) => {
+      if (ws !== this.#ws) return; // a replaced socket
       try {
         this.#handle(JSON.parse(String(data)) as ServerFrame);
       } catch (error) {
         this.#ctx.log.warn("relay frame failed", { error: String(error) });
       }
     });
-    ws.on("close", () => {
+    ws.on("close", (code) => {
+      if (ws !== this.#ws) return; // a replaced socket
       const wasReady = this.#ready;
       this.#ready = false;
       this.#online.clear();
       if (wasReady) this.#ctx.log.info("relay disconnected");
+      if (code === 4000) {
+        // The relay keeps one connection per device: another daemon with this device key took over.
+        this.#ctx.log.warn(
+          "another agentlink daemon is using this device's relay connection; this one stops",
+        );
+        this.#stopped = true;
+      }
       if (this.#stopped) return;
       setTimeout(() => this.#connect(), this.#backoff).unref();
       this.#backoff = Math.min(this.#backoff * 2, 30_000);
     });
     ws.on("error", (error) => {
+      if (ws !== this.#ws) return;
       this.#ctx.log.debug("relay connection error", { error: String(error) });
       if (this.#mode.kind !== "hello") {
         this.#onWelcome?.(new Error(`cannot reach relay ${this.#team.relay}: ${error.message}`));
@@ -285,14 +295,12 @@ export class RelayClient {
       case "error":
         this.#ctx.log.warn("relay error", { code: frame.code, message: frame.message });
         if (frame.ref) this.#waiters.get(frame.ref)?.(frame);
+        // Before the welcome, any refusal (bad invite, handle taken, …) ends a create/join.
         if (
           this.#onWelcome &&
-          (frame.code === "auth" ||
-            frame.code === "invite" ||
-            frame.code === "exists" ||
-            frame.code === "unknown_device")
+          (!this.#ready || frame.code === "auth" || frame.code === "unknown_device")
         ) {
-          this.#onWelcome(new Error(`relay refused: ${frame.message}`));
+          this.#onWelcome(new Error(frame.message));
           this.#onWelcome = undefined;
           this.#stopped = true;
           this.#ws?.close();
