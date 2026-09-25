@@ -1,0 +1,18 @@
+YOLO mode is enabled. All tool calls will be automatically approved.
+Approval mode overridden to "default" because the current folder is not trusted.
+Error authenticating: IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google
+    at throwIneligibleOrProjectIdError (file:///home/pik/.nvm/versions/node/v24.16.0/lib/node_modules/@google/gemini-cli/bundle/chunk-SBG6CUNK.js:307713:11)
+    at _doSetupUser (file:///home/pik/.nvm/versions/node/v24.16.0/lib/node_modules/@google/gemini-cli/bundle/chunk-SBG6CUNK.js:307702:5)
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5) {
+  ineligibleTiers: [
+    {
+      reasonCode: 'UNSUPPORTED_CLIENT',
+      reasonMessage: 'This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google',
+      tierId: 'free-tier',
+      tierName: 'Gemini Code Assist for individuals'
+    }
+  ]
+}
+YOLO mode is enabled. All tool calls will be automatically approved.
+Approval mode overridden to "default" because the current folder is not trusted.
+[31mGemini CLI is not running in a trusted directory. To proceed, either use `--skip-trust`, set the `GEMINI_CLI_TRUST_WORKSPACE=true` environment variable, or trust this directory in interactive mode. For more details, see https://geminicli.com/docs/cli/trusted-folders/#headless-and-automated-environments[0m

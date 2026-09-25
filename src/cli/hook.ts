@@ -40,6 +40,9 @@ interface HookResponse {
   env?: Record<string, string>;
 }
 
+/** CLIs whose hook contract expects a JSON object on stdout even when there is nothing to say. */
+const JSON_STDOUT_TOOLS = new Set(["agy", "cursor", "copilot"]);
+
 /**
  * `agentlink hook <tool> <event> [json]`, invoked by a CLI's hook system. It must fail open:
  * any problem exits 0 with no output, so the agent keeps working as if agentlink wasn't there.
@@ -75,8 +78,12 @@ export async function runHook(
         cwd: process.cwd(),
         ...(process.env.TMUX_PANE ? { tmuxPane: process.env.TMUX_PANE } : {}),
         ...(process.env.TMUX ? { tmux: process.env.TMUX } : {}),
+        ...(process.env.CLAUDE_CODE_MESSAGING_SOCKET
+          ? { claudeSocket: process.env.CLAUDE_CODE_MESSAGING_SOCKET }
+          : {}),
       },
     });
+    if (!res.stdout && JSON_STDOUT_TOOLS.has(tool)) res.stdout = "{}";
     const envFile = process.env.CLAUDE_ENV_FILE;
     if (res.env && envFile) {
       const lines = Object.entries(res.env)

@@ -11,6 +11,8 @@ export interface WakePayload {
   rendered: string;
   notice: string;
   items: InboxItem[];
+  /** At least one item justifies a response (ask/request/handoff/…); else it's FYI only. */
+  wakeWorthy: boolean;
 }
 
 export interface Deliverer {
@@ -22,8 +24,8 @@ export interface Deliverer {
    * false means only a notice was shown and hooks will inject the messages.
    */
   wake(agent: AgentRow, payload: WakePayload): Promise<{ consumed: boolean }>;
-  /** Push-capable deliverers can also queue into a busy session. */
-  pushWhenBusy?: boolean;
+  /** Push-capable deliverers reach the session in any state (busy: queued; idle: FYI added silently). */
+  pushAlways?: boolean;
 }
 
 function ago(isoTime: string, now: Date): string {
@@ -139,16 +141,19 @@ export class DeliveryEngine {
     }
     const caps = this.capabilities(agent);
     const deliverer = this.delivererFor(agent);
+    const worthy = items.some((i) => this.wakeWorthy(i));
+    if (deliverer?.pushAlways && (agent.state === "busy" || !worthy)) {
+      this.#push(agent, deliverer);
+      return agent.state === "busy"
+        ? `busy: queued into its session (${deliverer.id})`
+        : `idle: added to its session without waking it (${deliverer.id})`;
+    }
     if (agent.state === "busy") {
-      if (deliverer?.pushWhenBusy) {
-        this.#push(agent, deliverer);
-        return `busy: queued into its session (${deliverer.id})`;
-      }
       if (caps.midTurn) return "busy: injected at its next tool call";
       return "busy: delivered when its next turn starts";
     }
     // idle
-    if (!items.some((i) => this.wakeWorthy(i))) return "idle: delivered when it next starts a turn";
+    if (!worthy) return "idle: delivered when it next starts a turn";
     const { used, limit } = this.budget(agent);
     if (used >= limit) {
       return `idle: wake budget used up (${used}/${limit} this hour); delivered at its next turn`;
@@ -184,8 +189,9 @@ export class DeliveryEngine {
       if (items.length === 0) return;
       const rendered = this.#mailbox.render(items, agent.name);
       const notice = renderWakeNotice(items.map((i) => this.#mailbox.renderItem(i)));
+      const wakeWorthy = items.some((i) => this.wakeWorthy(i));
       const result = await withTimeout(
-        deliverer.wake(agent, { rendered, notice, items }),
+        deliverer.wake(agent, { rendered, notice, items, wakeWorthy }),
         25_000,
         `${deliverer.id} timed out`,
       );
@@ -223,8 +229,9 @@ export class DeliveryEngine {
   }
 
   /**
-   * Maintains `run/pending/<agentId>` and `run/pending/pid-<pid>` flag files. The PostToolUse
-   * hook checks `pid-$PPID` in plain sh, so it only starts Node when mail is waiting.
+   * Maintains flag files in `run/pending/`: `known-<pid>` for every live agent process and
+   * `pid-<pid>` while it has queued mail. High-frequency hooks (PostToolUse, PreInvocation)
+   * test these in plain sh and only start Node when there is mail or the process is new.
    */
   refreshPending(agentId: string): void {
     const agent = this.#registry.byId(agentId);
@@ -235,14 +242,19 @@ export class DeliveryEngine {
           agentId,
         )?.n ?? 0)
       : 0;
-    const active = count > 0 && agent && isLive(agent) && !agent.muted && !this.#mailbox.paused;
+    const live = !!agent && isLive(agent);
+    const active = count > 0 && live && !agent?.muted && !this.#mailbox.paused;
     try {
-      // Drop stale pid flags that belonged to this agent (e.g. after a restart with a new pid).
+      // Drop flags that belonged to this agent under another pid (e.g. after a restart).
       for (const file of readdirSync(dir)) {
-        if (!file.startsWith("pid-")) continue;
-        const owner = safeRead(join(dir, file));
-        if (owner === agentId && (!active || file !== `pid-${agent?.pid}`))
-          rmSync(join(dir, file), { force: true });
+        if (!file.startsWith("pid-") && !file.startsWith("known-")) continue;
+        if (safeRead(join(dir, file)) !== agentId) continue;
+        const keep =
+          (live && file === `known-${agent?.pid}`) || (active && file === `pid-${agent?.pid}`);
+        if (!keep) rmSync(join(dir, file), { force: true });
+      }
+      if (live && agent?.pid) {
+        writeFileSync(join(dir, `known-${agent.pid}`), agentId, { mode: 0o600 });
       }
       if (active && agent) {
         writeFileSync(join(dir, agentId), String(count), { mode: 0o600 });

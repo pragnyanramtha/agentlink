@@ -18,7 +18,12 @@ import { type Paths, resolvePaths } from "../core/paths.ts";
 import { isAlive, procInfo } from "../core/proc.ts";
 import { Claims } from "./claims.ts";
 import type { DaemonContext } from "./context.ts";
-import { codexQueueDeliverer, OpenCodeBridge, tmuxDeliverer } from "./deliverers.ts";
+import {
+  claudeInboxDeliverer,
+  codexQueueDeliverer,
+  OpenCodeBridge,
+  tmuxDeliverer,
+} from "./deliverers.ts";
 import { DeliveryEngine } from "./delivery.ts";
 import { EventBus } from "./events.ts";
 import { HookHandler } from "./hooks.ts";
@@ -118,6 +123,7 @@ export async function startDaemon(
   const opencode = new OpenCodeBridge();
   engine.use(opencode);
   engine.use(codexQueueDeliverer());
+  engine.use(claudeInboxDeliverer());
   engine.use(tmuxDeliverer(ctx));
   const hooks = new HookHandler(ctx, registry, mailbox, engine);
   const claims = new Claims(ctx);

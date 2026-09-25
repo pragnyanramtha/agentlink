@@ -3,6 +3,7 @@ import type { Capabilities } from "../daemon/types.ts";
 export const CANONICAL_EVENTS = [
   "session-start",
   "prompt-submit",
+  "pre-model",
   "pre-tool",
   "post-tool",
   "stop",
@@ -22,16 +23,16 @@ export interface HookInfo {
   source?: string;
 }
 
-/** How agentlink talks to one CLI's hook system at runtime (what installers wire up). */
+/** How agentlink talks to one CLI's hook system at runtime (what the installers wire up). */
 export interface AdapterRuntime {
   tool: string;
   capabilities: Capabilities;
-  /** Native hook event names, used in outputs like hookSpecificOutput.hookEventName. */
+  /** Native hook event names (documentation + outputs like hookSpecificOutput.hookEventName). */
   nativeEvents: Partial<Record<CanonicalEvent, string>>;
   parse(event: CanonicalEvent, payload: Record<string, unknown>): HookInfo;
   /** stdout that injects `text` into the model's context at this event, if the CLI supports it. */
   contextOutput(event: CanonicalEvent, text: string): string | undefined;
-  /** stdout that keeps the agent going after a Stop with `reason` as new input, if supported. */
+  /** stdout that keeps the agent going after a stop with `reason` as new input, if supported. */
   continueOutput?(reason: string): string;
 }
 
@@ -45,8 +46,11 @@ function firstString(p: Record<string, unknown>, keys: string[]): string | undef
   return undefined;
 }
 
+function firstOf(v: unknown): string | undefined {
+  return Array.isArray(v) ? str(v[0]) : undefined;
+}
+
 function genericParse(p: Record<string, unknown>): HookInfo {
-  const roots = Array.isArray(p.workspace_roots) ? p.workspace_roots : undefined;
   const sessionId = firstString(p, [
     "session_id",
     "sessionId",
@@ -57,9 +61,14 @@ function genericParse(p: Record<string, unknown>): HookInfo {
     "conversationId",
     "chat_id",
   ]);
-  const cwd = firstString(p, ["cwd", "workspaceRoot", "workspace_root"]) ?? str(roots?.[0]);
-  const transcriptPath = str(p.transcript_path);
-  const toolName = firstString(p, ["tool_name", "toolName"]);
+  const cwd =
+    firstString(p, ["cwd", "workspaceRoot", "workspace_root"]) ??
+    firstOf(p.workspace_roots) ??
+    firstOf(p.workspacePaths);
+  const transcriptPath = firstString(p, ["transcript_path", "transcriptPath"]);
+  const toolName =
+    firstString(p, ["tool_name", "toolName"]) ??
+    str((p.toolCall as Record<string, unknown> | undefined)?.name);
   const source = str(p.source);
   return {
     ...(sessionId ? { sessionId } : {}),
@@ -82,14 +91,12 @@ const CLAUDE_EVENTS: Partial<Record<CanonicalEvent, string>> = {
   "session-end": "SessionEnd",
 };
 
-const INJECTABLE: CanonicalEvent[] = ["session-start", "prompt-submit", "pre-tool", "post-tool"];
-
-/** Claude Code's hook contract, also followed by Codex and Devin CLI. */
-function claudeStyle(
-  tool: string,
-  capabilities: Capabilities,
-  injectable: CanonicalEvent[] = INJECTABLE,
-): AdapterRuntime {
+/**
+ * Claude Code's hook contract. Codex (0.124+) and Devin CLI follow it too. Verified live:
+ * PostToolUse additionalContext reaches the model mid-turn; Stop {decision:"block"} continues.
+ */
+function claudeStyle(tool: string, capabilities: Capabilities): AdapterRuntime {
+  const injectable: CanonicalEvent[] = ["session-start", "prompt-submit", "pre-tool", "post-tool"];
   return {
     tool,
     capabilities,
@@ -122,6 +129,7 @@ const COPILOT_EVENTS: Partial<Record<CanonicalEvent, string>> = {
   "pre-tool": "preToolUse",
   "post-tool": "postToolUse",
   stop: "agentStop",
+  notification: "notification",
   "session-end": "sessionEnd",
 };
 
@@ -134,14 +142,54 @@ const CURSOR_EVENTS: Partial<Record<CanonicalEvent, string>> = {
   "session-end": "sessionEnd",
 };
 
+const AGY_EVENTS: Partial<Record<CanonicalEvent, string>> = {
+  "pre-model": "PreInvocation",
+  "post-tool": "PostToolUse",
+  stop: "Stop",
+};
+
 const RUNTIMES: Record<string, AdapterRuntime> = {
   claude: claudeStyle("claude", { midTurn: true, nextTurn: true }),
-  codex: {
-    ...claudeStyle("codex", { midTurn: true, nextTurn: true, wake: true }),
-    // `notify` passes {"type":"agent-turn-complete","thread-id":…,"cwd":…} as argv JSON.
-    parse: (_event, p) => genericParse(p),
-  },
+  codex: claudeStyle("codex", { midTurn: true, nextTurn: true, wake: true }),
   devin: claudeStyle("devin", { midTurn: true, nextTurn: true }),
+  // Copilot CLI: postToolUse/sessionStart/notification take {additionalContext}; agentStop can block.
+  // userPromptSubmitted output is ignored for command hooks.
+  copilot: {
+    tool: "copilot",
+    capabilities: { midTurn: true, nextTurn: true },
+    nativeEvents: COPILOT_EVENTS,
+    parse: (_event, p) => genericParse(p),
+    contextOutput(event, text) {
+      if (!["session-start", "post-tool", "notification"].includes(event)) return undefined;
+      return JSON.stringify({ additionalContext: text });
+    },
+    continueOutput: (reason) => JSON.stringify({ decision: "block", reason }),
+  },
+  // Cursor: sessionStart/postToolUse take {additional_context}; stop takes {followup_message}.
+  cursor: {
+    tool: "cursor",
+    capabilities: { midTurn: true, nextTurn: true },
+    nativeEvents: CURSOR_EVENTS,
+    parse: (_event, p) => genericParse(p),
+    contextOutput(event, text) {
+      if (!["session-start", "post-tool"].includes(event)) return undefined;
+      return JSON.stringify({ additional_context: text });
+    },
+    continueOutput: (reason) => JSON.stringify({ followup_message: reason }),
+  },
+  // Antigravity CLI (agy): PreInvocation runs before every model call and can inject steps;
+  // Stop can {decision:"continue"}. Payload keys are camelCase (conversationId, workspacePaths).
+  agy: {
+    tool: "agy",
+    capabilities: { midTurn: true, nextTurn: true },
+    nativeEvents: AGY_EVENTS,
+    parse: (_event, p) => genericParse(p),
+    contextOutput(event, text) {
+      if (event !== "pre-model") return undefined;
+      return JSON.stringify({ injectSteps: [{ ephemeralMessage: text }] });
+    },
+    continueOutput: (reason) => JSON.stringify({ decision: "continue", reason }),
+  },
   gemini: {
     tool: "gemini",
     capabilities: { midTurn: true, nextTurn: true },
@@ -154,27 +202,6 @@ const RUNTIMES: Record<string, AdapterRuntime> = {
       return JSON.stringify({
         hookSpecificOutput: { hookEventName: name, additionalContext: text },
       });
-    },
-  },
-  copilot: {
-    tool: "copilot",
-    capabilities: { nextTurn: true },
-    nativeEvents: COPILOT_EVENTS,
-    parse: (_event, p) => genericParse(p),
-    contextOutput(event, text) {
-      if (!["session-start", "prompt-submit"].includes(event)) return undefined;
-      return JSON.stringify({ additionalContext: text });
-    },
-    continueOutput: (reason) => JSON.stringify({ decision: "block", reason }),
-  },
-  cursor: {
-    tool: "cursor",
-    capabilities: { nextTurn: true },
-    nativeEvents: CURSOR_EVENTS,
-    parse: (_event, p) => genericParse(p),
-    contextOutput(event, text) {
-      if (event !== "session-start") return undefined;
-      return JSON.stringify({ additional_context: text });
     },
   },
   kiro: {

@@ -1,0 +1,7 @@
+{
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs devin SessionStart log" }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs devin UserPromptSubmit log" }] }],
+  "PostToolUse":      [{ "matcher": "", "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs devin PostToolUse inject-once" }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs devin Stop block-once" }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs devin SessionEnd log" }] }]
+}

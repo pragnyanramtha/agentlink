@@ -393,6 +393,96 @@ describe("hooks", () => {
     );
   });
 
+  it("identifies the real CLI when another tool's hook config fires, and drops the duplicate", async () => {
+    // Devin CLI also runs hooks from ~/.claude/settings.json.
+    const d = t.fakeAgentProcess("devin");
+    const viaClaudeConfig = await t.hook<{ stdout?: string }>(
+      "claude",
+      "session-start",
+      { session_id: "dv1", cwd: t.home },
+      d,
+      "/usr/local/bin/devin",
+    );
+    const viaDevinConfig = await t.hook<{ stdout?: string }>(
+      "devin",
+      "session-start",
+      { session_id: "dv1", cwd: t.home },
+      d,
+      "/usr/local/bin/devin",
+    );
+    expect(
+      JSON.parse(String(viaClaudeConfig.stdout)).hookSpecificOutput.additionalContext,
+    ).toContain("(Devin)");
+    expect(viaDevinConfig.stdout).toBeUndefined();
+    const agents = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents;
+    expect(agents.map((a) => a.tool)).toEqual(["devin"]);
+  });
+
+  it("agy: PreInvocation injects via injectSteps and Stop continues with decision=continue", async () => {
+    const g = t.fakeAgentProcess("agy");
+    await t.hook("agy", "pre-model", { conversationId: "conv-1", workspacePaths: [t.home] }, g);
+    const name = String(
+      (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents[0]?.name,
+    );
+    expect(name).toMatch(/^agy-/);
+    await register("alpha");
+    await t
+      .client("alpha")
+      .request("POST", "/v1/messages", { to: [name], kind: "ask", text: "status of the build?" });
+    const pre = await t.hook<{ stdout: string }>(
+      "agy",
+      "pre-model",
+      { conversationId: "conv-1" },
+      g,
+    );
+    expect(JSON.parse(pre.stdout).injectSteps[0].ephemeralMessage).toContain(
+      "status of the build?",
+    );
+    await t
+      .client("alpha")
+      .request("POST", "/v1/messages", { to: [name], kind: "ask", text: "and the tests?" });
+    const stop = await t.hook<{ stdout: string }>("agy", "stop", { conversationId: "conv-1" }, g);
+    expect(JSON.parse(stop.stdout)).toMatchObject({ decision: "continue" });
+    expect(JSON.parse(stop.stdout).reason).toContain("and the tests?");
+  });
+
+  it("cursor: postToolUse injects additional_context and stop uses followup_message", async () => {
+    const k = t.fakeAgentProcess("cursor-agent");
+    await t.hook(
+      "cursor",
+      "session-start",
+      { session_id: "cur-1", workspace_roots: [t.home] },
+      k,
+      "/usr/local/bin/cursor-agent",
+    );
+    const name = String(
+      (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents[0]?.name,
+    );
+    await register("alpha");
+    await t
+      .client("alpha")
+      .request("POST", "/v1/messages", { to: [name], kind: "ask", text: "which branch?" });
+    const post = await t.hook<{ stdout: string }>(
+      "cursor",
+      "post-tool",
+      { conversation_id: "cur-1" },
+      k,
+      "/usr/local/bin/cursor-agent",
+    );
+    expect(JSON.parse(post.stdout).additional_context).toContain("which branch?");
+    await t
+      .client("alpha")
+      .request("POST", "/v1/messages", { to: [name], kind: "ask", text: "and the commit?" });
+    const stop = await t.hook<{ stdout: string }>(
+      "cursor",
+      "stop",
+      { conversation_id: "cur-1" },
+      k,
+      "/usr/local/bin/cursor-agent",
+    );
+    expect(JSON.parse(stop.stdout).followup_message).toContain("and the commit?");
+  });
+
   it("stop continuation is capped to avoid loops", async () => {
     const c = t.fakeAgentProcess("claude");
     await t.hook("claude", "session-start", { session_id: "loop", cwd: t.home }, c);

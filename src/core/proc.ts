@@ -82,15 +82,30 @@ const TOOL_PATTERNS: Record<string, RegExp> = {
   opencode: /(^|\/)opencode(\.exe)?$|opencode-ai/,
   gemini: /(^|\/)gemini$|@google\/gemini-cli/,
   copilot: /(^|\/)copilot$|@github\/copilot/,
-  cursor: /(^|\/)(cursor-agent|agent)$|cursor-agent/,
-  kiro: /(^|\/)kiro(-cli)?$/,
+  cursor: /(^|\/)(cursor-agent|agent)$|cursor-agent\//,
+  kiro: /(^|\/)kiro-cli$/,
   devin: /(^|\/)devin$/,
+  agy: /(^|\/)(agy|antigravity)$/,
 };
 
 export function matchesTool(tool: string, info: ProcInfo): boolean {
   const re = TOOL_PATTERNS[tool];
   if (!re) return false;
   return info.cmd.slice(0, 3).some((arg) => re.test(arg));
+}
+
+/**
+ * Which agent CLI a hook really runs under. Hook configs are shared across tools (Devin reads
+ * ~/.claude/settings.json hooks; Copilot and Cursor read a repo's .claude hooks), so the tool
+ * named on the hook command line is only a hint.
+ */
+export function detectTool(chain: ProcInfo[]): { tool: string; proc: ProcInfo } | undefined {
+  for (const proc of chain.slice(1)) {
+    for (const tool of Object.keys(TOOL_PATTERNS)) {
+      if (matchesTool(tool, proc)) return { tool, proc };
+    }
+  }
+  return undefined;
 }
 
 const SHELLS = /(^|\/)(sh|bash|zsh|dash|fish|env|timeout|nohup|script)$/;

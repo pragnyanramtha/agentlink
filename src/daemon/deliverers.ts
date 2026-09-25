@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync } from "node:fs";
+import { connect } from "node:net";
 import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { ulid } from "../core/ids.ts";
@@ -42,6 +43,35 @@ export function codexQueueDeliverer(
   };
 }
 
+/**
+ * Claude Code (2.1.224+): every session listens on an inbox socket; a JSON `user` line posted
+ * there starts a new turn in an idle session, framed by Claude as a peer message. We never
+ * send the session's own token, so Claude's inbound controls (hold/refuse) still apply.
+ */
+export function claudeInboxDeliverer(): Deliverer {
+  const socketOf = (agent: AgentRow): string | undefined => {
+    const s = parseJson<Record<string, unknown>>(agent.adapter, {}).claudeSocket;
+    return typeof s === "string" && s ? s : undefined;
+  };
+  return {
+    id: "claude-inbox",
+    canWake(agent) {
+      const socket = socketOf(agent);
+      return agent.tool === "claude" && !!socket && existsSync(socket);
+    },
+    wake(agent, payload) {
+      const socket = socketOf(agent) as string;
+      const line = `${JSON.stringify({ type: "user", message: { role: "user", content: payload.rendered } })}\n`;
+      return new Promise((resolve, reject) => {
+        const conn = connect(socket);
+        conn.setTimeout(5_000, () => conn.destroy(new Error("claude inbox timed out")));
+        conn.once("error", reject);
+        conn.once("connect", () => conn.end(line, () => resolve({ consumed: true })));
+      });
+    },
+  };
+}
+
 /** Any CLI running inside tmux: types a one-line notice into its pane; hooks inject the mail. */
 export function tmuxDeliverer(
   ctx: DaemonContext,
@@ -74,12 +104,14 @@ interface PendingPush {
   token: string;
   text: string;
   deliveryIds: number[];
+  /** false → the plugin adds the text with noReply (FYI, no model turn). */
+  reply: boolean;
 }
 
-/** OpenCode: the agentlink plugin long-polls the daemon and calls `client.session.prompt`. */
+/** OpenCode: the agentlink plugin long-polls the daemon and calls `client.session.promptAsync`. */
 export class OpenCodeBridge implements Deliverer {
   readonly id = "opencode-plugin";
-  readonly pushWhenBusy = true;
+  readonly pushAlways = true;
   readonly #polls = new Map<string, (push: PendingPush | null) => void>();
   readonly #acks = new Map<string, (ok: boolean) => void>();
 
@@ -107,6 +139,7 @@ export class OpenCodeBridge implements Deliverer {
       token,
       text: payload.rendered,
       deliveryIds: payload.items.map((i) => i.delivery.id),
+      reply: payload.wakeWorthy,
     });
     return acked.then((consumed) => ({ consumed }));
   }
