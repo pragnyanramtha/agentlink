@@ -167,14 +167,20 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
     "reply",
     {
       title: "Reply to a message",
-      description: "Answer a message you received (use its id).",
-      inputSchema: { id: z.string().describe("Message id to answer"), answer: z.string() },
+      description:
+        "Answer a message you received (use its id). all=true answers everyone in a group conversation.",
+      inputSchema: {
+        id: z.string().describe("Message id to answer"),
+        answer: z.string(),
+        all: z.boolean().optional().describe("Reply to every participant, not just the sender"),
+      },
     },
-    guard(async ({ id, answer }) => {
+    guard(async ({ id, answer, all }) => {
       const res = await call<SendResponse>("POST", "/v1/messages", {
         kind: "reply",
         replyTo: id,
         text: answer,
+        ...(all ? { replyAll: true } : {}),
       });
       return ok(describeSend(res, 0));
     }),

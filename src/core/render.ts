@@ -16,6 +16,8 @@ export interface RenderItem {
   replyTo?: string;
   ack?: AckValue;
   attachments: string[];
+  /** Other participants when this is a group conversation. */
+  others?: string[];
 }
 
 const TAG = "agentlink-msg";
@@ -47,7 +49,9 @@ function action(item: RenderItem): string {
     case "review_result":
       return `Review findings answering your request ${item.replyTo ?? ""}.`.trim();
     case "reply":
-      return `This answers your message ${item.replyTo ?? ""}. No reply needed unless you have a follow-up.`;
+      return item.others?.length
+        ? `A reply in the group conversation (to ${item.replyTo ?? "a message"}). No reply needed unless you have something to add.`
+        : `This answers your message ${item.replyTo ?? ""}. No reply needed unless you have a follow-up.`;
     case "ack":
       return `Acknowledgement (${item.ack ?? "processed"}) of your message ${item.replyTo ?? ""}.`;
     case "info":
@@ -67,7 +71,13 @@ function renderOne(item: RenderItem, maxBodyChars: number): string {
   if (body.length > maxBodyChars) {
     body = `${body.slice(0, maxBodyChars)}\n… (truncated; full text: agentlink show ${item.id})`;
   }
-  const lines = [open, provenance(item), action(item), "---", body];
+  const lines = [open, provenance(item), action(item)];
+  if (item.others?.length) {
+    lines.push(
+      `Group conversation, also with: ${item.others.join(", ")}. To answer everyone: agentlink reply ${item.id} --all "<text>"`,
+    );
+  }
+  lines.push("---", body);
   for (const att of item.attachments) lines.push(`[${att}]`);
   lines.push(`</${TAG}-${token}>`);
   return lines.join("\n");

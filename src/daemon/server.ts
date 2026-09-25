@@ -129,6 +129,7 @@ const SendSchema = z.object({
   ttlMs: z.number().int().positive().optional(),
   ack: AckSchema.optional(),
   force: z.boolean().optional(),
+  replyAll: z.boolean().optional(),
 });
 
 const RegisterSchema = z.object({
@@ -300,9 +301,19 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   route("POST", "/v1/team/join", async (req) => {
     requireHuman(req, false);
     const body = z
-      .object({ invite: z.string().min(10), handle: z.string().optional() })
+      .object({
+        invite: z.string().min(1),
+        handle: z.string().optional(),
+        relay: z.string().optional(),
+      })
       .parse(req.body);
-    return s.team.join(body.invite, body.handle);
+    return s.team.join(body.invite, body.handle, body.relay);
+  });
+
+  route("POST", "/v1/team/relay", async (req) => {
+    requireHuman(req, false);
+    const body = z.object({ url: z.string().min(1) }).parse(req.body);
+    return s.team.setRelay(body.url);
   });
 
   route("POST", "/v1/team/leave", (req) => {
@@ -338,6 +349,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       ...(input.ttlMs ? { ttlMs: input.ttlMs } : {}),
       ...(input.ack ? { ack: input.ack } : {}),
       ...(input.force ? { force: true } : {}),
+      ...(input.replyAll ? { replyAll: true } : {}),
       wait: !!input.waitMs,
     });
     const notes = engine.onQueued(result.queued);

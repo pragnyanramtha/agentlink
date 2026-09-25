@@ -49,6 +49,8 @@ export interface SendInput {
   ack?: AckValue;
   /** Send to teammates even though the text looks like it contains a secret. */
   force?: boolean;
+  /** Answer everyone in the original message's conversation (group chat). */
+  replyAll?: boolean;
 }
 
 interface Recipient {
@@ -310,6 +312,15 @@ export class Mailbox {
     return [...unique.values()];
   }
 
+  #resolvable(sender: Sender, address: string): boolean {
+    try {
+      this.#resolveRecipients(sender, [address]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Only a recipient answers a message, and a handoff gets one final accept/decline. */
   #checkAnswerer(sender: Sender, original: MessageRow, ack?: AckValue): void {
     const mine = this.deliveriesOf(original.id).find((d) =>
@@ -432,7 +443,18 @@ export class Mailbox {
     if (original && ["reply", "ack", "review_result"].includes(input.kind)) {
       this.#checkAnswerer(sender, original, input.ack);
     }
-    const recipients = this.#resolveRecipients(sender, input.to ?? [], original);
+    let to = input.to ?? [];
+    if (input.replyAll) {
+      if (!original) throw invalid("--all needs a message to answer");
+      const me = sender.kind === "agent" ? sender.agent.name : `@${this.handle}`;
+      // Everyone still reachable; a participant that no longer exists is skipped.
+      to = this.participants(this.envelopeOf(original)).filter(
+        (p) => p !== me && this.#resolvable(sender, p),
+      );
+      if (to.length === 0)
+        throw invalid(`nobody else in the conversation of ${original.id} is reachable`);
+    }
+    const recipients = this.#resolveRecipients(sender, to, original);
     const thread =
       original?.thread_id ?? (input.thread ? this.resolveThread(input.thread) : undefined);
     const key = echoKey(`${input.kind}:${text}`);
@@ -905,13 +927,29 @@ export class Mailbox {
   }
 
   /** Whether this delivery answers a message whose sender expects a reply. */
+  /** An answer to something this recipient asked (answers to others in a group don't wake). */
   answersExpecting(item: InboxItem): boolean {
     if (!item.message.reply_to) return false;
     const original = this.#ctx.store.get<MessageRow>(
-      "SELECT kind FROM messages WHERE id = ?",
+      "SELECT kind, from_agent_id FROM messages WHERE id = ?",
       item.message.reply_to,
     );
-    return !!original && EXPECTS_REPLY.has(original.kind);
+    return (
+      !!original &&
+      EXPECTS_REPLY.has(original.kind) &&
+      (original.from_agent_id === null || original.from_agent_id === item.delivery.to_agent_id)
+    );
+  }
+
+  /** Everyone in a message's conversation (sender and recipients), as addressed from here. */
+  participants(env: Envelope): string[] {
+    const local = (a: Envelope["from"]): string | undefined => {
+      if (a.role === "system") return undefined;
+      const human = a.role === "human" || !a.agent;
+      if (a.member === this.handle) return human ? `@${this.handle}` : a.agent;
+      return human ? `@${a.member}` : `${a.member}/${a.agent}`;
+    };
+    return [...new Set([env.from, ...env.to].map(local).filter((x): x is string => !!x))];
   }
 
   renderItem(item: InboxItem): RenderItem {
@@ -945,6 +983,9 @@ export class Mailbox {
       ...(env.replyTo ? { replyTo: env.replyTo } : {}),
       ...(env.meta.ack ? { ack: env.meta.ack } : {}),
       attachments,
+      others: this.participants(env).filter(
+        (p) => p !== item.delivery.to_addr && p !== item.message.from_addr,
+      ),
     };
   }
 

@@ -146,9 +146,15 @@ export const team: Command = async (ctx) => {
       return 0;
     }
     case "join": {
-      const { values, positionals } = parse(sub2.argv, { handle: { type: "string" } });
+      const { values, positionals } = parse(sub2.argv, {
+        handle: { type: "string" },
+        relay: { type: "string", short: "r" },
+      });
       const [invite] = positionals;
-      if (!invite) throw new UsageError("usage: agentlink team join <invite> [--handle <you>]");
+      if (!invite)
+        throw new UsageError(
+          "usage: agentlink team join <invite> [--handle <you>] [--relay <url>]",
+        );
       if (
         !invite
           .trim()
@@ -163,11 +169,36 @@ export const team: Command = async (ctx) => {
       const s = await ctx.client.request<TeamStatus>(
         "POST",
         "/v1/team/join",
-        { invite, ...(values.handle ? { handle: values.handle } : {}) },
+        {
+          invite,
+          ...(values.handle ? { handle: values.handle } : {}),
+          ...(values.relay ? { relay: values.relay } : {}),
+        },
         { timeoutMs: 20_000 },
       );
       out(ctx, s, () =>
         [`${c.green("✓")} joined ${c.bold(s.team?.name ?? "the team")}`, printStatus(s)].join("\n"),
+      );
+      return 0;
+    }
+    case "relay": {
+      const { positionals } = parse(sub2.argv, {});
+      const [url] = positionals;
+      if (!url) throw new UsageError("usage: agentlink team relay <ws://host:port>");
+      await ctx.client.ensureDaemon();
+      const s = await ctx.client.request<TeamStatus>(
+        "POST",
+        "/v1/team/relay",
+        { url },
+        { timeoutMs: 20_000 },
+      );
+      out(ctx, s, () =>
+        [
+          s.team?.connected
+            ? `${c.green("✓")} now using relay ${s.team.relay}`
+            : `${c.yellow("!")} saved relay ${s.team?.relay}, but it is not reachable yet (agentlink keeps retrying)`,
+          printStatus(s),
+        ].join("\n"),
       );
       return 0;
     }
@@ -185,7 +216,7 @@ export const team: Command = async (ctx) => {
     }
     default:
       throw new UsageError(
-        `unknown team command "${sub}"${didYouMean(sub, ["status", "members", "create", "invite", "join", "leave"])}; use status|create|invite|join|leave`,
+        `unknown team command "${sub}"${didYouMean(sub, ["status", "members", "create", "invite", "join", "relay", "leave"])}; use status|create|invite|join|relay|leave`,
       );
   }
 };

@@ -82,15 +82,20 @@ Send a message. Kinds:
 
 Recipients: agent names, alice/agent (teammate), @alice (teammate's inbox),
 @<you> (your own inbox), repo:<git remote> (every agent in that repo).
+Several recipients make a group conversation; they answer everyone with reply --all.
 
 Example: agentlink send opencode-web --kind request "Please run the e2e suite"`,
 
-  reply: `agentlink reply <message-id> "<answer>" [--wait [d]] [--stdin]
+  reply: `agentlink reply <message-id> "<answer>" [--all] [--wait [d]] [--stdin]
 
 Answer a message you received (the id is in its <agentlink-msg …> tag or inbox).
 A unique prefix of the id is enough.
 
-Example: agentlink reply 01M3C4 "pnpm test (vitest)"`,
+  -a, --all   answer everyone in the conversation (group chat), not just the sender
+
+Examples:
+  agentlink reply 01M3C4 "pnpm test (vitest)"
+  agentlink reply 01M3C4 --all "I'll take the API part"`,
 
   ack: `agentlink ack <message-id> [--accept|--decline] ["note"]
 
@@ -174,12 +179,14 @@ List active file claims on this machine.`,
   team: `agentlink team [status]
 agentlink team create <name> --relay ws://<host>:7700 [--handle <you>]
 agentlink team invite [--uses 1] [--ttl 24h]
-agentlink team join <invite> [--handle <you>]
+agentlink team join <invite> [--handle <you>] [--relay <url>]
+agentlink team relay <url>          use another address for the relay (after moving it)
 agentlink team leave
 
 Connect this machine to other machines and people. Messages are end-to-end
 encrypted to each device; the relay only stores and forwards ciphertext.
 After joining, teammates' agents show up in agentlink peers as alice/<agent>.
+--relay reaches the same relay at another address (for example through an SSH tunnel).
 
 Typical setup:
   (any machine)  agentlink relay serve --host 0.0.0.0

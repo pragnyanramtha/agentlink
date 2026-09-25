@@ -123,6 +123,8 @@ async function sendCommon(
     thread?: string;
     waitMs: number;
     ttl?: string;
+    force?: boolean;
+    replyAll?: boolean;
   },
 ): Promise<number> {
   if (!opts.text.trim()) throw new UsageError("message text is empty");
@@ -140,6 +142,8 @@ async function sendCommon(
       ...(opts.thread ? { thread: opts.thread } : {}),
       ...(opts.waitMs > 0 ? { waitMs: opts.waitMs } : {}),
       ...(opts.ttl ? { ttlMs: parseDuration(opts.ttl, 0, "m") } : {}),
+      ...(opts.force ? { force: true } : {}),
+      ...(opts.replyAll ? { replyAll: true } : {}),
     },
     { timeoutMs: opts.waitMs > 0 ? opts.waitMs + 10_000 : 15_000 },
   );
@@ -153,6 +157,7 @@ export const send: Command = async (ctx) => {
     wait: { type: "string", short: "w" },
     stdin: { type: "boolean" },
     ttl: { type: "string" },
+    force: { type: "boolean" },
   });
   const [to, ...rest] = positionals;
   if (!to)
@@ -169,6 +174,7 @@ export const send: Command = async (ctx) => {
     ...(values.thread ? { thread: values.thread } : {}),
     waitMs,
     ...(values.ttl ? { ttl: values.ttl } : {}),
+    ...(values.force ? { force: true } : {}),
   });
 };
 
@@ -178,6 +184,7 @@ export const ask: Command = async (ctx) => {
     "no-wait": { type: "boolean" },
     thread: { type: "string", short: "t" },
     stdin: { type: "boolean" },
+    force: { type: "boolean" },
   });
   const [to, ...rest] = positionals;
   if (!to)
@@ -188,6 +195,7 @@ export const ask: Command = async (ctx) => {
     text: await readText(rest, Boolean(values.stdin)),
     ...(values.thread ? { thread: values.thread } : {}),
     waitMs: values["no-wait"] ? 0 : parseDuration(values.timeout, LIMITS.cliAskDefaultWaitMs),
+    ...(values.force ? { force: true } : {}),
   });
 };
 
@@ -196,14 +204,16 @@ export const reply: Command = async (ctx) => {
     wait: { type: "string", short: "w" },
     stdin: { type: "boolean" },
     kind: { type: "string", short: "k", default: "reply" },
+    all: { type: "boolean", short: "a" },
   });
   const [id, ...rest] = positionals;
-  if (!id) throw new UsageError('usage: agentlink reply <message-id> "<answer>"');
+  if (!id) throw new UsageError('usage: agentlink reply <message-id> "<answer>" [--all]');
   return sendCommon(ctx, {
     kind: String(values.kind),
     replyTo: id,
     text: await readText(rest, Boolean(values.stdin)),
     waitMs: values.wait !== undefined ? parseDuration(values.wait, LIMITS.cliAskDefaultWaitMs) : 0,
+    ...(values.all ? { replyAll: true } : {}),
   });
 };
 

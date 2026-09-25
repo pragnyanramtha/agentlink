@@ -243,7 +243,12 @@ export class TeamManager {
     });
   }
 
-  async join(inviteText: string, handle?: string): Promise<Record<string, unknown>> {
+  /** `relay` overrides the invite's address (same relay, reached differently, e.g. via a tunnel). */
+  async join(
+    inviteText: string,
+    handle?: string,
+    relay?: string,
+  ): Promise<Record<string, unknown>> {
     if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
     let invite: ReturnType<typeof decodeInvite>;
     try {
@@ -256,7 +261,7 @@ export class TeamManager {
     const base = slugify(this.#ctx.config.handle, 24);
     const fallback = base === invite.by.handle ? `${base}-${slugify(hostname(), 16)}` : base;
     const team: TeamState = {
-      relay: invite.relay,
+      relay: relay ? normalizeRelay(relay) : invite.relay,
       teamId: invite.teamId,
       teamName: invite.teamName,
       teamKey: invite.teamKey,
@@ -267,6 +272,19 @@ export class TeamManager {
     await this.#attach(team, { kind: "join", token: invite.token });
     saveTeam(this.#ctx.paths, team);
     return { ...this.status(), invitedBy: invite.by };
+  }
+
+  /** Points this device at another address for the team's relay (e.g. after moving it). */
+  async setRelay(url: string): Promise<Record<string, unknown>> {
+    const team = loadTeam(this.#ctx.paths);
+    if (!team) throw invalid("not in a team");
+    const next = { ...team, relay: normalizeRelay(url) };
+    saveTeam(this.#ctx.paths, next);
+    await this.#attach(next, { kind: "hello" });
+    const deadline = Date.now() + 8_000;
+    while (!this.#client?.connected && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 100));
+    return this.status();
   }
 
   leave(): void {

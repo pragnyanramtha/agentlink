@@ -242,6 +242,88 @@ describe("team relay", () => {
     expect(got).toBeTruthy();
   }, 40_000);
 
+  it("runs a three-way group conversation with reply --all", async () => {
+    const carol = await startTestDaemon({ handle: "carol" });
+    try {
+      const inv = await alice.raw<{ invite: string }>("POST", "/v1/team/invite", { uses: 1 });
+      expect((await carol.raw("POST", "/v1/team/join", { invite: inv.data.invite })).status).toBe(
+        200,
+      );
+      await registerAgent(carol, "claude-ops");
+      await until(async () => {
+        const { agents } = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+        return agents.find((a) => a.name === "carol/claude-ops");
+      }, 8_000);
+      await until(async () => {
+        const { agents } = await bob.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+        return agents.find((a) => a.name === "carol/claude-ops");
+      }, 8_000);
+      // alice asks bob and carol together and waits for both
+      const asking = alice
+        .client("claude-web")
+        .request<SendRes & { replies?: { text: string; message: { from: string } }[] }>(
+          "POST",
+          "/v1/messages",
+          {
+            to: [bobAgentName, "carol/claude-ops"],
+            kind: "ask",
+            text: "name for the new CLI?",
+            waitMs: 15_000,
+          },
+          { timeoutMs: 20_000 },
+        );
+      type Item = { message: { id: string; from: string }; text: string };
+      const bobItem = await until(async () => {
+        const r = await bob
+          .client("codex-api")
+          .request<{ items: Item[] }>("GET", "/v1/inbox?format=text");
+        return r.items.find((i) => i.text === "name for the new CLI?");
+      }, 8_000);
+      // bob sees the other participant and answers everyone
+      const rendered = await bob
+        .client("codex-api")
+        .request<{ text: string }>("GET", "/v1/inbox?all=1&peek=1&format=inject");
+      expect(rendered.text).toContain("also with: carol/claude-ops");
+      await bob.client("codex-api").request("POST", "/v1/messages", {
+        kind: "reply",
+        replyTo: bobItem?.message.id,
+        text: "bob: linkup",
+        replyAll: true,
+      });
+      // carol receives the question and bob's group reply
+      const carolItems = await until(async () => {
+        const r = await carol
+          .client("claude-ops")
+          .request<{ items: Item[] }>("GET", "/v1/inbox?all=1&peek=1");
+        const texts = r.items.map((i) => i.text);
+        return texts.includes("name for the new CLI?") && texts.includes("bob: linkup")
+          ? r.items
+          : undefined;
+      }, 8_000);
+      const question = carolItems?.find((i) => i.text === "name for the new CLI?");
+      expect(carolItems?.find((i) => i.text === "bob: linkup")?.message.from).toBe("bob/codex-api");
+      await carol.client("claude-ops").request("POST", "/v1/messages", {
+        kind: "reply",
+        replyTo: question?.message.id,
+        text: "carol: meshy",
+        replyAll: true,
+      });
+      const res = await asking;
+      expect(res.replies?.map((r) => r.text).sort()).toEqual(["bob: linkup", "carol: meshy"]);
+      // bob also gets carol's group reply
+      const bobGot = await until(async () => {
+        const r = await bob
+          .client("codex-api")
+          .request<{ items: Item[] }>("GET", "/v1/inbox?all=1&peek=1");
+        return r.items.find((i) => i.text === "carol: meshy");
+      }, 8_000);
+      expect(bobGot?.message.from).toBe("carol/claude-ops");
+    } finally {
+      await carol.raw("POST", "/v1/team/leave", {});
+      await carol.stop();
+    }
+  }, 60_000);
+
   it("rejects unknown team members and needs a team for team addresses", async () => {
     const res = await alice.raw(
       "POST",
