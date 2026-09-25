@@ -19,7 +19,8 @@ interface AgentView {
   member?: string;
 }
 
-function reach(a: AgentView & { wakeVia?: string | null }): string {
+function reach(a: AgentView & { wakeVia?: string | null; reach?: string | null }): string {
+  if (a.local === false) return `${a.reach ?? "?"} (relay)`;
   const caps = a.capabilities ?? {};
   const bits = [];
   if (caps.push) bits.push("push");

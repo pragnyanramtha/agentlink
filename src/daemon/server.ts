@@ -244,6 +244,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         status: a.status ?? null,
         muted: false,
         capabilities: {},
+        reach: a.reach ?? null,
         local: false,
       }));
     return { agents: [...local, ...remote], paused: mailbox.paused };

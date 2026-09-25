@@ -46,6 +46,8 @@ export interface RemoteAgent {
   branch?: string | null;
   status?: string | null;
   stateAt?: string;
+  /** How messages reach it on its own machine, e.g. "wake,mid-turn". */
+  reach?: string;
   at: string;
 }
 

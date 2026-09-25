@@ -9,7 +9,13 @@ import { type Mailbox, remoteHandleOf } from "./mailbox.ts";
 import { isLive, type Registry } from "./registry.ts";
 import { RelayClient } from "./relay-client.ts";
 import { clearTeam, deviceKeys, loadTeam, saveTeam, type TeamState } from "./team.ts";
-import type { DeliveryRow, MessageRow } from "./types.ts";
+import {
+  type AgentRow,
+  type Capabilities,
+  type DeliveryRow,
+  type MessageRow,
+  parseJson,
+} from "./types.ts";
 
 const RECEIPT_STATES = new Set([
   "seen",
@@ -87,6 +93,7 @@ export class TeamManager {
           branch: a.branch,
           status: a.status_text,
           stateAt: a.state_at,
+          reach: this.#reach(a),
         }));
     this.#client = client;
     this.#mailbox.remote = {
@@ -124,6 +131,17 @@ export class TeamManager {
     if (messageId) {
       for (const r of receipts) this.#mailbox.remote?.receipt(msg.from.handle, { messageId, ...r });
     }
+  }
+
+  #reach(a: AgentRow): string {
+    const caps = parseJson<Capabilities>(a.capabilities, {});
+    const bits: string[] = [];
+    const via = this.#engine.delivererFor(a);
+    if (caps.push || via?.pushAlways) bits.push("push");
+    else if (via || caps.wake) bits.push("wake");
+    if (caps.midTurn) bits.push("mid-turn");
+    else if (caps.nextTurn) bits.push("next-turn");
+    return bits.join(",") || "cli";
   }
 
   /** Tells a teammate how its message is doing here (seen, replied, …). */
