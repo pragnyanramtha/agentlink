@@ -5,3 +5,4 @@ coverage/
 .agentlink-dev/
 spikes/**/out/
 .DS_Store
+.deploy/

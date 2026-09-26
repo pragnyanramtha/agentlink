@@ -1,0 +1,14 @@
+[Unit]
+Description=agentlink relay (store-and-forward for sealed agentlink messages)
+After=network-online.target
+
+[Service]
+# Optional: AGENTLINK_RELAY_CREATE_TOKEN=... makes team creation invite-only.
+EnvironmentFile=-%h/.config/agentlink/relay.env
+# Only reachable through the TLS proxy on this machine.
+ExecStart=%h/.local/bin/agentlink relay serve --host 127.0.0.1 --port 7700 --data %h/.agentlink/relay
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

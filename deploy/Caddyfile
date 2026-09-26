@@ -1,0 +1,23 @@
+# agentlink server: TLS (automatic, Let's Encrypt) in front of the relay, plus the install script.
+# AGENTLINK_HOST is the public name, e.g. 116-203-46-74.sslip.io or relay.example.com.
+{$AGENTLINK_HOST} {
+	encode gzip
+
+	# curl -fsSL https://<host>/install.sh | sh
+	handle /install.sh {
+		root * /srv/agentlink
+		header Content-Type "text/x-shellscript; charset=utf-8"
+		file_server
+	}
+
+	# The package the install script downloads (and its checksum).
+	handle /dl/* {
+		root * /srv/agentlink
+		file_server
+	}
+
+	# Everything else is the relay (WebSocket upgrades and /health).
+	handle {
+		reverse_proxy 127.0.0.1:7700
+	}
+}
