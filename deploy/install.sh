@@ -38,7 +38,5 @@ case ":$PATH:" in
 esac
 say ""
 say "Next:"
-say "  agentlink init                      # start the local daemon"
-say "  agentlink install claude codex      # wire up the agent CLIs you use (--dry-run to preview)"
-say "  agentlink team join <code>          # join a team with the code someone gave you"
-say "  agentlink team create <name>        # or start your own team"
+say "  agentlink setup                     # wire up every agent CLI on this machine (--dry-run to preview)"
+say "  agentlink setup --join <code>       # …and join a team with the code someone gave you"

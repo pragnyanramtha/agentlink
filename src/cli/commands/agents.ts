@@ -58,7 +58,10 @@ export const whoami: Command = async (ctx) => {
 };
 
 export const peers: Command = async (ctx) => {
-  const { values } = parse(ctx.argv, { all: { type: "boolean", short: "a" } });
+  const { values } = parse(ctx.argv, {
+    all: { type: "boolean", short: "a" },
+    long: { type: "boolean", short: "l" },
+  });
   await ctx.client.ensureDaemon();
   const [res, who] = await Promise.all([
     ctx.client.request<{ agents: AgentView[]; paused?: boolean; team?: string | null }>(
@@ -83,9 +86,22 @@ export const peers: Command = async (ctx) => {
     }
     // In a team, every row shows the full address, so names mean the same on every machine.
     const team = res.agents.some((a) => (a as { local?: boolean }).local === false) || !!res.team;
+    const nameOf = (a: AgentView) =>
+      team ? ((a as { address?: string }).address ?? a.name) : a.name;
+    if (!values.long && !ctx.verbose) {
+      // Short by default: who, state, what they do (and where, for other repos). -l shows everything.
+      return table(
+        res.agents.map((a) => [
+          c.bold(nameOf(a)) + (who.agent?.id === a.id ? c.dim(" (you)") : ""),
+          stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
+          a.status || c.dim(shortRepo(a.repo)),
+        ]),
+        ["NAME", "STATE", "DOING"],
+      );
+    }
     return table(
       res.agents.map((a) => [
-        c.bold(team ? ((a as { address?: string }).address ?? a.name) : a.name) +
+        c.bold(nameOf(a)) +
           c.dim(
             (a as { local?: boolean }).local === false
               ? (a as { sid?: string | null }).sid

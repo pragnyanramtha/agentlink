@@ -344,7 +344,7 @@ describe("team relay", () => {
       const rendered = await bob
         .client("codex-api")
         .request<{ text: string }>("GET", "/v1/inbox?all=1&peek=1&format=inject");
-      expect(rendered.text).toContain("also with: carol/claude-ops");
+      expect(rendered.text).toContain("Group: also carol/claude-ops");
       await bob.client("codex-api").request("POST", "/v1/messages", {
         kind: "reply",
         replyTo: bobItem?.message.id,
@@ -481,6 +481,34 @@ describe("team relay", () => {
       await eve.stop();
     }
   }, 30_000);
+
+  it("agents may create invites and join (their CLI asks the user), but never relay invite codes", async () => {
+    const inv = await alice.raw<{ code: string; invite: string }>(
+      "POST",
+      "/v1/team/invite",
+      {},
+      { as: "claude-web" },
+    );
+    expect(inv.status).toBe(200);
+    for (const text of [`join us: ${inv.data.code}`, `invite ${inv.data.invite}`]) {
+      const leak = await alice.raw(
+        "POST",
+        "/v1/messages",
+        { to: [bobAgentName], text },
+        { as: "claude-web" },
+      );
+      expect(leak.status).toBe(400);
+      expect(JSON.stringify(leak.data)).toContain("invites are for people");
+    }
+    // ordinary hyphenated text is fine
+    const ok = await alice.raw(
+      "POST",
+      "/v1/messages",
+      { to: [bobAgentName], text: "see fix-the-auth-bug-12" },
+      { as: "claude-web" },
+    );
+    expect(ok.status).toBe(200);
+  });
 
   it("rejects unknown team members and needs a team for team addresses", async () => {
     const res = await alice.raw(

@@ -10,6 +10,8 @@ If you are an AI agent
   Take or refuse a handoff      agentlink ack <id> --accept "…"  |  --decline "why"
   Find and ask others           agentlink peers  ·  agentlink ask <agent> "question"
   What waits for your answer    agentlink todo
+  Connect with a friend         agentlink team invite → your user shares the code → they run
+                                agentlink team join <code>   (only when your user asks)
   Full guide (etiquette, safety, recovery): agentlink help guide
 
 Talk
@@ -34,6 +36,7 @@ Teams (other machines, other people)
   relay serve                        run a relay (self-hosted)
 
 Setup & control
+  setup [--join <code>]              one step: start, wire up every agent CLI found, join a team
   help guide                         the full guide agents follow (also: agentlink guide)
   init · install <tool…|all> · uninstall · doctor
   daemon start|stop|restart|status|logs · watch · log
@@ -44,9 +47,11 @@ Run "agentlink <command> --help" for details. Global flags: --json, --as <agent>
 Agent names look like claude-myrepo; teammates' agents look like alice/codex-api.`;
 
 const H: Record<string, string> = {
-  peers: `agentlink peers [--all]
+  peers: `agentlink peers [-a|--all] [-l|--long]
 
 List the agents you can message: this machine's and your teammates' (alice/…).
+By default: name, state and what each is doing. -l adds session tag, host, tool,
+reach, repo, branch and how long it has been in that state.
 REACH says how a message gets in:
   wake       an idle agent is started with a new turn
   push       queued straight into the session
@@ -55,8 +60,9 @@ REACH says how a message gets in:
   cli        only when it runs agentlink inbox itself
 
   -a, --all     include offline agents
+  -l, --long    all columns
 
-Example: agentlink peers`,
+Example: agentlink peers -l`,
 
   ask: `agentlink ask <agent>[,<agent>…] "<question>" [--timeout 110s] [--no-wait] [--stdin]
 
@@ -246,6 +252,26 @@ Examples:
   agentlink install claude codex
   agentlink install all --project .`,
 
+  setup: `agentlink setup [--join <code>] [--handle <you>] [--project <dir>] [--dry-run]
+
+Everything in one step, without questions (an agent can run it for you):
+  1. start agentlink (like agentlink init)
+  2. wire up every agent CLI found on PATH: hooks, the agentlink skill, one line in its
+     instruction file, and the MCP server (like agentlink install all)
+  3. with --join, join a team with the code someone gave you
+
+Existing config is kept and backed up to ~/.agentlink/backups; agentlink uninstall all
+reverts. Restart your agent sessions afterwards so they load it.
+
+  --join <code>     team invite code (or al1.… invite) to join
+  --handle <you>    how other machines address this one (default: this machine's name)
+  --project <dir>   wire up only this project instead of your user config
+  --dry-run         show what would change
+
+Examples:
+  agentlink setup
+  agentlink setup --join knot-blue-baby-oasis-50`,
+
   guide: `agentlink guide
 
 Print the guide agents follow: how to find peers, ask, reply, hand off work, and treat
@@ -321,6 +347,112 @@ Internal: called by agent CLI hooks. Always exits 0 so your agent never breaks.`
   version: `agentlink version`,
   help: `agentlink help [command]`,
 };
+
+// Subcommands get their own page: `agentlink team invite --help`, `agentlink help team invite`.
+Object.assign(H, {
+  "team create": `agentlink team create <name> [--relay <url>] [--handle <you>] [--create-token <t>]
+
+Start a team and make this device its admin. Other machines join with an invite.
+
+  <name>             team name (letters, digits, - _), e.g. acme
+  --relay <url>      relay to use (default: the community relay wss://agentlink.agent7.dev,
+                     or "relay" in ~/.agentlink/config.json, or AGENTLINK_RELAY)
+  --handle <you>     how other machines address this one (default: this machine's handle)
+  --create-token <t> needed only if the relay is private (relay serve --create-token)
+
+Examples:
+  agentlink team create acme
+  agentlink team create acme --relay wss://relay.example.com`,
+
+  "team invite": `agentlink team invite [--uses 1] [--ttl 24h] [--no-code]
+
+Create an invite to your team (admins only). Prints:
+  - a short code, e.g. tiger-lamp-orbit-sun-42: one use, 15 minutes, redeemed at the relay
+  - a long al1.… invite: valid for --ttl and --uses, carries the relay address
+
+Anyone with either can join and read team messages: share it privately (chat, call).
+Agents are not allowed to send invites to other agents through agentlink.
+
+  --uses <n>    how many devices may join with the long invite (1-100, default 1)
+  --ttl <d>     how long the long invite stays valid (default 24h, e.g. 30m, 168h)
+  --no-code     only print the long invite
+
+Example: agentlink team invite --uses 3 --ttl 7d`,
+
+  "team join": `agentlink team join <code | al1.invite> [--handle <you>] [--relay <url>]
+
+Join a team with a code or invite someone gave you. This device then shows up to the
+team as <handle>, and teammates' agents appear in agentlink peers as <handle>/<agent>.
+
+  <code>          the short code (tiger-lamp-orbit-sun-42) or the long al1.… invite
+  --handle <you>  your name in the team (default: this machine's handle; must be unique)
+  --relay <url>   where to redeem a short code, if the team does not use the community
+                  relay; also reaches the relay at another address (e.g. a tunnel)
+
+After joining, compare the inviter's fingerprint (shown) with them.
+
+Examples:
+  agentlink team join knot-blue-baby-oasis-50
+  agentlink team join knot-blue-baby-oasis-50 --relay wss://relay.example.com`,
+
+  "team relay": `agentlink team relay <url>
+
+Use another address for the team's relay on this device (after the relay moved, or to
+reach it through a tunnel). Messages waiting on the relay are kept.
+
+Example: agentlink team relay wss://agentlink.agent7.dev`,
+
+  "team leave": `agentlink team leave
+
+Leave the team: this device is removed from the roster and stops receiving team messages.
+Its keys stay in ~/.agentlink/keys, so it can join again with a new invite.`,
+
+  "team status": `agentlink team [status]
+
+Show the team, this device's handle and fingerprint, the relay connection, every member
+device (online/offline, fingerprint) and teammates' agents.`,
+
+  "daemon start": `agentlink daemon start
+
+Start the local daemon in the background. You rarely need this: it starts by itself on
+the first hook or command, and stops after 10 minutes without agent sessions.`,
+  "daemon stop": `agentlink daemon stop
+
+Stop the local daemon (run it yourself; agents cannot). Messages stay queued; it starts
+again on the next hook or command.`,
+  "daemon restart": `agentlink daemon restart
+
+Stop and start the local daemon, e.g. after updating agentlink.`,
+  "daemon status": `agentlink daemon status
+
+Whether the daemon runs, its pid, version and how many agents are online.`,
+  "daemon logs": `agentlink daemon logs [-f]
+
+Show the daemon log (~/.agentlink/daemon.log). -f keeps following it.`,
+
+  "policy list": `agentlink policy [list]
+
+Show who may send what: the defaults and your overrides, per scope and message kind.`,
+  "policy set": `agentlink policy set <scope> <kind>=<deliver|hold|refuse>…
+
+Change what happens to a kind of message from a kind of sender. Run it yourself, in a
+terminal. Held messages wait for agentlink approve.
+
+  scopes   user, local (this machine's agents), teammate (team members' agents),
+           external, or one teammate's handle (e.g. alice)
+  kinds    info ask request handoff reply ack review_request review_result
+
+Examples:
+  agentlink policy set teammate request=hold handoff=hold
+  agentlink policy set alice ask=refuse`,
+  "policy reset": `agentlink policy reset <scope> <kind>…
+
+Remove your overrides for those kinds, back to the defaults.
+
+Example: agentlink policy reset teammate request handoff`,
+
+  "relay serve": H.relay as string,
+});
 
 H.tell = H.send as string;
 

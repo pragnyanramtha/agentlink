@@ -13,6 +13,7 @@ import {
   textOf,
 } from "../core/envelope.ts";
 import { AgentLinkError, invalid, limited, notFound } from "../core/errors.ts";
+import { containsInvite } from "../core/invite-code.ts";
 import { echoKey, LIMITS } from "../core/limits.ts";
 import {
   decidePolicy,
@@ -544,6 +545,11 @@ export class Mailbox {
       original?.thread_id ?? (input.thread ? this.resolveThread(input.thread) : undefined);
     const key = echoKey(`${input.kind}:${text}`);
     this.#checkGuards(sender, recipients, thread, original, key, input.hops ?? 0);
+    if (sender.kind === "agent" && containsInvite(text)) {
+      throw invalid(
+        "that looks like a team invite code; invites are for people: show it to your user and let them share it",
+      );
+    }
     if (recipients.some((r) => r.remote)) {
       // Anything leaving this machine is scanned: text, file names and bytes, and data parts.
       const secrets = scanParts(input.parts ?? [{ kind: "text", text }]);
@@ -1132,14 +1138,15 @@ export class Mailbox {
       !author && env.from.role === "agent" && env.from.agent
         ? this.remote?.infoOf(env.from.member, env.from.agent)
         : undefined;
+    // Short labels: "codex (Codex)", "alice/claude (Claude Code on alice-laptop)", "@alice".
     const fromLabel = author
-      ? `${toolLabel(author.tool)} session "${author.name}"`
+      ? `${author.name} (${toolLabel(author.tool)})`
       : env.from.role === "system"
         ? "agentlink"
         : env.from.role === "human"
-          ? env.from.member
+          ? `@${env.from.member}`
           : remoteInfo
-            ? `${remoteInfo.tool ? `${toolLabel(remoteInfo.tool)} session` : "agent"} "${env.from.agent}" on ${env.from.member}${remoteInfo.host ? ` (${remoteInfo.host})` : ""}`
+            ? `${env.from.member}/${env.from.agent} (${[remoteInfo.tool ? toolLabel(remoteInfo.tool) : "", remoteInfo.host ? `on ${remoteInfo.host}` : ""].filter(Boolean).join(" ") || "agent"})`
             : formatAddr(env.from, this.handle);
     const attachments = env.parts
       .map((p, i) => ({ p, i }))

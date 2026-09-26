@@ -67,74 +67,82 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
   const failedAll =
     (res.failed?.length ?? 0) > 0 ||
     (res.deliveries.length > 0 && res.deliveries.every((d) => bad(d.state)));
-  out(ctx, res, () => {
-    const lines = res.deliveries.map((d) =>
-      bad(d.state)
-        ? `${c.red("✗")} ${c.bold(d.to)}: ${d.state}${d.note ? ` (${d.note})` : ""}`
-        : `${c.cyan("→")} ${c.bold(d.to)}: ${d.note ?? d.state}`,
-    );
-    lines.push(
-      c.dim(
-        `  message ${res.message.id.slice(0, 12)} (${res.message.kind}, thread ${res.message.thread.slice(0, 12)})`,
-      ),
-    );
-    if (res.reply) {
-      const all = res.replies ?? [res.reply];
-      for (const r of all) {
-        lines.push("");
-        lines.push(
-          `${c.green("←")} ${r.message.kind} from ${c.bold(r.message.from)} ${c.dim(`(${r.message.id})`)}:`,
-        );
-        lines.push(r.ack ? `[${r.ack}] ${r.text}` : r.text);
-      }
-      const answered = new Set(all.map((r) => r.message.from));
-      const silent = res.deliveries
-        .filter((d) => !answered.has(d.to) && !bad(d.state))
-        .map((d) => d.to);
-      if (silent.length && res.timedOut)
-        lines.push(c.yellow(`No answer yet from ${silent.join(", ")}.`));
-    } else if (res.paused && res.waited) {
-      lines.push(
-        c.yellow(
-          res.asHuman
-            ? "agentlink is paused, so nothing was delivered yet (agentlink resume)."
-            : "agentlink is paused, so nothing was delivered yet; your user can resume it with agentlink resume.",
-        ),
-      );
-    } else if (res.offline && res.relayDown && res.waited) {
-      lines.push(
-        c.yellow(
-          "Not waiting: the relay is unreachable. The message waits here and goes out when agentlink reconnects.",
-        ),
-      );
-    } else if (res.offline && res.waited) {
-      lines.push(
-        c.yellow(
-          res.asHuman
-            ? `Not waiting: nobody it went to is online. The answer will land in your inbox (agentlink inbox).`
-            : `Not waiting: nobody it went to is online. The answer will be delivered to you when they are back.`,
-        ),
-      );
-    } else if (res.failed?.length) {
-      for (const f of res.failed) {
-        if (!res.deliveries.some((d) => d.to === f.to && d.state === f.state)) {
-          lines.push(`${c.red("✗")} ${c.bold(f.to)}: ${f.state}${f.note ? ` (${f.note})` : ""}`);
-        }
-      }
-      lines.push(c.red("Nobody could receive this message, so there is no answer to wait for."));
-    } else if (res.waited && res.timedOut) {
-      lines.push(
-        c.yellow(
-          res.asHuman
-            ? `No answer within ${Math.round(waitMs / 1000)}s. Check later: agentlink status ${res.message.id} (answers to you land in: agentlink inbox)`
-            : `No answer within ${Math.round(waitMs / 1000)}s. The answer will be delivered to you automatically when it comes (or run: agentlink inbox).`,
-        ),
-      );
-    }
-    return lines.join("\n");
-  });
+  out(ctx, res, () => (ctx.verbose ? verboseSend(res, waitMs) : compactSend(res)));
   // Exit codes: 0 sent/answered, 1 nobody could receive it, 3 no answer in time.
   return failedAll ? 1 : res.waited && res.timedOut ? 3 : 0;
+}
+
+/**
+ * Just what matters: the answers for an ask, one line per recipient otherwise, and only
+ * delivery states worth knowing about (offline, held, refused…). --verbose shows everything.
+ */
+function compactSend(res: SendResponse): string {
+  const bad = (state: string) => ["failed", "refused", "expired"].includes(state);
+  const lines: string[] = [];
+  const answers = res.replies ?? (res.reply ? [res.reply] : []);
+  for (const r of answers) {
+    const text = r.ack ? `[${r.ack}] ${r.text}` : r.text;
+    lines.push(
+      answers.length > 1 || text.includes("\n") ? `${c.bold(r.message.from)}: ${text}` : text,
+    );
+  }
+  const answered = new Set(answers.map((r) => r.message.from));
+  for (const d of res.deliveries) {
+    if (answered.has(d.to)) continue;
+    const note = d.note && !/^(sent|queued|delivered|seen)$/.test(d.note) ? d.note : "";
+    if (bad(d.state)) lines.push(`${c.red("✗")} ${d.to}: ${note || d.state}`);
+    else if (!res.waited)
+      lines.push(`${c.green("✓")} ${d.to}${noteworthy(d) ? c.dim(` (${note || d.state})`) : ""}`);
+    else if (noteworthy(d)) lines.push(c.dim(`${d.to}: ${note || d.state}`));
+  }
+  if (!answers.length && res.waited) {
+    const who = res.deliveries
+      .filter((d) => !bad(d.state))
+      .map((d) => d.to)
+      .join(", ");
+    if (res.paused) lines.push(c.yellow("agentlink is paused; nothing was delivered."));
+    else if (res.offline && res.relayDown)
+      lines.push(c.yellow("relay unreachable; queued, will send when it reconnects."));
+    else if (res.offline)
+      lines.push(c.yellow(`${who} offline; the answer will come to your inbox.`));
+    else if (res.timedOut && who)
+      lines.push(c.yellow(`no answer yet from ${who}; it will come to your inbox.`));
+  } else if (answers.length && res.timedOut) {
+    const silent = res.deliveries
+      .filter((d) => !answered.has(d.to) && !bad(d.state))
+      .map((d) => d.to);
+    if (silent.length) lines.push(c.yellow(`no answer yet from ${silent.join(", ")}.`));
+  }
+  return lines.join("\n");
+}
+
+/** Deliveries a sender should hear about (anything but a normal hand-over). */
+function noteworthy(d: { state: string; note?: string | null }): boolean {
+  if (["held", "refused", "failed", "expired"].includes(d.state)) return true;
+  return /offline|paused|muted|relay|held|queued here/i.test(d.note ?? "");
+}
+
+function verboseSend(res: SendResponse, waitMs: number): string {
+  const bad = (state: string) => ["failed", "refused", "expired"].includes(state);
+  const lines = res.deliveries.map((d) =>
+    bad(d.state)
+      ? `${c.red("✗")} ${c.bold(d.to)}: ${d.state}${d.note ? ` (${d.note})` : ""}`
+      : `${c.cyan("→")} ${c.bold(d.to)}: ${d.note ?? d.state}`,
+  );
+  lines.push(
+    c.dim(`  message ${res.message.id} (${res.message.kind}, thread ${res.message.thread})`),
+  );
+  const answers = res.replies ?? (res.reply ? [res.reply] : []);
+  for (const r of answers) {
+    lines.push(
+      "",
+      `${c.green("←")} ${r.message.kind} from ${c.bold(r.message.from)} ${c.dim(`(${r.message.id})`)}:`,
+    );
+    lines.push(r.ack ? `[${r.ack}] ${r.text}` : r.text);
+  }
+  if (!answers.length && res.waited && res.timedOut)
+    lines.push(c.yellow(`no answer within ${Math.round(waitMs / 1000)}s`));
+  return lines.join("\n");
 }
 
 async function sendCommon(

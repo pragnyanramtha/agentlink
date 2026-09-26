@@ -42,6 +42,7 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   uninstall: async () => (await import("./commands/setup.ts")).uninstall,
   doctor: async () => (await import("./commands/setup.ts")).doctor,
   guide: async () => (await import("./commands/setup.ts")).guide,
+  setup: async () => (await import("./commands/setup.ts")).setup,
   team: async () => (await import("./commands/team.ts")).team,
   relay: async () => (await import("./commands/team.ts")).relay,
 };
@@ -50,11 +51,13 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
 function extractGlobals(argv: string[]): {
   rest: string[];
   json: boolean;
+  verbose: boolean;
   as?: string;
   home?: string;
 } {
   const rest: string[] = [];
   let json = false;
+  let verbose = false;
   let as: string | undefined;
   let home: string | undefined;
   for (let i = 0; i < argv.length; i++) {
@@ -64,6 +67,7 @@ function extractGlobals(argv: string[]): {
       break;
     }
     if (arg === "--json") json = true;
+    else if (arg === "--verbose") verbose = true;
     else if (arg === "--as" || arg === "--home") {
       const value = argv[i + 1];
       if (!value) throw new Error(`${arg} needs a value`);
@@ -74,7 +78,7 @@ function extractGlobals(argv: string[]): {
     else if (arg.startsWith("--home=")) home = arg.slice(7);
     else rest.push(arg);
   }
-  return { rest, json, ...(as ? { as } : {}), ...(home ? { home } : {}) };
+  return { rest, json, verbose, ...(as ? { as } : {}), ...(home ? { home } : {}) };
 }
 
 async function main(argv: string[]): Promise<number> {
@@ -96,7 +100,10 @@ async function main(argv: string[]): Promise<number> {
       process.stdout.write(await guideText());
       return 0;
     }
-    const text = topic ? commandHelp(topic) : OVERVIEW;
+    const subtopic = rest.filter((a) => !a.startsWith("-"))[1];
+    const text = topic
+      ? (subtopic && commandHelp(`${topic} ${subtopic}`)) || commandHelp(topic)
+      : OVERVIEW;
     if (!text) {
       process.stderr.write(`agentlink: no help for "${topic}"\n\n${OVERVIEW}\n`);
       return 2;
@@ -109,7 +116,8 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (wantsHelp(rest)) {
-    const text = commandHelp(command);
+    const sub = rest.find((a) => !a.startsWith("-"));
+    const text = (sub && commandHelp(`${command} ${sub}`)) || commandHelp(command);
     if (text) {
       process.stdout.write(`${text}\n`);
       return 0;
@@ -135,6 +143,7 @@ async function main(argv: string[]): Promise<number> {
     // Human-readable output gets terminal-safe strings; --json stays exactly as sent.
     client: new Client(paths, { ...(globals.as ? { as: globals.as } : {}), clean: !globals.json }),
     json: globals.json,
+    verbose: globals.verbose,
     ...(globals.as ? { as: globals.as } : {}),
     argv: rest,
   };

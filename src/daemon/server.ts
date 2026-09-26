@@ -312,7 +312,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   route("GET", "/v1/team", () => s.team.status());
 
   route("POST", "/v1/team/create", async (req) => {
-    requireHuman(req, false);
+    // Agents may do this when their user asks; their CLI's permission prompt confirms it.
     const body = z
       .object({
         name: z.string().min(1),
@@ -325,7 +325,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   });
 
   route("POST", "/v1/team/invite", async (req) => {
-    requireHuman(req, false);
+    // Agents may do this when their user asks; their CLI's permission prompt confirms it.
     const body = z
       .object({
         uses: z.number().int().min(1).max(100).default(1),
@@ -341,7 +341,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   });
 
   route("POST", "/v1/team/join", async (req) => {
-    requireHuman(req, false);
+    // Agents may do this when their user asks; their CLI's permission prompt confirms it.
     const body = z
       .object({
         invite: z.string().min(1),

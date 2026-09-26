@@ -18,6 +18,13 @@
 		file_server
 	}
 
+	# Setup instructions for AI agents: "follow https://<host>/llms.txt".
+	handle /llms.txt {
+		root * /srv/agentlink
+		header Content-Type "text/plain; charset=utf-8"
+		file_server
+	}
+
 	# The package the install script downloads (and its checksum).
 	handle /dl/* {
 		root * /srv/agentlink

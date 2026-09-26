@@ -30,7 +30,8 @@ pnpm pack --pack-destination .deploy >/dev/null
 mv .deploy/agentlink-*.tgz .deploy/dl/agentlink.tgz
 (cd .deploy/dl && sha256sum agentlink.tgz > agentlink.tgz.sha256)
 sed "s/__HOST__/$PUBLIC_HOST/g" deploy/install.sh > .deploy/install.sh
-files=".deploy/dl/agentlink.tgz .deploy/dl/agentlink.tgz.sha256 .deploy/install.sh deploy/Caddyfile deploy/agentlink-relay.service"
+sed "s/__HOST__/$PUBLIC_HOST/g" deploy/llms.txt > .deploy/llms.txt
+files=".deploy/dl/agentlink.tgz .deploy/dl/agentlink.tgz.sha256 .deploy/install.sh .deploy/llms.txt deploy/Caddyfile deploy/agentlink-relay.service"
 if [ -n "$CF_TUNNEL_ID" ]; then
   [ -r "$CF_CREDENTIALS" ] || { echo "missing tunnel credentials $CF_CREDENTIALS" >&2; exit 1; }
   cat > .deploy/cloudflared.yml <<EOF
@@ -55,6 +56,7 @@ npm install --global --prefix "$HOME/.local" --no-fund --no-audit /tmp/agentlink
 sudo mkdir -p /srv/agentlink/dl /etc/caddy
 sudo cp /tmp/agentlink.tgz /tmp/agentlink.tgz.sha256 /srv/agentlink/dl/
 sudo cp /tmp/install.sh /srv/agentlink/install.sh
+sudo cp /tmp/llms.txt /srv/agentlink/llms.txt
 sudo cp /tmp/Caddyfile /etc/caddy/Caddyfile
 sudo chmod -R a+rX /srv/agentlink /etc/caddy
 
@@ -87,7 +89,7 @@ if [ -n "$CF_TUNNEL_ID" ]; then
     -v /etc/cloudflared:/etc/cloudflared:ro \
     cloudflare/cloudflared:2026.9.1 tunnel --no-autoupdate --config /etc/cloudflared/config.yml run >/dev/null
 fi
-rm -f /tmp/agentlink.tgz /tmp/agentlink.tgz.sha256 /tmp/install.sh /tmp/Caddyfile /tmp/agentlink-relay.service
+rm -f /tmp/agentlink.tgz /tmp/agentlink.tgz.sha256 /tmp/install.sh /tmp/llms.txt /tmp/Caddyfile /tmp/agentlink-relay.service
 
 sleep 4
 echo "relay: $(systemctl --user is-active agentlink-relay.service)"

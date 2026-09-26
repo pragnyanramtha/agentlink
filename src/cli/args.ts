@@ -7,6 +7,8 @@ export interface CliContext {
   paths: Paths;
   client: Client;
   json: boolean;
+  /** --verbose: ids, delivery notes and other details. */
+  verbose?: boolean;
   as?: string;
   argv: string[];
 }

@@ -309,3 +309,102 @@ export const guide: Command = async (ctx) => {
   process.stdout.write(GUIDE);
   return 0;
 };
+
+/**
+ * One step: start agentlink, wire up every agent CLI found on PATH, optionally join a team.
+ * Non-interactive, so an agent can run it for its user (see /llms.txt).
+ */
+export const setup: Command = async (ctx) => {
+  const { values } = parse(ctx.argv, {
+    join: { type: "string" },
+    handle: { type: "string" },
+    project: { type: "string", short: "p" },
+    "dry-run": { type: "boolean", short: "n" },
+  });
+  const quiet = { ...ctx, json: false };
+  const { init } = await import("./admin.ts");
+  const found = INSTALL_TOOLS.filter((t) => onPath(TOOL_BINARIES[t]));
+  if (values["dry-run"]) {
+    return run(
+      {
+        ...quiet,
+        argv: ["all", "--dry-run", ...(values.project ? ["--project", values.project] : [])],
+      },
+      true,
+    );
+  }
+  const lines: string[] = [];
+  const capture = async (fn: () => Promise<number>) => {
+    const write = process.stdout.write.bind(process.stdout);
+    let text = "";
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      text += String(chunk);
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      return { code: await fn(), text };
+    } finally {
+      process.stdout.write = write;
+    }
+  };
+  const started = await capture(() =>
+    init({ ...quiet, argv: values.handle ? ["--handle", values.handle] : [] }),
+  );
+  if (started.code !== 0) {
+    process.stdout.write(started.text);
+    return started.code;
+  }
+  lines.push(`${c.green("✓")} agentlink is running (${ctx.paths.home})`);
+  if (found.length === 0) {
+    lines.push(
+      c.yellow(
+        "No agent CLIs found on PATH (claude, codex, opencode, cursor-agent, agy, devin, copilot, gemini).",
+      ),
+    );
+  } else {
+    const installed = await capture(() =>
+      run(
+        { ...quiet, argv: ["all", ...(values.project ? ["--project", values.project] : [])] },
+        true,
+      ),
+    );
+    if (installed.code !== 0) {
+      process.stdout.write(installed.text);
+      return installed.code;
+    }
+    lines.push(
+      `${c.green("✓")} set up for ${found.join(", ")} (hooks, skill, one line in their instruction files)`,
+    );
+    lines.push(c.dim("  backups: ~/.agentlink/backups · undo: agentlink uninstall all"));
+  }
+  if (values.join) {
+    await ctx.client.ensureDaemon();
+    const joined = await ctx.client.request<{
+      team: { name: string; handle: string };
+      invitedBy?: { handle: string; fingerprint: string };
+    }>(
+      "POST",
+      "/v1/team/join",
+      { invite: values.join, ...(values.handle ? { handle: values.handle } : {}) },
+      { timeoutMs: 30_000 },
+    );
+    lines.push(
+      `${c.green("✓")} joined team ${joined.team.name} as @${joined.team.handle}${
+        joined.invitedBy
+          ? c.dim(
+              ` (invited by @${joined.invitedBy.handle}, fingerprint ${joined.invitedBy.fingerprint})`,
+            )
+          : ""
+      }`,
+    );
+  }
+  lines.push(
+    "",
+    "Next:",
+    "  restart your agent sessions so they load agentlink",
+    "  agentlink peers                  who is online",
+    "  agentlink team invite            connect a friend or another machine (share the code)",
+  );
+  out(ctx, { tools: found, joined: !!values.join }, () => lines.join("\n"));
+  return 0;
+};

@@ -60,3 +60,14 @@ export function sealInvite(code: string, invite: string): { nonce: string; ct: s
 export function openInvite(code: string, box: { nonce: string; ct: string }): string {
   return teamDecrypt(codeKey(code), box, "agentlink/invite-code").toString("utf8");
 }
+
+const WORD_SET = new Set(WORDS);
+
+/** Invite codes and al1 invites are for people to pass on, never for agents to relay. */
+export function containsInvite(text: string): boolean {
+  if (/\bal1\.[A-Za-z0-9_-]{40,}/.test(text)) return true;
+  for (const m of text.toLowerCase().matchAll(/\b([a-z]+)-([a-z]+)-([a-z]+)-([a-z]+)-\d{2}\b/g)) {
+    if ([m[1], m[2], m[3], m[4]].every((w) => WORD_SET.has(w as string))) return true;
+  }
+  return false;
+}
