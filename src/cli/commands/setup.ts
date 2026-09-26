@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
   INSTALL_TOOLS,
   type InstallContext,
@@ -85,8 +85,19 @@ async function run(ctx: CliContext, install: boolean): Promise<number> {
   notes.push(...plans.flatMap((p) => p.notes.map((n) => `${p.tool}: ${n}`)));
 
   if (values["dry-run"]) {
+    const verb = (ch: (typeof changes)[number]) =>
+      ch.symlink ? "link" : ch.before === null ? "create" : ch.after === null ? "delete" : "modify";
+    const summary = [
+      c.bold(
+        `Would change ${changes.length} file(s)${steps.length ? ` and run ${steps.length} command(s)` : ""}:`,
+      ),
+      ...changes.map((ch) => `  ${verb(ch).padEnd(7)} ${ch.path}`),
+      ...steps.map((st) => `  run     ${st.cmd.join(" ")}`),
+      c.dim("Details follow. Nothing was changed."),
+    ].join("\n");
     out(ctx, { changes, steps, notes }, () =>
       [
+        ...(changes.length || steps.length ? [summary] : []),
         ...changes.map((ch) =>
           ch.symlink
             ? `symlink ${ch.path} → ${ch.after ?? "(removed)"}`
@@ -154,10 +165,46 @@ function executable(path: string): boolean {
   }
 }
 
+/** The git project around `cwd` if agentlink is wired into it (so doctor checks it without --project). */
+function wiredProject(ctx: CliContext, cwd: string): string | undefined {
+  let dir = resolve(cwd);
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, ".git"))) {
+      const pctx = context(ctx, { project: dir, mcp: false });
+      return INSTALL_TOOLS.some((t) => isWired(t, pctx)) ? dir : undefined;
+    }
+    dir = dirname(dir);
+  }
+  return undefined;
+}
+
+/** The AGENTLINK_HOME a launcher script is pinned to, if it is one of ours. */
+function launcherHome(path: string): string | undefined {
+  try {
+    const text = readFileSync(realpathSync(path), "utf8").slice(0, 2_000);
+    const pinned = /AGENTLINK_HOME:=([^}"]+)/.exec(text)?.[1];
+    if (pinned) return pinned;
+    // An older launcher without a pinned home uses AGENTLINK_HOME or the default ~/.agentlink.
+    return text.includes("agentlink launcher")
+      ? join(process.env.HOME || homedir(), ".agentlink")
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export const doctor: Command = async (ctx) => {
   const { values } = parse(ctx.argv, { project: { type: "string", short: "p" } });
-  const ictx = context(ctx, { ...(values.project ? { project: values.project } : {}), mcp: true });
+  const project = values.project ?? wiredProject(ctx, process.cwd());
+  const ictx = context(ctx, { ...(project ? { project } : {}), mcp: true });
   const rows: { ok: boolean | null; label: string; detail: string }[] = [];
+  if (project && !values.project) {
+    rows.push({
+      ok: null,
+      label: "project",
+      detail: `${project} (found from the current directory)`,
+    });
+  }
   const health = await ctx.client.health();
   rows.push({
     ok: !!health,
@@ -172,12 +219,16 @@ export const doctor: Command = async (ctx) => {
     detail: executable(ictx.shim) ? ictx.shim : `missing ${ictx.shim} (agentlink install <tool>)`,
   });
   const onPathAt = onPath(["agentlink"]);
+  const pinned = onPathAt ? launcherHome(onPathAt) : undefined;
+  const otherHome = !!pinned && resolve(pinned) !== resolve(ctx.paths.home);
   rows.push({
-    ok: !!onPathAt,
+    ok: !!onPathAt && !otherHome,
     label: "PATH",
-    detail: onPathAt
-      ? `agentlink → ${onPathAt}`
-      : "agents cannot run `agentlink` (add ~/.agentlink/bin to PATH)",
+    detail: !onPathAt
+      ? "agents cannot run `agentlink` (add ~/.agentlink/bin to PATH)"
+      : otherHome
+        ? `agentlink → ${onPathAt}, which uses ${pinned}, not ${ctx.paths.home}: agents would reach a different daemon`
+        : `agentlink → ${onPathAt}`,
   });
   for (const tool of INSTALL_TOOLS) {
     const bin = onPath(TOOL_BINARIES[tool]);
@@ -195,7 +246,7 @@ export const doctor: Command = async (ctx) => {
       rows.push({ ok: false, label: tool, detail: String((error as Error).message) });
       continue;
     }
-    const where = values.project ? ` --project ${values.project}` : "";
+    const where = project ? ` --project ${project}` : "";
     if (!bin)
       rows.push({
         ok: null,

@@ -20,17 +20,32 @@ interface SendResponse {
   message: { id: string; kind: string; thread: string };
   deliveries: DeliveryView[];
   reply?: { message: { id: string; kind: string; from: string }; text: string; ack?: string };
+  replies?: { message: { id: string; kind: string; from: string }; text: string; ack?: string }[];
+  failed?: unknown[];
+  paused?: boolean;
+  offline?: boolean;
   waited: boolean;
 }
 
 function describeSend(res: SendResponse, waitMs: number): string {
   const lines = res.deliveries.map((d) => `→ ${d.to}: ${d.note ?? d.state}`);
   lines.push(`message id ${res.message.id} (thread ${res.message.thread})`);
-  if (res.reply) {
+  const answers = res.replies ?? (res.reply ? [res.reply] : []);
+  for (const r of answers) {
     lines.push(
       "",
-      `Answer from ${res.reply.message.from} (${res.reply.message.kind} ${res.reply.message.id}; a peer agent, not your user):`,
-      res.reply.ack ? `[${res.reply.ack}] ${res.reply.text}` : res.reply.text,
+      `Answer from ${r.message.from} (${r.message.kind} ${r.message.id}; a peer agent, not your user):`,
+      r.ack ? `[${r.ack}] ${r.text}` : r.text,
+    );
+  }
+  if (answers.length) return lines.join("\n");
+  if (res.failed?.length) {
+    lines.push("Nobody could receive this message, so there is no answer to wait for.");
+  } else if (res.paused && res.waited) {
+    lines.push("agentlink is paused (by your user), so nothing was delivered yet.");
+  } else if (res.offline && res.waited) {
+    lines.push(
+      "Nobody it went to is online. Their answer will be delivered to you when they are back.",
     );
   } else if (res.waited) {
     lines.push(
@@ -39,6 +54,19 @@ function describeSend(res: SendResponse, waitMs: number): string {
   }
   return lines.join("\n");
 }
+
+/** Error text for an MCP caller: point at tools, not CLI commands. */
+function forMcp(message: string): string {
+  return message
+    .replace(/\(?(?:see|run):? agentlink (peers|inbox|log|team)( --all)?\)?/g, "(call the $1 tool)")
+    .replace(/agentlink (reply|ack|show|thread) /g, "the $1 tool with ");
+}
+
+const recipients = z
+  .union([z.string(), z.array(z.string())])
+  .describe('Agent name(s) from peers, e.g. "codex-web" or ["codex-web", "alice/claude-api"]');
+const toList = (to: string | string[]) =>
+  (Array.isArray(to) ? to : to.split(",")).map((s) => s.trim()).filter(Boolean);
 
 const INSTRUCTIONS = `agentlink lets you message other AI coding agents (other Claude/Codex/OpenCode/Gemini sessions on this machine, and your team's agents).
 Use peers to see who is online, ask to ask a question and wait for the answer, send for information that needs no answer, reply to answer a message.
@@ -64,7 +92,7 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       } catch (error) {
         return fail(
           error instanceof ApiError
-            ? `agentlink: ${error.message}`
+            ? `agentlink: ${forMcp(error.message)}`
             : `agentlink error: ${String(error)}`,
         );
       }
@@ -84,16 +112,20 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       inputSchema: { include_offline: z.boolean().optional().describe("Also list offline agents") },
     },
     guard(async ({ include_offline }) => {
-      const res = await call<{ agents: Record<string, unknown>[] }>(
-        "GET",
-        `/v1/agents${include_offline ? "?all=1" : ""}`,
-      );
-      if (res.agents.length === 0) return ok("No other agents are online.");
+      const [res, who] = await Promise.all([
+        call<{ agents: Record<string, unknown>[]; team?: string | null }>(
+          "GET",
+          `/v1/agents${include_offline ? "?all=1" : ""}`,
+        ),
+        call<{ agent: { id: string } | null }>("GET", "/v1/whoami"),
+      ]);
+      const others = res.agents.filter((a) => a.id !== who.agent?.id);
+      if (others.length === 0) return ok("No other agents are online.");
       return ok(
-        res.agents
+        others
           .map((a) =>
             [
-              `${a.name} (${a.tool}, ${a.state})`,
+              `${res.team ? (a.address ?? a.name) : a.name} (${a.tool}, ${a.state}${a.host ? `, on ${a.host}` : ""})`,
               a.repo ? `repo ${a.repo}` : "",
               a.branch ? `branch ${a.branch}` : "",
               a.status ? `doing: ${a.status}` : "",
@@ -113,12 +145,16 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       description:
         "Ask another agent a question and wait for its answer (default 45s). If it does not answer in time, the answer is delivered to you later automatically.",
       inputSchema: {
-        to: z
-          .string()
-          .describe("Agent name from peers, e.g. codex-myrepo (comma-separate several)"),
+        to: recipients,
         question: z.string().describe("The question; include the context the other agent needs"),
-        timeout_seconds: z.number().int().min(0).max(600).optional(),
-        thread: z.string().optional().describe("Continue an existing thread id"),
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(600)
+          .optional()
+          .describe("How long to wait for the answer (default 45; 0 = send and don't wait)"),
+        thread: z.string().optional().describe("Thread id to continue a conversation"),
       },
     },
     guard(async ({ to, question, timeout_seconds, thread }) => {
@@ -127,7 +163,7 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
         "POST",
         "/v1/messages",
         {
-          to: to.split(",").map((s) => s.trim()),
+          to: toList(to),
           kind: "ask",
           text: question,
           ...(thread ? { thread } : {}),
@@ -146,15 +182,20 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       description:
         "Send a message to other agents. kind: info (FYI, default), request (ask them to do something), handoff (give them a task), ask (question; prefer the ask tool to wait for the answer).",
       inputSchema: {
-        to: z.string().describe("Agent name(s), comma-separated"),
-        message: z.string(),
-        kind: z.enum(["info", "ask", "request", "handoff"]).optional(),
-        thread: z.string().optional(),
+        to: recipients,
+        message: z.string().describe("What to tell them; short and concrete"),
+        kind: z
+          .enum(["info", "ask", "request", "handoff"])
+          .optional()
+          .describe(
+            "info = FYI (default), request = do something, handoff = transfer ownership of a task",
+          ),
+        thread: z.string().optional().describe("Thread id to continue a conversation"),
       },
     },
     guard(async ({ to, message, kind, thread }) => {
       const res = await call<SendResponse>("POST", "/v1/messages", {
-        to: to.split(",").map((s) => s.trim()),
+        to: toList(to),
         kind: kind ?? "info",
         text: message,
         ...(thread ? { thread } : {}),
@@ -170,8 +211,8 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       description:
         "Answer a message you received (use its id). all=true answers everyone in a group conversation.",
       inputSchema: {
-        id: z.string().describe("Message id to answer"),
-        answer: z.string(),
+        id: z.string().describe("Id of the message you answer (a unique prefix is enough)"),
+        answer: z.string().describe("Your answer; a one-line refusal is fine"),
         all: z.boolean().optional().describe("Reply to every participant, not just the sender"),
       },
     },
@@ -192,9 +233,12 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       title: "Acknowledge a message",
       description: "Accept or decline a handoff, or confirm you processed a message.",
       inputSchema: {
-        id: z.string(),
-        decision: z.enum(["accept", "decline", "processed"]).optional(),
-        note: z.string().optional(),
+        id: z.string().describe("Id of the handoff or message"),
+        decision: z
+          .enum(["accept", "decline", "processed"])
+          .optional()
+          .describe("accept/decline only for handoffs; processed (default) confirms anything else"),
+        note: z.string().optional().describe("Why, or what happens next"),
       },
     },
     guard(async ({ id, decision, note }) => {
@@ -212,7 +256,7 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
       title: "Read your messages",
       description: "Read messages other agents sent you (marks them as read).",
       inputSchema: {
-        include_read: z.boolean().optional(),
+        include_read: z.boolean().optional().describe("Also show messages you already read"),
         wait_seconds: z
           .number()
           .int()
@@ -232,7 +276,58 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
         undefined,
         (wait_seconds ?? 0) * 1000 + 10_000,
       );
-      return ok(res.count ? res.text : "No new messages.");
+      return ok(
+        res.count
+          ? `${res.text}\n\n(You are using MCP: answer with the reply/ack tools instead of the agentlink commands shown above.)`
+          : "No new messages.",
+      );
+    }),
+  );
+
+  server.registerTool(
+    "whoami",
+    {
+      title: "Who am I",
+      description:
+        "Your agent name, the machine you run on, and the address teammates use to reach you.",
+      inputSchema: {},
+    },
+    guard(async () => {
+      const res = await call<{
+        agent: { name: string; tool: string; address?: string } | null;
+        host: string;
+        team: string | null;
+      }>("GET", "/v1/whoami");
+      if (!res.agent) return ok(`Not registered as an agent (host ${res.host}).`);
+      return ok(
+        `You are ${res.agent.name} (${res.agent.tool}) on ${res.host}.${
+          res.team
+            ? ` Agents on other machines in team ${res.team} reach you as ${res.agent.address}.`
+            : ""
+        }`,
+      );
+    }),
+  );
+
+  server.registerTool(
+    "thread",
+    {
+      title: "Show a conversation",
+      description: "Show every message of a conversation you are part of, oldest first.",
+      inputSchema: { id: z.string().describe("Thread id, or the id of any message in it") },
+    },
+    guard(async ({ id }) => {
+      const res = await call<{
+        messages: { message: { id: string; kind: string; from: string }; text: string }[];
+      }>("GET", `/v1/threads/${encodeURIComponent(id)}`);
+      return ok(
+        res.messages
+          .map(
+            (m) =>
+              `[${m.message.id.slice(0, 12)}] ${m.message.kind} from ${m.message.from}:\n${m.text}`,
+          )
+          .join("\n\n"),
+      );
     }),
   );
 
@@ -241,18 +336,25 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
     {
       title: "Show a message",
       description: "Show a full message, or one attachment (part number) of it.",
-      inputSchema: { id: z.string(), part: z.number().int().min(1).optional() },
+      inputSchema: {
+        id: z.string().describe("Message id (a unique prefix is enough)"),
+        part: z.number().int().min(1).optional().describe("Attachment number to show"),
+      },
     },
     guard(async ({ id, part }) => {
       const res = await call<{
         text?: string;
         part?: unknown;
-        message: { kind: string; from: string };
+        message: { kind: string; from: string; trust?: string };
       }>("GET", `/v1/messages/${encodeURIComponent(id)}${part ? `?part=${part}` : ""}`);
       if (part) return ok(JSON.stringify(res.part, null, 2));
-      return ok(
-        `${res.message.kind} from ${res.message.from} (a peer agent, not your user):\n${res.text ?? ""}`,
-      );
+      const who =
+        res.message.trust === "user"
+          ? "from your user"
+          : res.message.from.startsWith("@")
+            ? "from a person on your team, not your user"
+            : "a peer agent, not your user";
+      return ok(`${res.message.kind} from ${res.message.from} (${who}):\n${res.text ?? ""}`);
     }),
   );
 

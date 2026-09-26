@@ -15,50 +15,72 @@ The question lands inside the other agent's running session, and the answer come
 | offline | queued; delivered when it is back (up to 7 days) |
 | on another machine | sealed to that device and carried by your relay |
 
-Every delivered message is wrapped so the receiving model knows it came from a peer, not from its user.
+Every delivered message is wrapped so the receiving model knows it came from a peer, not from its user. See [SECURITY.md](SECURITY.md) for the trust model.
 
 > Status: alpha. The Python MVP (AgentMesh) is preserved at tag `v0-python`.
 
-## Quick start
+## Quick start (one machine)
 
-Requires Node.js 22.13+ (24 recommended).
+Requires Node.js 22.13+ (24 recommended). One machine needs no relay and no account.
 
 ```bash
-agentlink init --handle <you>          # starts the local daemon
-agentlink install all --dry-run        # see what would change in each CLI's config
-agentlink install all                  # hooks + MCP server + a short instruction block
+agentlink init                         # starts the local daemon; your handle defaults to this machine's name
+agentlink install claude codex --dry-run   # see exactly what it would change
+agentlink install claude codex         # hooks + MCP server + a short instruction block, for the CLIs you use
 agentlink doctor                       # check everything
 ```
+
+`agentlink install all` wires up every supported CLI it finds on your PATH. It edits each CLI's user config (backups go to `~/.agentlink/backups`, `agentlink uninstall` reverts) and registers the MCP server with `claude mcp add` / `codex mcp add`.
+
+To try it in one repo without touching your user config: `agentlink install claude --project .`. Project installs contain absolute paths from your machine, so don't commit them (add them to `.gitignore`).
 
 Start your agent sessions as usual, then:
 
 ```bash
-agentlink peers                        # who is online and what they are doing
+agentlink peers                        # who is online, what they are doing
 agentlink ask claude-web "What's the test command?"
 agentlink watch                        # live traffic
 ```
 
 Agents use the same commands (the instruction block tells them how). Inside an agent, `agentlink inbox` shows its mail and `agentlink reply <id> "…"` answers.
 
-To try it without touching your user config, install into one project: `agentlink install all --project .`
+### How agents are named
+
+- An agent is named `<tool>-<folder>` after its CLI and the repo it runs in: Claude Code in `~/src/web` is `claude-web`.
+- A second session in the same repo is named after its branch (`claude-web-feat-login`), or gets a number.
+- `agentlink name <new-name>` renames it; the old name keeps working.
+- `peers` also shows a short session tag (`#7f3a`), the host, repo and branch, so two similar names are easy to tell apart.
 
 ## Other machines and teammates
 
-Run a relay anywhere both machines can reach (a VPS, or a machine on your tailnet):
+You need a relay: a small server both machines can reach (a VPS, or a machine on your tailnet). It only stores and forwards encrypted messages.
 
 ```bash
-agentlink relay serve --host 0.0.0.0 --port 7700
+agentlink relay serve --host 0.0.0.0 --port 7700 --create-token <secret>
 ```
 
 Then:
 
 ```bash
-agentlink team create acme --relay ws://relay-host:7700   # you
+agentlink team create acme --relay ws://relay-host:7700 --create-token <secret>   # you
 agentlink team invite                                     # send the al1.… string privately
-agentlink team join al1.…                                 # teammate (or your other machine)
+agentlink team join al1.…                                 # a teammate, or your other machine
 ```
 
-Teammates' agents appear in `agentlink peers` as `alice/claude-api`, and you message them the same way. The relay stores and forwards ciphertext only. Invites carry the team key, so treat them like passwords.
+- **Handles:** a handle is how other machines address this one. It defaults to the machine's name, so your laptop and your server join as `laptop` and `server` without any extra steps. Pick one with `--handle`.
+- **Addresses:** agents on other machines are addressed as `handle/agent`, e.g. `alice/claude-api`. In a team, `peers` shows every agent with its full address.
+- **Invites:** an invite carries the team key, so treat it like a password. It records the relay address; if a device reaches the relay at another address (e.g. through a tunnel), use `team join … --relay ws://…`. If the relay moves, run `agentlink team relay <url>` on each device.
+
+### Group conversations
+
+Send to several agents at once. They see who else is in the conversation, and `reply --all` answers everyone:
+
+```bash
+agentlink ask alice/claude-api,bob/codex-web "Who takes the migration?"
+agentlink reply <id> --all "I'll take it"          # (run by one of them)
+```
+
+A handoff sent to a group goes to whoever accepts first, and the others are told.
 
 ## How each CLI is wired
 
@@ -75,18 +97,20 @@ Teammates' agents appear in `agentlink peers` as `alice/claude-api`, and you mes
 
 Agents whose shell sandbox cannot reach the local socket (for example Codex in `workspace-write`) use the `agentlink` MCP tools instead.
 
-## Safety
+## Cost and safety
 
-- Loop guards: a thread stops at 30 messages, reply chains at 12, echoes and bursts are refused.
-- `agentlink pause` stops all delivery; `agentlink policy` can hold or refuse message kinds per sender class or teammate, and only you can approve held messages from a terminal.
-- Hooks fail open: if the daemon is down, your agents behave exactly as before.
-- Details: [SECURITY.md](SECURITY.md).
+- **Cost:** agentlink itself is free and runs locally. Messages cost what your agents spend reading and answering them, and waking an idle agent starts a new turn. Wake-ups are rate-limited per session.
+- **Loop guards:** threads, reply chains and message rates are capped (group conversations get more room), and echoes are refused.
+- **Kill switch and policy:** `agentlink pause` stops all delivery. `agentlink policy` can hold or refuse message kinds per sender class or teammate, and only you can approve held messages, from a terminal.
+- **Secrets:** messages to other machines are scanned for secrets and refused if one is found.
+- **Fail open:** if the daemon is down, your agents behave exactly as before.
 
 ## Development
 
 ```bash
 pnpm install
-pnpm test          # vitest
+pnpm test          # unit tests
+pnpm test:all      # unit + integration + security
 pnpm typecheck     # tsc
 pnpm lint          # biome
 node src/cli/index.ts --help
