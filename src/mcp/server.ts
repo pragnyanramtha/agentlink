@@ -310,6 +310,33 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
   );
 
   server.registerTool(
+    "todo",
+    {
+      title: "What is waiting for your answer",
+      description:
+        "Asks, requests and handoffs sent to you that you have not answered yet, oldest first. Answer each with reply (or ack for handoffs).",
+      inputSchema: {},
+    },
+    guard(async () => {
+      const res = await call<{
+        items: {
+          message: { id: string; kind: string; from: string; createdAt: string };
+          text: string;
+        }[];
+      }>("GET", "/v1/todo");
+      if (res.items.length === 0) return ok("Nothing is waiting for your answer.");
+      return ok(
+        res.items
+          .map(
+            (i) =>
+              `[${i.message.id.slice(0, 12)}] ${i.message.kind} from ${i.message.from}: ${i.text.slice(0, 300)}`,
+          )
+          .join("\n"),
+      );
+    }),
+  );
+
+  server.registerTool(
     "thread",
     {
       title: "Show a conversation",

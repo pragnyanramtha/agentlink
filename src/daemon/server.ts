@@ -466,6 +466,11 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     };
   });
 
+  route("GET", "/v1/todo", (req) => {
+    const target = req.agent ? { agent: req.agent } : ({ human: true } as const);
+    return { items: mailbox.todo(target).map(itemView) };
+  });
+
   route("GET", "/v1/inbox", async (req) => {
     if (req.agent?.muted) {
       const text = `agentlink: ${req.agent.name} is muted; messages wait until your user runs \`agentlink unmute ${req.agent.name}\`.`;

@@ -936,6 +936,20 @@ export class Mailbox {
     return rows.reverse().map((r) => this.#item(r));
   }
 
+  /** Asks, requests and handoffs addressed to `target` that it has not answered yet, oldest first. */
+  todo(target: InboxTarget): InboxItem[] {
+    this.expireSweep();
+    const [clause, param] = this.#targetClause(target);
+    return this.#ctx.store
+      .all<DeliveryRow>(
+        `SELECT d.* FROM deliveries d JOIN messages m ON m.id = d.message_id
+         WHERE ${clause} AND m.kind IN ('ask','request','handoff','review_request')
+           AND d.state IN ('queued','delivered','seen') ORDER BY d.id LIMIT 100`,
+        param,
+      )
+      .map((r) => this.#item(r));
+  }
+
   #item(row: DeliveryRow & { m_envelope?: string }): InboxItem {
     const { m_envelope: _, ...delivery } = row;
     const message = this.#ctx.store.get<MessageRow>(

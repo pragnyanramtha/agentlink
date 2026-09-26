@@ -13,6 +13,7 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   reply: async () => (await import("./commands/messaging.ts")).reply,
   ack: async () => (await import("./commands/messaging.ts")).ack,
   inbox: async () => (await import("./commands/messaging.ts")).inbox,
+  todo: async () => (await import("./commands/messaging.ts")).todo,
   show: async () => (await import("./commands/messaging.ts")).show,
   thread: async () => (await import("./commands/messaging.ts")).thread,
   status: async () => (await import("./commands/messaging.ts")).status,

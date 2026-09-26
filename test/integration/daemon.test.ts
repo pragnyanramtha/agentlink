@@ -505,6 +505,27 @@ describe("usability fixes, round 3", () => {
     void asker;
   });
 
+  it("todo lists what is still waiting for an answer", async () => {
+    await register("tq1");
+    await register("tq2");
+    const a = await t
+      .client("tq1")
+      .request<SendRes>("POST", "/v1/messages", { to: ["tq2"], kind: "ask", text: "first?" });
+    await t
+      .client("tq1")
+      .request("POST", "/v1/messages", { to: ["tq2"], kind: "request", text: "please run tests" });
+    await t
+      .client("tq1")
+      .request("POST", "/v1/messages", { to: ["tq2"], text: "just so you know" });
+    let todo = await t.client("tq2").request<{ items: { text: string }[] }>("GET", "/v1/todo");
+    expect(todo.items.map((i) => i.text)).toEqual(["first?", "please run tests"]);
+    await t
+      .client("tq2")
+      .request("POST", "/v1/messages", { kind: "reply", replyTo: a.message.id, text: "yes" });
+    todo = await t.client("tq2").request<{ items: { text: string }[] }>("GET", "/v1/todo");
+    expect(todo.items.map((i) => i.text)).toEqual(["please run tests"]);
+  });
+
   it("answers quote the question they answer", async () => {
     await register("qa");
     await register("qb");

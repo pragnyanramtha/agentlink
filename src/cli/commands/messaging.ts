@@ -513,3 +513,24 @@ export const watch: Command = async (ctx) => {
   }, controller.signal);
   return 0;
 };
+
+export const todo: Command = async (ctx) => {
+  parse(ctx.argv, {});
+  await ctx.client.ensureDaemon();
+  const res = await ctx.client.request<{ items: InboxItemView[] }>("GET", "/v1/todo");
+  out(ctx, res, () =>
+    res.items.length === 0
+      ? c.dim("Nothing waiting for an answer from you.")
+      : [
+          c.bold(`${res.items.length} waiting for your answer:`),
+          ...res.items.map(
+            (i) =>
+              `  ${c.dim(i.message.id.slice(0, 12))} ${c.bold(i.message.kind.padEnd(8))} from ${c.cyan(i.message.from)} ${c.dim(ago(i.message.createdAt))}  "${i.text.replace(/\s+/g, " ").slice(0, 80)}"`,
+          ),
+          c.dim(
+            '  answer: agentlink reply <id> "…"   ·   handoffs: agentlink ack <id> --accept|--decline',
+          ),
+        ].join("\n"),
+  );
+  return 0;
+};

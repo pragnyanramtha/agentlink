@@ -9,6 +9,7 @@ Talk
   reply <id> "<answer>"              answer a message
   ack <id> [--accept|--decline]      accept/decline a handoff, or confirm
   inbox [--wait 60s]                 read your messages
+  todo                               asks, requests and handoffs you haven't answered
   show <id> · thread <id> · status [<id>]
 
 Coordinate
@@ -113,6 +114,11 @@ that agent's mail; in your own terminal it shows messages sent to you (@you).
   -w, --wait     wait for a message to arrive (default 60s)
   -n, --limit    how many (default 20)
   --format       inject = the tagged format agents receive (default when piped)`,
+
+  todo: `agentlink todo
+
+Asks, requests and handoffs sent to you (or to this agent) that are not answered yet,
+oldest first. Answer with agentlink reply <id>, or accept/decline handoffs with ack.`,
 
   show: `agentlink show <message-id> [--part N] [--raw]
 
