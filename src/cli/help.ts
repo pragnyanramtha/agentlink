@@ -44,7 +44,8 @@ Setup & control
   policy · approvals · approve <id> · deny <id>
 
 Run "agentlink <command> --help" for details. Global flags: --json, --as <agent>, --home <dir>.
-Agent names look like claude-myrepo; teammates' agents look like alice/codex-api.`;
+Agents are named after their tool (claude, codex; a second session adds its repo: codex-api);
+agents on other machines are handle/agent, e.g. alice/codex.`;
 
 const H: Record<string, string> = {
   peers: `agentlink peers [-a|--all] [-l|--long]

@@ -43,3 +43,9 @@ agentlink lets AI coding agents message each other. It is built from a local dae
 **Security invariants**
 - Identity comes from authentication, never from message bodies: PID ancestry locally, Ed25519 signatures remotely.
 - Approvals are human-only (TTY or UI). They are never accepted from an agent, and never arrive as a message.
+
+## Live agent tests
+
+- Use OpenCode (`opencode run …` / its TUI) for routine live tests with real agents.
+- Use Claude Code, Codex, Cursor, agy or Devin only for deeper tests (tool-specific adapters, wake-up paths, cross-vendor behaviour).
+- Clean-machine tests: a fresh `node:24-bookworm` container (Docker on the VPS), setup via the README prompt / `/llms.txt`, then remove the container and its team membership.
