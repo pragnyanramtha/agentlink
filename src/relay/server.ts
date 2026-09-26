@@ -525,10 +525,17 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   wss.on("connection", (ws, req) => {
     const direct = req.socket.remoteAddress ?? "";
     const fromProxy = direct === "127.0.0.1" || direct === "::1" || direct === "::ffff:127.0.0.1";
-    const forwarded = String(req.headers["x-forwarded-for"] ?? "")
-      .split(",")
-      .pop()
-      ?.trim();
+    // Behind local proxies (Caddy, cloudflared) the client is the nearest public address they report.
+    const forwarded = fromProxy
+      ? [
+          String(req.headers["cf-connecting-ip"] ?? ""),
+          ...String(req.headers["x-forwarded-for"] ?? "")
+            .split(",")
+            .reverse(),
+        ]
+          .map((a) => a.trim())
+          .find((a) => a && !isPrivateAddress(a))
+      : undefined;
     const c: Conn = {
       ws,
       sentThisMinute: 0,
@@ -614,4 +621,15 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         );
       }),
   };
+}
+
+function isPrivateAddress(address: string): boolean {
+  const a = address.replace(/^::ffff:/, "");
+  return (
+    /^(127\.|10\.|192\.168\.|169\.254\.)/.test(a) ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(a) ||
+    a === "::1" ||
+    /^f[cd]/i.test(a) ||
+    /^fe80:/i.test(a)
+  );
 }

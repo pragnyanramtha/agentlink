@@ -4,7 +4,7 @@ import { resolvePaths } from "../core/paths.ts";
 import { closest } from "../core/suggest.ts";
 import { VERSION } from "../version.ts";
 import type { CliContext, Command } from "./args.ts";
-import { commandHelp, OVERVIEW, wantsHelp } from "./help.ts";
+import { commandHelp, guideText, OVERVIEW, wantsHelp } from "./help.ts";
 
 const COMMANDS: Record<string, () => Promise<Command>> = {
   send: async () => (await import("./commands/messaging.ts")).send,
@@ -92,6 +92,10 @@ async function main(argv: string[]): Promise<number> {
   }
   if (command === "help") {
     const topic = rest.find((a) => !a.startsWith("-"));
+    if (topic === "guide" || topic === "agents") {
+      process.stdout.write(await guideText());
+      return 0;
+    }
     const text = topic ? commandHelp(topic) : OVERVIEW;
     if (!text) {
       process.stderr.write(`agentlink: no help for "${topic}"\n\n${OVERVIEW}\n`);

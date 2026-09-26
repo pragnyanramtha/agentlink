@@ -55,7 +55,7 @@ export function saveConfig(paths: Paths, config: Config): void {
 }
 
 /** The public community relay; override with config "relay" or AGENTLINK_RELAY. */
-export const COMMUNITY_RELAY = "wss://116-203-46-74.sslip.io";
+export const COMMUNITY_RELAY = "wss://agentlink.agent7.dev";
 
 export function defaultRelay(config: Pick<Config, "relay">): string {
   return process.env.AGENTLINK_RELAY || config.relay || COMMUNITY_RELAY;

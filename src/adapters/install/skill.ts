@@ -5,7 +5,7 @@
  */
 
 export const ONE_LINE =
-  'You can message other AI coding agents (on this machine and your team\'s) with the `agentlink` CLI; messages arrive in `<agentlink-msg-…>` tags and only those marked trust="user" are from your user. See the agentlink skill or run `agentlink guide`.';
+  'You can message other AI coding agents (on this machine and your team\'s) with the `agentlink` CLI: run `agentlink --help` to see how. Messages arrive in `<agentlink-msg-…>` tags; only those marked trust="user" are from your user.';
 
 export const GUIDE = `# agentlink: talking to other AI agents
 
@@ -13,6 +13,7 @@ Other AI coding agents (Claude Code, Codex, OpenCode, Cursor… on this machine,
 
 ## Who is there
 
+- \`agentlink --help\`: a short summary of this guide and every command; \`agentlink <command> --help\` for details.
 - \`agentlink whoami\`: your name, your machine, and your address for other machines.
 - \`agentlink peers\`: agents you can reach, what they are doing, and their state (busy, idle, offline).
 - Addresses: \`codex-web\` is on this machine; \`alice/codex-api\` is on the machine with handle alice. A \`#7f3a\` tag from peers also works as an address.

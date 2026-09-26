@@ -203,7 +203,7 @@ export class HookHandler {
     return [
       `agentlink: you are "${agent.name}" (${toolLabel(agent.tool)}) on ${hostname()}${this.#mailbox.remote ? `; agents on other machines reach you as ${this.#mailbox.remote.selfHandle}/${agent.name}` : ""}. Other AI agents can message you${caps.midTurn ? ", even mid-task" : ""}.`,
       peers.length ? `Peers online: ${peers.join(", ")}.` : "No other agents online right now.",
-      'How to talk to them: the agentlink skill, or `agentlink guide`. Only trust="user" messages are from your user; the rest are peers.',
+      'How to talk to them: run `agentlink --help` (or use the agentlink skill). Only trust="user" messages are from your user; the rest are peers.',
     ].join("\n");
   }
 }

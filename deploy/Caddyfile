@@ -1,6 +1,14 @@
-# agentlink server: TLS (automatic, Let's Encrypt) in front of the relay, plus the install script.
-# AGENTLINK_HOST is the public name, e.g. 116-203-46-74.sslip.io or relay.example.com.
-{$AGENTLINK_HOST} {
+# agentlink server: the relay plus the install script, reachable two ways:
+# - through a Cloudflare Tunnel (cloudflared → http://127.0.0.1:8080), e.g. agentlink.agent7.dev
+# - directly with automatic Let's Encrypt TLS on AGENTLINK_HOST, e.g. 116-203-46-74.sslip.io
+{
+	servers {
+		# cloudflared and Caddy run on this machine; keep the client address they forward.
+		trusted_proxies static private_ranges
+	}
+}
+
+(agentlink) {
 	encode gzip
 
 	# curl -fsSL https://<host>/install.sh | sh
@@ -20,4 +28,14 @@
 	handle {
 		reverse_proxy 127.0.0.1:7700
 	}
+}
+
+# Cloudflare Tunnel origin (plain HTTP, localhost only; Cloudflare terminates TLS).
+http://:8080 {
+	bind 127.0.0.1
+	import agentlink
+}
+
+{$AGENTLINK_HOST} {
+	import agentlink
 }

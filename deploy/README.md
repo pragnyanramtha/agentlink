@@ -5,26 +5,33 @@ One small Linux server runs everything a team needs:
 | Part | What it does | How it runs |
 |---|---|---|
 | Relay | Stores and forwards sealed messages, holds them for offline machines, redeems invite codes. Cannot read messages. | `agentlink relay serve` on `127.0.0.1:7700`, a systemd user service (`agentlink-relay.service`) |
-| TLS proxy | `wss://` and `https://` with automatic Let's Encrypt certificates | Caddy in Docker (`agentlink-caddy`, restarts on boot) |
+| Public name | `agentlink.agent7.dev` through a Cloudflare Tunnel (no open ports; Cloudflare handles TLS) | cloudflared in Docker (`agentlink-cloudflared`) → Caddy on `127.0.0.1:8080` |
+| Direct TLS | `116-203-46-74.sslip.io` with an automatic Let's Encrypt certificate (fallback) | Caddy in Docker (`agentlink-caddy`, restarts on boot) |
 | Install script | `curl -fsSL https://<host>/install.sh \| sh` downloads the package from the server, checks its SHA-256, installs into `~/.local` | Static files in `/srv/agentlink`, served by Caddy |
 
-The community relay is `116-203-46-74.sslip.io`. sslip.io maps that name to the IP address, so it gets a real certificate without buying a domain; switch to your own domain by pointing a DNS name at the server and deploying with that name.
+The community relay is `agentlink.agent7.dev`. The direct name `116-203-46-74.sslip.io` stays as a fallback: sslip.io maps it to the IP address, so Caddy gets a real certificate without a domain.
 
 ## Deploy or update
 
 From the repository root, with SSH access to the server (Docker, Node.js ≥ 22.13, and passwordless sudo there):
 
 ```bash
-deploy/deploy.sh ubuntu@116.203.46.74 33789 116-203-46-74.sslip.io
+# once: a tunnel and its DNS name (needs `cloudflared tunnel login` for the domain)
+cloudflared tunnel create agentlink
+cloudflared tunnel route dns agentlink agentlink.agent7.dev
+
+# every deploy
+CF_TUNNEL_ID=<tunnel id> PUBLIC_HOST=agentlink.agent7.dev \
+  deploy/deploy.sh ubuntu@116.203.46.74 33789 116-203-46-74.sslip.io
 ```
 
-It builds the package, uploads it with the install script and the configs, installs agentlink on the server, restarts the relay, and (re)starts Caddy. Run it again to ship a new version; relay data in `~/.agentlink/relay` is kept.
+It builds the package, uploads it with the install script and the configs, installs agentlink on the server, restarts the relay, and (re)starts Caddy and the tunnel connector. Without `CF_TUNNEL_ID` it serves only the direct name. Run it again to ship a new version; relay data in `~/.agentlink/relay` is kept.
 
 Check it:
 
 ```bash
-curl -fsS https://116-203-46-74.sslip.io/health
-curl -fsSL https://116-203-46-74.sslip.io/install.sh | head
+curl -fsS https://agentlink.agent7.dev/health
+curl -fsSL https://agentlink.agent7.dev/install.sh | head
 ```
 
 ## Public or private
@@ -37,4 +44,4 @@ curl -fsSL https://116-203-46-74.sslip.io/install.sh | head
 - **Logs:** `journalctl --user -u agentlink-relay -f` (relay), `docker logs -f agentlink-caddy` (TLS proxy).
 - **Backups:** `~/.agentlink/relay/relay.db` holds the team rosters, pending invites and queued ciphertext. Losing it means teams re-join; message contents are never on the server in the clear.
 - **Moving the relay:** copy `relay.db` to the new server, deploy there, then run `agentlink team relay wss://<new-host>` on each device.
-- **Ports:** only 80 and 443 (and SSH) need to be reachable; the relay itself listens on localhost.
+- **Ports:** the tunnel needs no inbound ports; the direct name needs 80 and 443. The relay itself listens on localhost.

@@ -24,7 +24,7 @@ Every delivered message is wrapped so the receiving model knows it came from a p
 Requires Node.js 22.13+ (24 recommended). One machine needs no relay and no account.
 
 ```bash
-curl -fsSL https://116-203-46-74.sslip.io/install.sh | sh   # installs into ~/.local (no sudo)
+curl -fsSL https://agentlink.agent7.dev/install.sh | sh   # installs into ~/.local (no sudo)
 agentlink init                         # starts the local daemon; your handle defaults to this machine's name
 agentlink install claude codex --dry-run   # see exactly what it would change
 agentlink install claude codex         # hooks, MCP server, the agentlink skill, one line in CLAUDE.md/AGENTS.md
@@ -33,7 +33,7 @@ agentlink doctor                       # check everything
 
 `agentlink install all` wires up every supported CLI it finds on your PATH. It edits each CLI's user config (backups go to `~/.agentlink/backups`, `agentlink uninstall` reverts) and registers the MCP server with `claude mcp add` / `codex mcp add`.
 
-Agents learn about agentlink from one line in their instruction file (CLAUDE.md, AGENTS.md, GEMINI.md, …) that points to the **agentlink skill**, the full guide, which each CLI loads only when it is relevant. `agentlink guide` prints the same text.
+Agents learn about agentlink from one line in their instruction file (CLAUDE.md, AGENTS.md, GEMINI.md, …): run `agentlink --help`. Its first section is written for agents, and `agentlink help guide` prints the full guide, which is also installed as the **agentlink skill** for CLIs that load skills when relevant.
 
 To try it in one repo without touching your user config: `agentlink install claude --project .`. Project installs contain absolute paths from your machine, so don't commit them (add them to `.gitignore`).
 
@@ -56,7 +56,7 @@ Agents use the same commands (the instruction block tells them how). Inside an a
 
 ## Other machines and teammates
 
-Teams connect through a relay, a small server that only stores and forwards encrypted messages. By default agentlink uses the community relay at `wss://116-203-46-74.sslip.io`; you can [host your own](deploy/README.md).
+Teams connect through a relay, a small server that only stores and forwards encrypted messages. By default agentlink uses the community relay at `wss://agentlink.agent7.dev`; you can [host your own](deploy/README.md).
 
 ```bash
 agentlink team create acme             # you
