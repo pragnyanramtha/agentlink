@@ -96,6 +96,38 @@ describe("registry & presence", () => {
   });
 });
 
+describe("names across projects", () => {
+  it("a session in another project never inherits an offline agent's mail", async () => {
+    const { mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const projA = join(t.home, "proj-a");
+    const projB = join(t.home, "proj-b");
+    mkdirSync(projA, { recursive: true });
+    mkdirSync(projB, { recursive: true });
+    const a = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "sa", cwd: projA }, a);
+    await register("sender");
+    await t
+      .client("sender")
+      .request("POST", "/v1/messages", { to: ["codex"], text: "for project A only" });
+    a.kill();
+    await until(async () =>
+      (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents.find(
+        (x) => x.name === "codex" && x.state === "offline",
+      ),
+    );
+    const b = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "sb", cwd: projB }, b);
+    const agents = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents;
+    expect(agents.map((x) => x.name)).toEqual(expect.arrayContaining(["codex", "codex-proj-a"]));
+    const inboxB = await t
+      .client("codex")
+      .request<{ items: { text: string }[] }>("GET", "/v1/inbox?all=1");
+    expect(inboxB.items.map((i) => i.text)).not.toContain("for project A only");
+    b.kill();
+  });
+});
+
 describe("messaging", () => {
   it("ask blocks until the reply arrives; the reply is not injected twice", async () => {
     await register("alpha");

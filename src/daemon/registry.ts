@@ -110,6 +110,7 @@ export class Registry {
             input.tool,
             repo?.name || basename(input.cwd ?? "") || "agent",
             repo?.branch ?? undefined,
+            repo?.root ?? input.cwd,
           );
       if (chosen.takeover) {
         if (!input.pid) {
@@ -208,13 +209,15 @@ export class Registry {
   /**
    * Names stay short: the first session of a tool is just `codex`. Another live session of the
    * same tool gets its repo (`codex-api`), then its branch (`codex-api-feat-login`), then a number.
-   * A new session takes over an offline agent's name of the same tool, with the mail waiting for
-   * it: "ask codex" goes to whichever Codex session runs next.
+   * A new session in the same place (git repo, else working directory) takes over an offline
+   * agent's name with the mail waiting for it; an offline agent from elsewhere moves aside to
+   * `<tool>-<its folder>` and keeps its mail, so one project's messages never reach another's.
    */
   #autoName(
     tool: string,
     repoName: string,
-    branch?: string,
+    branch: string | undefined,
+    place: string | undefined,
   ): { name: string; takeover?: AgentRow } {
     const short = slugify(tool, 16);
     const withRepo = `${short}-${slugify(repoName, 40)}`;
@@ -222,11 +225,22 @@ export class Registry {
       branch && !["main", "master", "HEAD", "trunk", "develop"].includes(branch)
         ? `${withRepo}-${slugify(branch, 24)}`
         : undefined;
+    const placeOf = (row: AgentRow) => row.repo_root ?? row.cwd ?? undefined;
     for (const name of [short, withRepo, ...(byBranch ? [byBranch] : [])]) {
       const row = this.byName(name);
       if (!row) return { name };
-      if (!isLive(row) && row.tool === tool && row.name_source === "auto")
-        return { name, takeover: row };
+      if (isLive(row) || row.tool !== tool || row.name_source !== "auto") continue;
+      if (name !== short || (place && placeOf(row) === place)) return { name, takeover: row };
+      const aside = this.#freeName(
+        `${short}-${slugify(basename(placeOf(row) ?? "") || "old", 40)}`,
+      );
+      this.#ctx.store.run("UPDATE agents SET name = ? WHERE id = ?", aside, row.id);
+      this.#ctx.store.run(
+        "UPDATE deliveries SET to_addr = ? WHERE to_agent_id = ? AND state IN ('queued','delivered','held')",
+        aside,
+        row.id,
+      );
+      return { name };
     }
     for (let i = 2; i < 100; i++) {
       const name = `${byBranch ?? withRepo}-${i}`;
@@ -289,6 +303,12 @@ export class Registry {
     if (!agent) throw notFound(`agent ${agentId}`);
     this.#emit(agent);
     return agent;
+  }
+
+  #freeName(base: string): string {
+    if (!this.byName(base)) return base;
+    for (let i = 2; i < 100; i++) if (!this.byName(`${base}-${i}`)) return `${base}-${i}`;
+    return `${base}-${ulid().slice(-6).toLowerCase()}`;
   }
 
   /** An agent by its current name, or by a name it had before a rename. */
