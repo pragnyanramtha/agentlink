@@ -91,7 +91,14 @@ function acquireLock(runDir: string): () => void {
 }
 
 export async function startDaemon(
-  opts: { paths?: Paths; logger?: Logger; now?: () => Date; sweepMs?: number } = {},
+  opts: {
+    paths?: Paths;
+    logger?: Logger;
+    now?: () => Date;
+    sweepMs?: number;
+    /** Tests only: accept the caller identity the client claims. */
+    trustClientCaller?: boolean;
+  } = {},
 ): Promise<RunningDaemon> {
   const paths = opts.paths ?? resolvePaths();
   mkdirSync(paths.runDir, { recursive: true, mode: 0o700 });
@@ -129,7 +136,17 @@ export async function startDaemon(
   const hooks = new HookHandler(ctx, registry, mailbox, engine);
   const claims = new Claims(ctx);
   const team = new TeamManager(ctx, registry, mailbox, engine);
-  const services: Services = { ctx, registry, mailbox, engine, hooks, claims, opencode, team };
+  const services: Services = {
+    ctx,
+    registry,
+    mailbox,
+    engine,
+    hooks,
+    claims,
+    opencode,
+    team,
+    ...(opts.trustClientCaller ? { trustClientCaller: true } : {}),
+  };
 
   let closing: Promise<void> | undefined;
   const close = (): Promise<void> => {

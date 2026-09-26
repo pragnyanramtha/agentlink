@@ -40,7 +40,7 @@ export interface TestDaemon {
 }
 
 export async function startTestDaemon(
-  opts: { now?: () => Date; handle?: string; home?: string } = {},
+  opts: { now?: () => Date; handle?: string; home?: string; verifyCallers?: boolean } = {},
 ): Promise<TestDaemon> {
   const home = opts.home ?? mkdtempSync(join(tmpdir(), "agentlink-test-"));
   const paths = resolvePaths({ AGENTLINK_HOME: home, HOME: home } as NodeJS.ProcessEnv);
@@ -51,6 +51,7 @@ export async function startTestDaemon(
     JSON.stringify({ handle: opts.handle ?? "tester", wake: { tmux: false } }),
   );
   const daemon = await startDaemon({
+    trustClientCaller: opts.verifyCallers !== true,
     paths,
     logger: silentLogger,
     sweepMs: 200,

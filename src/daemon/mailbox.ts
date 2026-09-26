@@ -127,8 +127,9 @@ export class Mailbox {
     this.#registry = registry;
   }
 
+  /** How this machine is addressed: its team handle when in a team (it may differ from config). */
   get handle(): string {
-    return this.#ctx.config.handle;
+    return this.remote?.selfHandle ?? this.#ctx.config.handle;
   }
 
   get paused(): boolean {

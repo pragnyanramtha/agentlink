@@ -300,12 +300,36 @@ export class Registry {
   }
 
   /** Maps a CLI/MCP caller to the agent it runs inside (nearest registered ancestor). */
+  /**
+   * Which agent is calling. With a verified caller, identity comes only from the process tree:
+   * `--as` is for humans acting for a hook-less agent, and AGENTLINK_AGENT must match the tree.
+   */
   resolveCaller(caller: CallerInfo): AgentRow | undefined {
+    const fromTree = this.#fromChain(caller.chain);
+    if (caller.verified) {
+      if (caller.as) {
+        const target = this.require(caller.as);
+        if (fromTree && fromTree.id !== target.id) {
+          throw new AgentLinkError(
+            "forbidden",
+            `an agent cannot act as another agent (you are ${fromTree.name})`,
+            403,
+          );
+        }
+        return target;
+      }
+      return fromTree;
+    }
     if (caller.as) return this.require(caller.as);
     if (caller.envAgent) {
       const agent = this.byId(caller.envAgent) ?? this.byName(caller.envAgent);
       if (agent) return agent;
     }
+    return fromTree;
+  }
+
+  #fromChain(chain: CallerInfo["chain"]): AgentRow | undefined {
+    const caller = { chain };
     const pids = caller.chain.map((p) => p.pid).filter((p) => Number.isInteger(p) && p > 1);
     if (pids.length === 0) return undefined;
     const rows = this.#ctx.store.all<AgentRow>(

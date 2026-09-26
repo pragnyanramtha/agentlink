@@ -4,8 +4,9 @@ import { z } from "zod";
 import { loadConfig } from "../core/config.ts";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
 import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
+import { peerPid, stdinIsTty } from "../core/peer.ts";
 import { DEFAULT_POLICY, POLICY_ACTIONS, TRUSTS } from "../core/policy.ts";
-import { isAlive, procCwd, procInfo } from "../core/proc.ts";
+import { ancestry, isAlive, procCwd, procInfo } from "../core/proc.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { PROTOCOL_VERSION, VERSION } from "../version.ts";
 import type { Claims } from "./claims.ts";
@@ -27,6 +28,8 @@ export interface Services {
   claims: Claims;
   opencode: OpenCodeBridge;
   team: TeamManager;
+  /** Tests only: take the caller's claimed process tree/TTY at face value. */
+  trustClientCaller?: boolean;
 }
 
 interface Req {
@@ -707,11 +710,20 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     const tool = req.params.tool as string;
     const event = req.params.event as string;
     if (!s.hooks.isEvent(event)) throw invalid(`unknown hook event "${event}"`);
-    return s.hooks.handle(tool, event, HookRequestSchema.parse(req.body));
+    const body = HookRequestSchema.parse(req.body);
+    // A verified caller's real process tree replaces whatever the hook process claimed.
+    return s.hooks.handle(
+      tool,
+      event,
+      req.caller.verified ? { ...body, chain: req.caller.chain, verified: true } : body,
+    );
   });
 
   route("GET", "/v1/adapters/opencode/poll", async (req) => {
     const agent = registry.require(req.query.get("agent") ?? "");
+    if (req.caller.verified && agent.pid && !req.caller.chain.some((p) => p.pid === agent.pid)) {
+      throw forbidden("only the OpenCode process that owns this agent can poll its messages");
+    }
     const timeoutMs = Math.min(Number(req.query.get("timeoutMs") ?? 25_000) || 25_000, 60_000);
     registry.setState(
       agent.id,
@@ -728,6 +740,29 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   });
 
   // ------------------------------------------------------------------ dispatch
+  let warnedUnverified = false;
+  /** Replaces the client's claims with what the kernel says about the connecting process. */
+  async function verifyCaller(raw: IncomingMessage, claimed: CallerInfo): Promise<CallerInfo> {
+    if (s.trustClientCaller) return claimed;
+    const pid = await peerPid(raw.socket);
+    if (!pid) {
+      if (!warnedUnverified) {
+        warnedUnverified = true;
+        ctx.log.warn(
+          "cannot verify callers on this system (needs Linux + ss); trusting client claims",
+        );
+      }
+      return claimed;
+    }
+    return {
+      pid,
+      chain: ancestry(pid),
+      tty: stdinIsTty(pid),
+      verified: true,
+      ...(claimed.as ? { as: claimed.as } : {}),
+    };
+  }
+
   const server = createServer(async (raw, res) => {
     const controller = new AbortController();
     res.on("close", () => controller.abort());
@@ -744,7 +779,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     if (!match?.m)
       return send(404, { error: { code: "no_route", message: `${raw.method} ${url.pathname}` } });
     try {
-      const caller = parseCaller(raw.headers["x-agentlink-caller"]);
+      const caller = await verifyCaller(raw, parseCaller(raw.headers["x-agentlink-caller"]));
       const skipCaller =
         url.pathname === "/v1/health" ||
         url.pathname.startsWith("/v1/hooks/") ||

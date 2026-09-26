@@ -89,6 +89,8 @@ export interface CallerInfo {
   tty: boolean;
   as?: string;
   envAgent?: string;
+  /** chain and tty come from the kernel (peer credentials), not from the client. */
+  verified?: boolean;
 }
 
 export type Sender = { kind: "agent"; agent: AgentRow } | { kind: "human" };
