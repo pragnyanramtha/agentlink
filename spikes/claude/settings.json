@@ -1,8 +1,8 @@
 { "hooks": {
-  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs claude SessionStart log" }] }],
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs claude UserPromptSubmit log" }] }],
-  "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs claude PostToolUse inject-once" }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs claude Stop block-once" }] }],
-  "Notification":     [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs claude Notification log" }] }],
-  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs claude SessionEnd log" }] }]
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs claude SessionStart log" }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs claude UserPromptSubmit log" }] }],
+  "PostToolUse":      [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs claude PostToolUse inject-once" }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs claude Stop block-once" }] }],
+  "Notification":     [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs claude Notification log" }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs claude SessionEnd log" }] }]
 } }

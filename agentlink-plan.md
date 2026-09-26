@@ -1,6 +1,6 @@
 # agentlink: cross-vendor, cross-person messaging for AI coding agents
 
-Build `agentlink` (the existing `pragnyanramtha/mesh` repo, renamed, with its Python MVP preserved at `v0-python`) as an open-source TypeScript/Node CLI, local daemon, MCP server, and self-hostable end-to-end-encrypted relay that lets Claude Code, Codex, OpenCode and other coding agents message each other, share tasks and context, and coordinate on one machine and across teammates' machines, delivered through each CLI's native hooks and APIs, in four milestones: local mesh, team relay, review/compare/tasks/context/worker, then A2A gateway and web UI.
+Build `agentlink` (repo `pragnyanramtha/agentlink`, formerly `mesh`, with its Python MVP preserved at `v0-python`) as an open-source TypeScript/Node CLI, local daemon, MCP server, and self-hostable end-to-end-encrypted relay that lets Claude Code, Codex, OpenCode and other coding agents message each other, share tasks and context, and coordinate on one machine and across teammates' machines, delivered through each CLI's native hooks and APIs, in four milestones: local mesh, team relay, review/compare/tasks/context/worker, then A2A gateway and web UI.
 
 ## Goal
 
@@ -17,7 +17,7 @@ Evidence behind every decision is in `research/landscape-2026-09.md`, and the de
 | Topic | Decision |
 |---|---|
 | Name | **agentlink**. The npm package and binary are both `agentlink` (the npm name is free). |
-| Repo | Reuse `pragnyanramtha/mesh` and rename it to `pragnyanramtha/agentlink` (GitHub redirects the old URL). Tag the Python MVP `v0-python`. The TypeScript rewrite lands on `main`. |
+| Repo | Done: `pragnyanramtha/mesh` was renamed to `pragnyanramtha/agentlink` (GitHub redirects the old URL). The Python MVP is tagged `v0-python`; the TypeScript rewrite is on `main`. |
 | License | Apache-2.0, already the license of the mesh repo. |
 | Who talks | Coding agents: Claude Code, Codex, OpenCode, Gemini CLI, Copilot CLI, Cursor CLI, Kiro CLI, Devin CLI, plus anything with a shell. This covers the same machine (including Claude Code↔Claude Code) and teammates' machines. |
 | Jobs | Relay and handoff, comparing and reviewing work, sharing context, coordinating. |
@@ -46,7 +46,7 @@ Evidence behind every decision is in `research/landscape-2026-09.md`, and the de
   - Configurable via `wake.policy = asks|never|always`.
 - **Platforms:** macOS, Linux and WSL2 first; native Windows later.
 - **Hosting:** there is no hosted relay; users self-host it with Docker.
-- **Local checkout:** development happens in `~/dev/agent-speak`. You can rename it to `~/dev/agentlink` later.
+- **Local checkout:** clone `pragnyanramtha/agentlink` anywhere; nothing depends on its path.
 
 ## Non-goals
 
@@ -90,7 +90,7 @@ Evidence behind every decision is in `research/landscape-2026-09.md`, and the de
 
 | Address | Meaning |
 |---|---|
-| `codex-agent-speak` | A local agent. Names are auto-generated as `<tool>-<repo>[-n]` and can be changed with `agentlink name`. The name survives a session resume (matched by tool plus session id). |
+| `codex` | A local agent. Names are the tool (`codex`); a second live session of the same tool adds its repo, then branch or a number (`codex-api`). They can be changed with `agentlink name`. The name survives a session resume (matched by tool plus session id). |
 | `alice/claude-api` or `alice/claude-api@acme` | A teammate's agent. The `@team` part is only needed if you belong to more than one team. |
 | `alice` | Alice's "front desk". It routes to her agent in the same repo remote, otherwise her most recently active agent, otherwise it queues for her. |
 | `repo:github.com/org/app` | Whichever agents are active in that repo, locally or across the team. |
@@ -314,8 +314,8 @@ agentlink/  (repo pragnyanramtha/agentlink, formerly mesh; Python MVP kept at ta
 ### M0: Repo move, scaffold, de-risking spikes (do first)
 
 - [ ] **T0.1** Move the repo. Remote steps (rename and push) need your go-ahead at execution time.
-  - Run `gh repo rename agentlink -R pragnyanramtha/mesh`.
-  - In `~/dev/agent-speak`: `git init`, `git remote add origin git@github.com:pragnyanramtha/agentlink.git`, `git fetch`, then check out `main` (`research/` doesn't conflict).
+  - Done: `gh repo rename agentlink -R pragnyanramtha/mesh`.
+  - Done: the local checkout tracks `git@github.com:pragnyanramtha/agentlink.git` on `main`.
   - Tag the current HEAD as `v0-python`.
   - Commit "start TypeScript rewrite; Python MVP at v0-python". This commit:
     - removes the Python sources;

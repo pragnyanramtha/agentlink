@@ -1,6 +1,6 @@
 { "hooks": {
-  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs codex SessionStart log", "timeout": 10 }] }],
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs codex UserPromptSubmit log", "timeout": 10 }] }],
-  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs codex PostToolUse inject-once", "timeout": 10 }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs codex Stop block-once", "timeout": 10 }] }]
+  "SessionStart":     [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs codex SessionStart log", "timeout": 10 }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs codex UserPromptSubmit log", "timeout": 10 }] }],
+  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs codex PostToolUse inject-once", "timeout": 10 }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs codex Stop block-once", "timeout": 10 }] }]
 } }

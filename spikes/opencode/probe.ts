@@ -1,5 +1,5 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-const OUT = "/home/pik/dev/agent-speak/spikes/out/opencode";
+const OUT = "__REPO__/spikes/out/opencode";
 mkdirSync(OUT, { recursive: true });
 const log = (x: unknown) => appendFileSync(`${OUT}/events.jsonl`, `${JSON.stringify(x)}\n`);
 const keys = (o: unknown) => (o && typeof o === "object" ? Object.keys(o as object) : typeof o);

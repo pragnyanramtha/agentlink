@@ -1,7 +1,7 @@
 { "hooks": {
-  "SessionStart": [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs gemini SessionStart log" }] }],
-  "BeforeAgent":  [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs gemini BeforeAgent log" }] }],
-  "AfterTool":    [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs gemini AfterTool inject-once" }] }],
-  "AfterAgent":   [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs gemini AfterAgent log" }] }],
-  "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "node /home/pik/dev/agent-speak/spikes/bin/hook-probe.mjs gemini SessionEnd log" }] }]
+  "SessionStart": [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs gemini SessionStart log" }] }],
+  "BeforeAgent":  [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs gemini BeforeAgent log" }] }],
+  "AfterTool":    [{ "matcher": "*", "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs gemini AfterTool inject-once" }] }],
+  "AfterAgent":   [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs gemini AfterAgent log" }] }],
+  "SessionEnd":   [{ "hooks": [{ "type": "command", "command": "node __REPO__/spikes/bin/hook-probe.mjs gemini SessionEnd log" }] }]
 } }
