@@ -93,7 +93,7 @@ Send a message. Kinds:
   handoff   hands work over (recipient accepts/declines with agentlink ack)
 
   -k, --kind      message kind
-  -w, --wait [d]  wait for an answer (default 110s)
+  -w, --wait [d]  wait for an answer (default 110s); --timeout <d> does the same
   -t, --thread    continue an existing thread
   --ttl <d>       expire if undelivered (default 7 days; e.g. 30m)
   --stdin         read the message from stdin

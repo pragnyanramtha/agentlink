@@ -13,7 +13,7 @@ export function safeTerminal(text: string): string {
   return text.replace(INVISIBLE, "").replace(ESC, "␛").replace(CONTROL, "?");
 }
 
-const LOOKALIKE_TAG = /<\s*\/?\s*agent\W{0,3}link\W{0,3}msg/i;
+const LOOKALIKE_TAG = /<\s*\/?\s*agent[\W_]{0,3}link[\W_]{0,3}msg/i;
 // Body lines that imitate agentlink's banner or provenance lines.
 const FAKE_BANNER =
   /^(\s*)(agentlink:|<\s*\/?\s*agentlink|From your user|Automatic notice from agentlink|From .{1,80}, (a peer agent|a teammate's agent|a person on your team|an EXTERNAL))/i;

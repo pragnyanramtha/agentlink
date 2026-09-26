@@ -28,7 +28,11 @@ pnpm -s build
 rm -rf .deploy && mkdir -p .deploy/dl
 pnpm pack --pack-destination .deploy >/dev/null
 mv .deploy/agentlink-*.tgz .deploy/dl/agentlink.tgz
-(cd .deploy/dl && sha256sum agentlink.tgz > agentlink.tgz.sha256)
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd .deploy/dl && sha256sum agentlink.tgz > agentlink.tgz.sha256)
+else
+  (cd .deploy/dl && shasum -a 256 agentlink.tgz > agentlink.tgz.sha256)   # macOS
+fi
 sed "s/__HOST__/$PUBLIC_HOST/g" deploy/install.sh > .deploy/install.sh
 sed "s/__HOST__/$PUBLIC_HOST/g" deploy/llms.txt > .deploy/llms.txt
 files=".deploy/dl/agentlink.tgz .deploy/dl/agentlink.tgz.sha256 .deploy/install.sh .deploy/llms.txt deploy/Caddyfile deploy/agentlink-relay.service"
@@ -42,9 +46,9 @@ ingress:
     service: http://127.0.0.1:8080
   - service: http_status:404
 EOF
-  cp "$CF_CREDENTIALS" .deploy/cloudflared.json
-  chmod 600 .deploy/cloudflared.json
-  files="$files .deploy/cloudflared.yml .deploy/cloudflared.json"
+  files="$files .deploy/cloudflared.yml"
+  # The tunnel credentials go straight into a root-only directory, never through /tmp.
+  $SSH 'sudo install -d -m 700 -o 65532 -g 65532 /etc/cloudflared && sudo sh -c "umask 077; cat > /etc/cloudflared/agentlink.json" && sudo chown 65532:65532 /etc/cloudflared/agentlink.json' < "$CF_CREDENTIALS"
 fi
 # shellcheck disable=SC2086
 scp -q -P "$PORT" $files "$TARGET:/tmp/"
@@ -80,7 +84,6 @@ docker run -d --name agentlink-caddy --restart unless-stopped --network host \
 if [ -n "$CF_TUNNEL_ID" ]; then
   sudo mkdir -p /etc/cloudflared
   sudo mv /tmp/cloudflared.yml /etc/cloudflared/config.yml
-  sudo mv /tmp/cloudflared.json /etc/cloudflared/agentlink.json
   sudo chown -R 65532:65532 /etc/cloudflared
   sudo chmod 700 /etc/cloudflared
   sudo chmod 600 /etc/cloudflared/config.yml /etc/cloudflared/agentlink.json

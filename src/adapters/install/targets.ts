@@ -109,9 +109,19 @@ export function hookCommand(ctx: InstallContext, h: HookCmd): string {
 }
 
 type Obj = JsonObject;
-const asObj = (v: unknown): Obj =>
-  v && typeof v === "object" && !Array.isArray(v) ? (v as Obj) : {};
-const asArr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+// Missing values start empty; a value of another shape is left for the user to fix, never replaced.
+const asObj = (v: unknown, what = "hooks"): Obj => {
+  if (v === undefined || v === null) return {};
+  if (typeof v === "object" && !Array.isArray(v)) return v as Obj;
+  throw new Error(
+    `"${what}" in this config is not an object; fix it by hand, then run install again`,
+  );
+};
+const asArr = (v: unknown, what = "hooks"): unknown[] => {
+  if (v === undefined || v === null) return [];
+  if (Array.isArray(v)) return v;
+  throw new Error(`"${what}" in this config is not a list; fix it by hand, then run install again`);
+};
 
 /** Claude-style `{ Event: [{ matcher?, hooks: [{ type, command, timeout }] }] }`: drop ours, add ours. */
 function mergeGroupedHooks(

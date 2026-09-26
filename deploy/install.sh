@@ -22,7 +22,13 @@ say "Downloading agentlink from $HOST…"
 curl -fsSL "$BASE/agentlink.tgz" -o "$tmp/agentlink.tgz"
 curl -fsSL "$BASE/agentlink.tgz.sha256" -o "$tmp/agentlink.tgz.sha256"
 expected="$(cut -d' ' -f1 "$tmp/agentlink.tgz.sha256")"
-actual="$(sha256sum "$tmp/agentlink.tgz" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$tmp/agentlink.tgz" | cut -d' ' -f1)"
+if command -v sha256sum >/dev/null 2>&1; then
+  actual="$(sha256sum "$tmp/agentlink.tgz" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+  actual="$(shasum -a 256 "$tmp/agentlink.tgz" | cut -d' ' -f1)"   # macOS
+else
+  fail "need sha256sum or shasum to check the download"
+fi
 [ "$expected" = "$actual" ] || fail "checksum mismatch (expected $expected, got $actual)"
 
 say "Installing into $PREFIX…"

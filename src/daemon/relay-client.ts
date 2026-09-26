@@ -344,10 +344,7 @@ export class RelayClient {
         return;
       case "error":
         this.#ctx.log.warn("relay error", { code: frame.code, message: frame.message });
-        if (frame.ref) this.#waiters.get(frame.ref)?.(frame);
-        if (this.#ready) {
-          for (const op of ["op:code_put", "op:invite"]) this.#waiters.get(op)?.(frame);
-        }
+        if (frame.ref) this.#waiters.get(`ref:${frame.ref}`)?.(frame);
         // Before the welcome, any refusal (bad invite, handle taken, …) ends a create/join.
         if (
           this.#onWelcome &&
@@ -360,7 +357,7 @@ export class RelayClient {
         }
         return;
       case "ok":
-        this.#waiters.get(`op:${frame.op}`)?.(frame);
+        if (frame.ref) this.#waiters.get(`ref:${frame.ref}`)?.(frame);
         return;
       case "sent": {
         const row = this.#ctx.store.get<{ message_id: string | null; handle: string | null }>(
@@ -369,7 +366,6 @@ export class RelayClient {
         );
         this.#ctx.store.run("DELETE FROM outbox WHERE id = ?", frame.id);
         if (row?.message_id && row.handle) this.onSent?.(row.message_id, row.handle);
-        this.#waiters.get(frame.id)?.(frame);
         return;
       }
       default:
@@ -543,44 +539,40 @@ export class RelayClient {
     this.#presenceTimer.unref();
   }
 
-  async invite(uses: number, ttlMs: number): Promise<string> {
+  /** Sends a frame that the relay answers with ok/error carrying `ref`, and waits for that answer. */
+  async #request(frame: Record<string, unknown>, refField: "id" | "ref"): Promise<void> {
     if (!this.#ready) throw new Error("not connected to the relay");
-    const token = randomToken(24);
+    const ref = randomToken(12);
     const done = new Promise<ServerFrame>((resolve) => {
-      this.#waiters.set("op:invite", resolve);
+      this.#waiters.set(`ref:${ref}`, resolve);
       setTimeout(
         () => resolve({ t: "error", code: "timeout", message: "relay did not answer" }),
         10_000,
       ).unref();
     });
-    this.#ws?.send(
-      JSON.stringify({
+    this.#ws?.send(JSON.stringify({ ...frame, [refField]: ref }));
+    const res = await done;
+    this.#waiters.delete(`ref:${ref}`);
+    if (res.t === "error") throw new Error(res.message);
+  }
+
+  async invite(uses: number, ttlMs: number): Promise<string> {
+    const token = randomToken(24);
+    await this.#request(
+      {
         t: "invite",
         tokenHash: sha256(token),
         expiresAt: new Date(Date.now() + ttlMs).toISOString(),
         uses,
-      }),
+      },
+      "id",
     );
-    const res = await done;
-    this.#waiters.delete("op:invite");
-    if (res.t === "error") throw new Error(res.message);
     return token;
   }
 
   /** Stores a sealed invite under a short code's id on the relay (fetchable once). */
   async putCode(id: string, box: { nonce: string; ct: string }, expiresAt: string): Promise<void> {
-    if (!this.#ready) throw new Error("not connected to the relay");
-    const done = new Promise<ServerFrame>((resolve) => {
-      this.#waiters.set("op:code_put", resolve);
-      setTimeout(
-        () => resolve({ t: "error", code: "timeout", message: "relay did not answer" }),
-        10_000,
-      ).unref();
-    });
-    this.#ws?.send(JSON.stringify({ t: "code_put", id, box, expiresAt }));
-    const res = await done;
-    this.#waiters.delete("op:code_put");
-    if (res.t === "error") throw new Error(res.message);
+    await this.#request({ t: "code_put", id, box, expiresAt }, "ref");
   }
 
   removeSelf(): void {

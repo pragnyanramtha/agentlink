@@ -409,6 +409,14 @@ export class Registry {
     if (caller.verified) {
       if (caller.as) {
         const target = this.resolveName(caller.as)?.agent ?? this.require(caller.as);
+        // --as is for a person acting for a hook-less agent: a terminal, not some background process.
+        if (!fromTree && !caller.tty) {
+          throw new AgentLinkError(
+            "forbidden",
+            "--as works only from a terminal (a person acting for a hook-less agent)",
+            403,
+          );
+        }
         if (fromTree && fromTree.id !== target.id) {
           throw new AgentLinkError(
             "forbidden",

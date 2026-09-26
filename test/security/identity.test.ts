@@ -28,9 +28,7 @@ describe.skipIf(!linux)("caller identity comes from the kernel", () => {
         state: "idle",
       });
     }
-    await t
-      .client("p1")
-      .request("POST", "/v1/messages", { to: ["p2"], text: "secret between others" });
+    await t.client().request("POST", "/v1/messages", { to: ["p2"], text: "secret between others" });
     // This test process becomes the agent "alpha"; every request it makes is alpha's.
     await t.client().request("POST", "/v1/agents/register", {
       tool: "generic",
@@ -85,6 +83,27 @@ describe.skipIf(!linux)("caller identity comes from the kernel", () => {
     );
     expect(res.status).toBe(403);
     expect(JSON.stringify(res.data)).toContain("cannot act as another agent");
+  });
+
+  it("refuses --as from a process that is neither an agent nor at a terminal", async () => {
+    // A background process (no terminal) outside any agent's tree tries to act for "victim".
+    const script = `
+      const { Client } = await import(${JSON.stringify(new URL("../../src/cli/client.ts", import.meta.url).href)});
+      const c = new Client(${JSON.stringify(t.paths)}, { as: "victim" });
+      try { await c.request("GET", "/v1/inbox"); console.log("allowed"); }
+      catch (e) { console.log(String(e.status ?? e.message)); }`;
+    // async: the daemon under test runs in this process and must keep answering
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ["--input-type=module", "-e", script],
+      {
+        encoding: "utf8",
+        env: { ...process.env, AGENTLINK_HOME: t.home, HOME: t.home },
+      },
+    );
+    expect(stdout.trim()).toBe("403");
   });
 
   it("does not let an agent pass as the human by claiming a TTY", async () => {

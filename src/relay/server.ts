@@ -65,6 +65,9 @@ interface Conn {
   framesThisMinute: number;
   bytesThisMinute: number;
   codeTries: number;
+  /** Queued messages sent on this connection and not acked yet (backlog paging). */
+  inFlight?: Set<string>;
+  pageSize?: number;
   /** Client address (from X-Forwarded-For when a local reverse proxy is in front). */
   ip: string;
 }
@@ -149,12 +152,16 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     return undefined;
   };
 
+  // Queued messages go out in pages of 500; the next page follows once the device has acked
+  // everything sent so far (see "ack").
   const flushQueue = (c: Conn) => {
     const rows = q<{ id: string; from_device: string; blob: string; at: string }>(
       "SELECT id, from_device, blob, at FROM queue WHERE team_id = ? AND to_device = ? ORDER BY at LIMIT 500",
       c.teamId as string,
       c.deviceId as string,
     );
+    c.inFlight = new Set(rows.map((r) => r.id));
+    c.pageSize = rows.length;
     for (const r of rows)
       send(c, { t: "msg", id: r.id, from: r.from_device, blob: JSON.parse(r.blob), at: r.at });
   };
@@ -364,8 +371,28 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     );
     switch (frame.t) {
       case "invite": {
+        const ref = frame.id ? { ref: frame.id } : {};
         if (!isAdmin)
-          return send(c, { t: "error", code: "forbidden", message: "only team admins can invite" });
+          return send(c, {
+            t: "error",
+            code: "forbidden",
+            message: "only team admins can invite",
+            ...ref,
+          });
+        const open =
+          one<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM invites WHERE team_id = ? AND expires_at > ? AND uses_left > 0",
+            teamId,
+            now,
+          )?.n ?? 0;
+        if (open >= 100) {
+          return send(c, {
+            t: "error",
+            code: "full",
+            message: "too many open invites for this team",
+            ...ref,
+          });
+        }
         run(
           "INSERT OR REPLACE INTO invites (team_id, token_hash, expires_at, uses_left, created_by) VALUES (?, ?, ?, ?, ?)",
           teamId,
@@ -374,7 +401,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
           frame.uses,
           c.deviceId,
         );
-        return send(c, { t: "ok", op: "invite" });
+        return send(c, { t: "ok", op: "invite", ...(frame.id ? { ref: frame.id } : {}) });
       }
       case "send": {
         if (++c.sentThisMinute > RATE_PER_MINUTE) {
@@ -459,16 +486,25 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
           JSON.stringify(frame.box),
           frame.expiresAt < maxExpiry ? frame.expiresAt : maxExpiry,
         );
-        return send(c, { t: "ok", op: "code_put" });
+        return send(c, { t: "ok", op: "code_put", ...(frame.ref ? { ref: frame.ref } : {}) });
       }
       case "ack": {
-        for (const id of frame.ids)
+        for (const id of frame.ids) {
           run(
             "DELETE FROM queue WHERE id = ? AND team_id = ? AND to_device = ?",
             id,
             teamId,
             c.deviceId,
           );
+          c.inFlight?.delete(id);
+        }
+        // Next page of a long backlog once (nearly) all of this one is acked. A few messages may
+        // stay unacked on purpose (sender not in the roster yet); they are simply sent again.
+        if (c.inFlight && c.inFlight.size <= Math.floor((c.pageSize ?? 0) / 10)) {
+          const more = (c.pageSize ?? 0) >= 500;
+          c.inFlight = undefined;
+          if (more) flushQueue(c);
+        }
         return;
       }
       case "presence": {

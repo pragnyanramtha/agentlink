@@ -103,7 +103,7 @@ export const team: Command = async (ctx) => {
       const [name] = positionals;
       if (!name) {
         throw new UsageError(
-          "usage: agentlink team create <name> [--relay <url>] [--handle <you>]",
+          "usage: agentlink team create <name> [--relay <url>] [--handle <you>] [--create-token <t>]",
         );
       }
       await ctx.client.ensureDaemon();
@@ -249,7 +249,7 @@ export const relay: Command = async (ctx) => {
   const [sub, ...rest] = ctx.argv;
   if (sub !== "serve") {
     throw new UsageError(
-      `${sub ? `unknown relay command "${sub}"${didYouMean(sub, ["serve"])}; ` : ""}usage: agentlink relay serve [--host 0.0.0.0] [--port 7700] [--data <dir>]`,
+      `${sub ? `unknown relay command "${sub}"${didYouMean(sub, ["serve"])}; ` : ""}usage: agentlink relay serve [--host 127.0.0.1] [--port 7700] [--data <dir>] [--create-token <t>]`,
     );
   }
   const { values } = parse(rest, {

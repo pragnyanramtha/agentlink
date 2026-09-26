@@ -89,9 +89,8 @@ function action(item: RenderItem): string {
 
 /** Prevents message bodies from imitating our wrapper tags. */
 function neutralize(text: string): string {
-  return text.replace(/<\s*\/?\s*agentlink-msg/gi, (m) =>
-    m.replace(/agentlink-msg/i, "agentlink_msg"),
-  );
+  // Same breadth as the look-alike check in sanitize.ts: agent_link_msg, agent--link.msg, …
+  return text.replace(/<(\s*\/?\s*)agent[\W_]{0,3}link[\W_]{0,3}msg/gi, "‹$1agentlink_quoted_msg");
 }
 
 function renderOne(item: RenderItem, maxBodyChars: number): string {

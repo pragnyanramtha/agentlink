@@ -327,7 +327,7 @@ export const setup: Command = async (ctx) => {
   if (values["dry-run"]) {
     return run(
       {
-        ...quiet,
+        ...ctx,
         argv: ["all", "--dry-run", ...(values.project ? ["--project", values.project] : [])],
       },
       true,

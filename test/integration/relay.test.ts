@@ -539,6 +539,31 @@ describe("team relay", () => {
       { as: "claude-web" },
     );
     expect(res.status).toBe(404);
-    aliceAgent.kill();
   });
+
+  it("delivers a backlog longer than one page after a device comes back", async () => {
+    const home = bob.home;
+    await bob.stop(true);
+    const total = 520; // the relay sends queued messages in pages of 500
+    for (let i = 0; i < total; i++) {
+      await alice.client().request("POST", "/v1/messages", { to: ["@bob"], text: `backlog ${i}` });
+    }
+    bob = await startTestDaemon({ handle: "bob", home });
+    const got = await until(async () => {
+      const r = await bob
+        .client()
+        .request<{ messages: { message: { preview: string } }[] }>("GET", "/v1/log?limit=500");
+      const n = r.messages.filter((m) => m.message.preview.startsWith("backlog ")).length;
+      return n >= 500 ? n : undefined;
+    }, 30_000);
+    expect(got).toBeGreaterThanOrEqual(500);
+    const last = await until(async () => {
+      const r = await bob
+        .client()
+        .request<{ messages: { message: { preview: string } }[] }>("GET", "/v1/log?limit=5");
+      return r.messages.find((m) => m.message.preview === `backlog ${total - 1}`);
+    }, 30_000);
+    expect(last).toBeTruthy();
+    aliceAgent.kill();
+  }, 120_000);
 });

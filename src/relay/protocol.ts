@@ -57,6 +57,8 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
   }),
   z.object({
     t: z.literal("invite"),
+    /** Echoed as `ref` in the relay's ok/error reply. */
+    id: z.string().max(64).optional(),
     tokenHash: z.string(),
     expiresAt: z.string(),
     uses: z.number().int().min(1).max(100),
@@ -71,6 +73,8 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
   z.object({
     t: z.literal("code_put"),
     id: z.string().min(16).max(64),
+    /** Echoed as `ref` in the relay's ok/error reply. */
+    ref: z.string().max(64).optional(),
     box: TeamBoxSchema,
     expiresAt: z.string(),
   }),
@@ -93,7 +97,7 @@ export type ServerFrame =
   | { t: "presence"; deviceId: string; box: z.infer<typeof TeamBoxSchema>; at: string }
   | { t: "online"; deviceId: string; online: boolean }
   | { t: "sent"; id: string; queued: boolean }
-  | { t: "ok"; op: string }
+  | { t: "ok"; op: string; ref?: string }
   | { t: "pong" }
   | { t: "code"; box: z.infer<typeof TeamBoxSchema> }
   | { t: "error"; code: string; message: string; ref?: string };
