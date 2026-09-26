@@ -146,6 +146,15 @@ export class Client {
             ),
           );
         }
+        if (error.code === "ECONNRESET" || /socket hang up/.test(error.message)) {
+          return reject(
+            new ApiError(
+              "daemon_restarted",
+              "the agentlink daemon stopped while this was running; anything already sent is kept (check: agentlink status, agentlink inbox)",
+              503,
+            ),
+          );
+        }
         reject(error);
       });
       if (payload) req.write(payload);

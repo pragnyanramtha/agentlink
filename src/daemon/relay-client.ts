@@ -54,6 +54,8 @@ export interface RemoteAgent {
   reach?: string;
   /** Host name of the machine it runs on. */
   host?: string;
+  /** Short session tag (last characters of its id on its own machine). */
+  sid?: string;
   at: string;
 }
 
@@ -264,6 +266,7 @@ export class RelayClient {
         this.#ready = true;
         this.#backoff = 1_000;
         this.#mode = { kind: "hello" };
+        for (const id of frame.online ?? []) this.#online.add(id);
         this.#setRoster(frame.roster);
         this.#ctx.log.info("relay connected", {
           relay: this.#team.relay,
@@ -312,6 +315,9 @@ export class RelayClient {
                 status: safeField(a.status, 200),
                 ...(typeof a.stateAt === "string" ? { stateAt: a.stateAt.slice(0, 40) } : {}),
                 ...(safeField(a.reach, 40) ? { reach: safeField(a.reach, 40) as string } : {}),
+                ...(typeof a.sid === "string" && /^[a-z0-9]{1,8}$/.test(a.sid)
+                  ? { sid: a.sid }
+                  : {}),
                 member: member.handle,
                 deviceId: frame.deviceId,
                 at: frame.at,

@@ -94,11 +94,13 @@ export class TeamManager {
           status: a.status_text,
           stateAt: a.state_at,
           reach: this.#reach(a),
+          sid: a.id.slice(-4).toLowerCase(),
         }));
     this.#client = client;
     this.#mailbox.remote = {
       teamName: team.teamName,
       selfHandle: team.handle,
+      online: (handle) => client.members().some((m) => m.handle === handle && m.online),
       infoOf: (handle, agent) => {
         const a = client.remoteAgents().find((r) => r.member === handle && r.name === agent);
         return a ? { tool: a.tool, ...(a.host ? { host: a.host } : {}) } : undefined;

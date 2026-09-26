@@ -61,7 +61,7 @@ export const peers: Command = async (ctx) => {
   const { values } = parse(ctx.argv, { all: { type: "boolean", short: "a" } });
   await ctx.client.ensureDaemon();
   const [res, who] = await Promise.all([
-    ctx.client.request<{ agents: AgentView[]; paused?: boolean }>(
+    ctx.client.request<{ agents: AgentView[]; paused?: boolean; team?: string | null }>(
       "GET",
       `/v1/agents${values.all ? "?all=1" : ""}`,
     ),
@@ -81,9 +81,19 @@ export const peers: Command = async (ctx) => {
           : "No agents online. (agentlink peers --all shows offline ones.)",
       );
     }
+    // In a team, every row shows the full address, so names mean the same on every machine.
+    const team = res.agents.some((a) => (a as { local?: boolean }).local === false) || !!res.team;
     return table(
       res.agents.map((a) => [
-        c.bold(a.name) + (who.agent?.id === a.id ? c.dim(" (you)") : ""),
+        c.bold(team ? ((a as { address?: string }).address ?? a.name) : a.name) +
+          c.dim(
+            (a as { local?: boolean }).local === false
+              ? (a as { sid?: string | null }).sid
+                ? ` #${(a as { sid?: string | null }).sid}`
+                : ""
+              : ` #${a.id.slice(-4).toLowerCase()}`,
+          ) +
+          (who.agent?.id === a.id ? c.dim(" (you)") : ""),
         (a as { host?: string | null }).host ?? "-",
         a.tool,
         stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
@@ -164,6 +174,7 @@ export const register: Command = async (ctx) => {
     renamedFrom?: string;
   }>("POST", "/v1/agents/register", {
     tool,
+    state: "idle",
     cwd: process.cwd(),
     ...(pid ? { pid } : {}),
     ...(pidStart ? { pidStart } : {}),

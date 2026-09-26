@@ -32,7 +32,12 @@ export function parse<O extends Options>(argv: string[], options: O) {
     if (unknown) {
       const flag = unknown[1] as string;
       const guess = closest(flag.replace(/^-+/, ""), Object.keys(options));
-      throw new UsageError(`unknown option ${flag}${guess ? ` (did you mean --${guess}?)` : ""}`);
+      const looksLikeText = flag.length > 12 || /^-{3,}/.test(flag);
+      throw new UsageError(
+        `unknown option ${flag.slice(0, 40)}${guess ? ` (did you mean --${guess}?)` : ""}${
+          looksLikeText ? '; to send text that starts with "-", put -- before it' : ""
+        }`,
+      );
     }
     const missing = /Option '([^']+)' argument missing/.exec(message);
     const flagName = (s: string | undefined) =>

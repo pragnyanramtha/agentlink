@@ -148,5 +148,6 @@ main(process.argv.slice(2))
     if (usage && command && commandHelp(command)) {
       process.stderr.write(`Run "agentlink ${command} --help" for usage.\n`);
     }
-    process.exitCode = usage ? 2 : 1;
+    // 3 = "no answer (yet)": the daemon restarted mid-wait, but what was sent is kept.
+    process.exitCode = usage ? 2 : error.code === "daemon_restarted" ? 3 : 1;
   });

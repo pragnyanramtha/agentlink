@@ -80,6 +80,8 @@ export interface RemoteRouter {
   teamName: string;
   /** This device's handle in the team (how teammates address this machine). */
   selfHandle: string;
+  /** Whether any device of a teammate is connected to the relay. */
+  online(handle: string): boolean;
   /** Tool and host of a teammate's agent, from presence. */
   infoOf(handle: string, agent: string): { tool?: string; host?: string } | undefined;
   connected(): boolean;
@@ -257,9 +259,9 @@ export class Mailbox {
       const spec = parseAddress(raw);
       switch (spec.kind) {
         case "name": {
-          const agent = this.#registry.byName(spec.name);
-          if (agent) {
-            out.push(agentRecipient(agent));
+          const found = this.#registry.resolveName(spec.name);
+          if (found) {
+            out.push(agentRecipient(this.#registry.refreshLiveness(found.agent)));
             break;
           }
           if (spec.name === this.handle) {
@@ -287,9 +289,9 @@ export class Mailbox {
             out.push(remoteRecipient(spec.member, spec.agent));
             break;
           }
-          const agent = this.#registry.byName(spec.agent);
-          if (!agent) throw this.#noSuchAgent(spec.agent);
-          out.push(agentRecipient(agent));
+          const found = this.#registry.resolveName(spec.agent);
+          if (!found) throw this.#noSuchAgent(spec.agent);
+          out.push(agentRecipient(this.#registry.refreshLiveness(found.agent)));
           break;
         }
         case "repo": {
@@ -327,34 +329,52 @@ export class Mailbox {
   }
 
   /** Only a recipient answers a message, and a handoff gets one final accept/decline. */
+  #isAuthor(sender: Sender, original: MessageRow): boolean {
+    return sender.kind === "agent"
+      ? original.from_agent_id === sender.agent.id
+      : original.from_agent_id === null && original.from_addr === `@${this.handle}`;
+  }
+
+  /**
+   * Only a recipient answers a message (its author may follow up), a handoff gets one final
+   * accept/decline, and in a group the first accept takes it.
+   */
   #checkAnswerer(sender: Sender, original: MessageRow, ack?: AckValue): void {
-    const mine = this.deliveriesOf(original.id).find((d) =>
+    const deliveries = this.deliveriesOf(original.id);
+    const mine = deliveries.find((d) =>
       sender.kind === "agent"
         ? d.to_agent_id === sender.agent.id
         : d.to_agent_id === null && d.to_addr === `@${this.handle}`,
     );
-    if (!mine) {
+    if (!mine && !(this.#isAuthor(sender, original) && !ack)) {
       throw new AgentLinkError(
         "forbidden",
         `only a recipient of ${original.id} can answer it (it went to ${
-          this.deliveriesOf(original.id)
-            .map((d) => d.to_addr)
-            .join(", ") || "nobody here"
+          deliveries.map((d) => d.to_addr).join(", ") || "nobody here"
         })`,
         403,
       );
     }
-    if (ack === "accept" || ack === "decline") {
-      const decided = this.#ctx.store.all<{ envelope: string }>(
-        `SELECT envelope FROM messages WHERE reply_to = ? AND kind = 'ack' AND ${sender.kind === "agent" ? "from_agent_id = ?" : "from_agent_id IS NULL AND from_addr = ?"}`,
-        original.id,
-        sender.kind === "agent" ? sender.agent.id : `@${this.handle}`,
+    if (ack !== "accept" && ack !== "decline") return;
+    if (original.kind !== "handoff") {
+      throw invalid(
+        `only a handoff can be accepted or declined; ${original.id} is ${original.kind === "ask" ? "an" : "a"} ${original.kind} (answer it with agentlink reply, or confirm with agentlink ack ${original.id})`,
       );
-      const prior = decided
-        .map((r) => this.envelopeOf({ envelope: r.envelope } as MessageRow).meta.ack)
-        .find((a) => a === "accept" || a === "decline");
-      if (prior)
-        throw invalid(`you already ${prior === "accept" ? "accepted" : "declined"} ${original.id}`);
+    }
+    const decisions = this.#ctx.store
+      .all<MessageRow>("SELECT * FROM messages WHERE reply_to = ? AND kind = 'ack'", original.id)
+      .map((m) => ({ m, ack: this.envelopeOf(m).meta.ack }))
+      .filter((d) => d.ack === "accept" || d.ack === "decline");
+    const own = decisions.find(({ m }) =>
+      sender.kind === "agent"
+        ? m.from_agent_id === sender.agent.id
+        : m.from_agent_id === null && m.from_addr === `@${this.handle}`,
+    );
+    if (own)
+      throw invalid(`you already ${own.ack === "accept" ? "accepted" : "declined"} ${original.id}`);
+    const taken = decisions.find((d) => d.ack === "accept");
+    if (ack === "accept" && taken) {
+      throw invalid(`${taken.m.from_addr} already accepted this handoff (${original.id})`);
     }
   }
 
@@ -383,6 +403,10 @@ export class Mailbox {
     }
     if (sender.kind !== "agent") return; // humans are never throttled
     const { store } = this.#ctx;
+    // Group conversations get proportionally more room than two agents ping-ponging.
+    const extraPeople = original
+      ? Math.max(0, this.participants(this.envelopeOf(original)).length - 2)
+      : 0;
     // `agentlink thread <id> --allow N` (by a human) raises both the thread cap and reply depth.
     const allowance = thread
       ? (store.get<{ extra_allowance: number }>(
@@ -395,7 +419,7 @@ export class Mailbox {
         "SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?",
         thread,
       )?.n;
-      if ((count ?? 0) >= LIMITS.threadMaxMessages + allowance) {
+      if ((count ?? 0) >= LIMITS.threadMaxMessages + allowance + 10 * extraPeople) {
         throw limited(
           "thread_cap",
           `thread ${thread} reached ${LIMITS.threadMaxMessages + allowance} messages and is paused; ask your user to continue it (agentlink thread ${thread} --allow 10)`,
@@ -418,10 +442,10 @@ export class Mailbox {
          ) SELECT MAX(depth) AS d FROM chain`,
         original.id,
       )?.d;
-      if ((depth ?? 0) >= LIMITS.replyMaxDepth + allowance) {
+      if ((depth ?? 0) >= LIMITS.replyMaxDepth + allowance + 4 * extraPeople) {
         throw limited(
           "reply_depth",
-          `reply chain is ${depth} deep (max ${LIMITS.replyMaxDepth + allowance}); summarise and start a new thread, or ask your user to allow more (agentlink thread ${original.thread_id} --allow 10)`,
+          `reply chain is ${depth} deep (max ${LIMITS.replyMaxDepth + allowance + 4 * extraPeople}); summarise and start a new thread, or ask your user to allow more on this machine (agentlink thread ${original.thread_id} --allow 10)`,
         );
       }
     }
@@ -463,7 +487,14 @@ export class Mailbox {
       this.#checkAnswerer(sender, original, input.ack);
     }
     let to = input.to ?? [];
-    if (input.replyAll) {
+    const groupDecision =
+      !!original &&
+      original.kind === "handoff" &&
+      input.kind === "ack" &&
+      (input.ack === "accept" || input.ack === "decline") &&
+      this.participants(this.envelopeOf(original)).length > 2;
+    const authorFollowUp = !!original && !input.to?.length && this.#isAuthor(sender, original);
+    if (input.replyAll || groupDecision || authorFollowUp) {
       if (!original) throw invalid("--all needs a message to answer");
       const me = sender.kind === "agent" ? sender.agent.name : `@${this.handle}`;
       // Everyone still reachable; a participant that no longer exists is skipped.
@@ -575,7 +606,16 @@ export class Mailbox {
         );
         ids.push(res.lastInsertRowid);
       }
-      if (original) this.#markAnswered(original, sender, envelope.messageId, input.kind, stamp);
+      if (original) {
+        this.#markAnswered(
+          original,
+          sender,
+          envelope.messageId,
+          input.kind,
+          stamp,
+          ackNote(input.ack, text),
+        );
+      }
       return ids;
     });
 
@@ -624,6 +664,7 @@ export class Mailbox {
     replyId: string,
     kind: Kind,
     stamp: string,
+    note: string | null = null,
   ): void {
     const isAck = kind === "ack";
     const state: DeliveryState = isAck ? "acked" : "replied";
@@ -632,7 +673,7 @@ export class Mailbox {
     const whoParam = sender.kind === "agent" ? sender.agent.id : `@${this.handle}`;
     const updated = this.#ctx.store.run(
       `UPDATE deliveries SET state = ?, ${column} = ?, reply_id = COALESCE(reply_id, ?),
-         seen_at = COALESCE(seen_at, ?), delivered_at = COALESCE(delivered_at, ?)
+         seen_at = COALESCE(seen_at, ?), delivered_at = COALESCE(delivered_at, ?), note = COALESCE(?, note)
        WHERE message_id = ? AND ${who} AND state NOT IN ('refused','expired')
          ${isAck ? "AND state NOT IN ('replied')" : ""}`,
       state,
@@ -640,6 +681,7 @@ export class Mailbox {
       replyId,
       stamp,
       stamp,
+      note,
       original.id,
       whoParam,
     );
@@ -757,11 +799,13 @@ export class Mailbox {
       if (original) {
         const isAck = envelope.kind === "ack";
         store.run(
-          `UPDATE deliveries SET state = ?, ${isAck ? "acked_at" : "replied_at"} = ?, reply_id = COALESCE(reply_id, ?)
+          `UPDATE deliveries SET state = ?, ${isAck ? "acked_at" : "replied_at"} = ?, reply_id = COALESCE(reply_id, ?),
+             note = COALESCE(?, note)
            WHERE message_id = ? AND to_addr = ? AND state NOT IN ('refused','expired','replied')`,
           isAck ? "acked" : "replied",
           stamp,
           envelope.messageId,
+          isAck ? ackNote(envelope.meta.ack, text) : null,
           original.id,
           fromAddr,
         );
@@ -1014,6 +1058,15 @@ export class Mailbox {
       others: this.participants(env).filter(
         (p) => p !== item.delivery.to_addr && p !== item.message.from_addr,
       ),
+      ...(env.from.role === "human" ? { fromHuman: true } : {}),
+      ...(() => {
+        if (!env.replyTo) return {};
+        const original = this.#ctx.store.get<{ preview: string }>(
+          "SELECT preview FROM messages WHERE id = ?",
+          env.replyTo,
+        );
+        return original ? { replyToPreview: original.preview } : {};
+      })(),
     };
   }
 
@@ -1092,11 +1145,19 @@ export class Mailbox {
         clearTimeout(timer);
         set.delete(poke);
         if (set.size === 0) this.#replyWaiters.delete(messageId);
-        const { replies, failed } = snapshot();
-        resolve({ replies, failed, timedOut });
+        try {
+          const { replies, failed } = snapshot();
+          resolve({ replies, failed, timedOut });
+        } catch {
+          resolve({ replies: [], failed: [], timedOut: true }); // daemon shutting down
+        }
       };
       const poke = () => {
-        if (snapshot().done) finish(false);
+        try {
+          if (snapshot().done) finish(false);
+        } catch {
+          finish(true);
+        }
       };
       const timer = setTimeout(() => finish(true), timeoutMs);
       signal?.addEventListener("abort", () => finish(true), { once: true });
@@ -1175,7 +1236,22 @@ export class Mailbox {
       deliveryId,
     ) as DeliveryRow;
     this.#publishDelivery(updated);
-    if (decision === "deny") this.#checkFailed(updated.message_id);
+    if (decision === "deny") {
+      this.#checkFailed(updated.message_id);
+      const message = this.#ctx.store.get<MessageRow>(
+        "SELECT * FROM messages WHERE id = ?",
+        updated.message_id,
+      );
+      const author = message?.from_agent_id
+        ? this.#registry.byId(message.from_agent_id)
+        : undefined;
+      if (author && message) {
+        this.notify(
+          author,
+          `Your ${message.kind} ${message.id} to ${updated.to_addr} was not delivered: ${by} denied it.`,
+        );
+      }
+    }
     return this.#item(updated);
   }
 
@@ -1303,4 +1379,11 @@ function teamNotReady(addr: string): AgentLinkError {
     `"${addr}" is a team address; join a team first (agentlink team join <invite>)`,
     400,
   );
+}
+
+/** How an acknowledgement reads in receipts: "accepted: on it" / "declined: busy". */
+function ackNote(ack: AckValue | undefined, text: string): string | null {
+  if (ack !== "accept" && ack !== "decline") return null;
+  const note = text && text !== ack ? `: ${text.slice(0, 120)}` : "";
+  return `${ack === "accept" ? "accepted" : "declined"}${note}`;
 }

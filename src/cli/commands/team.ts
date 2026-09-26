@@ -53,7 +53,11 @@ function printStatus(s: TeamStatus): string {
       table(
         s.members.map((m) => [
           c.bold(`@${m.handle}`) + (m.self ? c.dim(" (you)") : ""),
-          m.online ? c.green("online") : c.dim("offline"),
+          m.self || t.connected
+            ? m.online
+              ? c.green("online")
+              : c.dim("offline")
+            : c.dim("unknown"),
           m.deviceName ?? "",
           c.dim(m.fingerprint),
         ]),
@@ -129,13 +133,16 @@ export const team: Command = async (ctx) => {
         uses: { type: "string", default: "1" },
         ttl: { type: "string", default: "24h" },
       });
+      const ttlMs = parseDuration(String(values.ttl), 24 * 3600_000, "h");
+      if (!(ttlMs > 0))
+        throw new UsageError("--ttl must be more than 0 (e.g. 30m, 24h, 7d is 168h)");
       const uses = Number(values.uses);
       if (!Number.isInteger(uses) || uses < 1 || uses > 100)
         throw new UsageError("--uses must be a whole number from 1 to 100");
       await ctx.client.ensureDaemon();
       const res = await ctx.client.request<{ invite: string }>("POST", "/v1/team/invite", {
         uses: Number(values.uses),
-        ttlMs: parseDuration(String(values.ttl), 24 * 3600_000, "h"),
+        ttlMs,
       });
       out(ctx, res, () =>
         [

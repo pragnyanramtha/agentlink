@@ -176,10 +176,13 @@ export async function startDaemon(
       server.close(() => {
         rmSync(paths.socket, { force: true });
         rmSync(paths.pidFile, { force: true });
-        store.close();
-        releaseLock();
-        log.info("daemon stopped");
-        resolve();
+        // Let aborted requests (waits ending) finish their last reads before the database closes.
+        setTimeout(() => {
+          store.close();
+          releaseLock();
+          log.info("daemon stopped");
+          resolve();
+        }, 50);
       });
       server.closeAllConnections();
     });

@@ -143,7 +143,10 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         other.ws.close(4000, "replaced by a newer connection");
       }
     }
-    send(c, { t: "welcome", teamId, deviceId: c.deviceId as string, ...roster(teamId) });
+    const online = [...new Set(peersOf(teamId).map((p) => p.deviceId as string))].filter(
+      (d) => d !== c.deviceId,
+    );
+    send(c, { t: "welcome", teamId, deviceId: c.deviceId as string, ...roster(teamId), online });
     for (const p of q<{ device_id: string; box: string; at: string }>(
       "SELECT device_id, box, at FROM presence WHERE team_id = ? AND device_id != ?",
       teamId,

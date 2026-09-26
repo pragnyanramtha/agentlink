@@ -70,7 +70,15 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
 export type ClientFrame = z.infer<typeof ClientFrameSchema>;
 
 export type ServerFrame =
-  | { t: "welcome"; teamId: string; deviceId: string; roster: SignedMember[]; admins: string[] }
+  | {
+      t: "welcome";
+      teamId: string;
+      deviceId: string;
+      roster: SignedMember[];
+      admins: string[];
+      /** Devices of the team connected right now (so a fresh join does not show everyone offline). */
+      online?: string[];
+    }
   | { t: "roster"; roster: SignedMember[]; admins: string[] }
   | { t: "msg"; id: string; from: string; blob: z.infer<typeof SealedSchema>; at: string }
   | { t: "presence"; deviceId: string; box: z.infer<typeof TeamBoxSchema>; at: string }

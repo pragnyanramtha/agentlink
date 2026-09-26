@@ -129,4 +129,12 @@ export const MIGRATIONS: string[] = [
   ALTER TABLE outbox ADD COLUMN message_id TEXT;
   ALTER TABLE outbox ADD COLUMN handle TEXT;
   `,
+  // 4: old names keep working after a rename (messages are forwarded to the renamed agent)
+  `
+  CREATE TABLE agent_aliases (
+    name TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  `,
 ];

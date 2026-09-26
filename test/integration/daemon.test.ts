@@ -390,6 +390,183 @@ describe("usability fixes, round 2", () => {
   });
 });
 
+describe("usability fixes, round 3", () => {
+  type Item = { message: { id: string; from: string }; text: string };
+
+  it("mute also hides mail from the agent's own inbox reads", async () => {
+    await register("m1");
+    await register("m2");
+    await t.raw("POST", "/v1/control", { action: "mute", agent: "m2" }, { tty: true });
+    await t.client("m1").request("POST", "/v1/messages", { to: ["m2"], text: "muted mail" });
+    const r = await t.client("m2").request<{ items: Item[]; muted?: boolean }>("GET", "/v1/inbox");
+    expect(r.muted).toBe(true);
+    expect(r.items).toHaveLength(0);
+  });
+
+  it("handoffs: accept/decline show in receipts, first accept wins, asks cannot be accepted", async () => {
+    await register("boss");
+    await register("w1");
+    await register("w2");
+    const h = await t.client("boss").request<SendRes>("POST", "/v1/messages", {
+      to: ["w1", "w2"],
+      kind: "handoff",
+      text: "own the release notes",
+    });
+    expect(
+      (
+        await t.raw(
+          "POST",
+          `/v1/messages/${h.message.id}/ack`,
+          { ack: "decline", note: "busy" },
+          { as: "w1" },
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (await t.raw("POST", `/v1/messages/${h.message.id}/ack`, { ack: "accept" }, { as: "w2" }))
+        .status,
+    ).toBe(200);
+    const shown = await t
+      .client()
+      .request<{ deliveries: { to: string; note: string }[] }>(
+        "GET",
+        `/v1/messages/${h.message.id}?peek=1`,
+      );
+    expect(shown.deliveries.find((d) => d.to === "w1")?.note).toBe("declined: busy");
+    expect(shown.deliveries.find((d) => d.to === "w2")?.note).toContain("accepted");
+    // w1 learns that w2 took it (group decisions go to everyone)
+    const w1 = await t.client("w1").request<{ items: Item[] }>("GET", "/v1/inbox?all=1");
+    expect(w1.items.some((i) => i.message.from === "w2")).toBe(true);
+    const ask = await t
+      .client("boss")
+      .request<SendRes>("POST", "/v1/messages", { to: ["w1"], kind: "ask", text: "eta?" });
+    const bad = await t.raw(
+      "POST",
+      `/v1/messages/${ask.message.id}/ack`,
+      { ack: "accept" },
+      { as: "w1" },
+    );
+    expect(bad.status).toBe(400);
+    expect(JSON.stringify(bad.data)).toContain("only a handoff");
+  });
+
+  it("the author can follow up on its own message; others cannot read the conversation", async () => {
+    await register("au");
+    await register("rc");
+    await register("nosy");
+    const ask = await t
+      .client("au")
+      .request<SendRes>("POST", "/v1/messages", { to: ["rc"], kind: "ask", text: "which port?" });
+    const follow = await t.raw<SendRes>(
+      "POST",
+      "/v1/messages",
+      { kind: "reply", replyTo: ask.message.id, text: "(the dev server one)" },
+      { as: "au" },
+    );
+    expect(follow.status).toBe(200);
+    expect(follow.data.deliveries.map((d) => d.to)).toEqual(["rc"]);
+    expect(
+      (await t.raw("GET", `/v1/messages/${ask.message.id}`, undefined, { as: "nosy" })).status,
+    ).toBe(403);
+    expect(
+      (await t.raw("GET", `/v1/threads/${ask.message.id}`, undefined, { as: "nosy" })).status,
+    ).toBe(403);
+    expect((await t.raw("GET", `/v1/messages/${ask.message.id}?peek=1`)).status).toBe(200); // you see everything
+  });
+
+  it("asking an offline agent returns at once, and a renamed agent keeps its old name as an alias", async () => {
+    const asker = await register("q1");
+    const gone = t.fakeAgentProcess("generic");
+    await t
+      .client()
+      .request("POST", "/v1/agents/register", {
+        tool: "generic",
+        name: "gone",
+        pid: gone.pid,
+        state: "idle",
+      });
+    gone.kill();
+    await new Promise((r) => setTimeout(r, 100));
+    const started = Date.now();
+    const res = await t
+      .client("q1")
+      .request<SendRes & { offline?: boolean }>(
+        "POST",
+        "/v1/messages",
+        { to: ["gone"], kind: "ask", text: "still there?", waitMs: 20_000 },
+        { timeoutMs: 25_000 },
+      );
+    expect(res.offline).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    await register("oldname");
+    await t.client("oldname").request("POST", "/v1/agents/rename", { name: "newname" });
+    const fwd = await t
+      .client("q1")
+      .request<SendRes>("POST", "/v1/messages", { to: ["oldname"], text: "hello again" });
+    expect(fwd.deliveries[0]?.to).toBe("newname");
+    void asker;
+  });
+
+  it("answers quote the question they answer", async () => {
+    await register("qa");
+    await register("qb");
+    const ask = await t
+      .client("qa")
+      .request<SendRes>("POST", "/v1/messages", {
+        to: ["qb"],
+        kind: "ask",
+        text: "Should we use pnpm or npm?",
+      });
+    await t
+      .client("qb")
+      .request("POST", "/v1/messages", { kind: "reply", replyTo: ask.message.id, text: "pnpm" });
+    const inj = await t.client("qa").request<{ text: string }>("GET", "/v1/inbox?format=inject");
+    expect(inj.text).toContain('"Should we use pnpm or npm?"');
+  });
+
+  it("a denied message tells the agent that sent it", async () => {
+    await register("dn1");
+    await register("dn2");
+    await t.raw(
+      "POST",
+      "/v1/policy",
+      { scope: "local", kind: "request", action: "hold" },
+      { tty: true },
+    );
+    const res = await t
+      .client("dn1")
+      .request<SendRes>("POST", "/v1/messages", {
+        to: ["dn2"],
+        kind: "request",
+        text: "rm -rf build",
+      });
+    await t.raw("POST", `/v1/approvals/${res.message.id}`, { decision: "deny" }, { tty: true });
+    const notice = await t.client("dn1").request<{ items: Item[] }>("GET", "/v1/inbox");
+    expect(notice.items.some((i) => i.text.includes("denied"))).toBe(true);
+    await t
+      .raw("POST", "/v1/policy/reset", { scope: "local", kind: "request" }, { tty: true })
+      .catch(() => undefined);
+  });
+
+  it("stopping the daemon while a client waits for an answer does not crash it", async () => {
+    await register("w-a");
+    await register("w-b");
+    const waiting = t
+      .client("w-a")
+      .request(
+        "POST",
+        "/v1/messages",
+        { to: ["w-b"], kind: "ask", text: "long wait", waitMs: 30_000 },
+        { timeoutMs: 35_000 },
+      )
+      .catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 200));
+    await t.daemon.close(); // must resolve without an uncaught "database is not open"
+    expect(await waiting).toBeTruthy();
+    t = await startTestDaemon();
+  });
+});
+
 describe("guards", () => {
   it("stops echo loops and caps threads", async () => {
     await register("alpha");

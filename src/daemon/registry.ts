@@ -106,8 +106,23 @@ export class Registry {
 
       const chosen = input.name
         ? this.#claimUserName(input.name)
-        : this.#autoName(input.tool, repo?.name || basename(input.cwd ?? "") || "agent");
+        : this.#autoName(
+            input.tool,
+            repo?.name || basename(input.cwd ?? "") || "agent",
+            repo?.branch ?? undefined,
+          );
       if (chosen.takeover) {
+        if (
+          input.sessionId &&
+          chosen.takeover.session_id &&
+          input.sessionId !== chosen.takeover.session_id
+        ) {
+          // A different session taking over an offline agent's name starts with a clean status.
+          this.#ctx.store.run(
+            "UPDATE agents SET status_text = NULL WHERE id = ?",
+            chosen.takeover.id,
+          );
+        }
         this.#update(chosen.takeover, { ...input, name: undefined }, repo, now, true);
         return { id: chosen.takeover.id, created: false, resumed: true };
       }
@@ -178,10 +193,29 @@ export class Registry {
     );
   }
 
-  #autoName(tool: string, repoName: string): { name: string; takeover?: AgentRow } {
+  /**
+   * `<tool>-<repo>`; a second live session in the same repo is told apart by its branch
+   * (`claude-web-feat-login`) when it has one, and by a number otherwise.
+   */
+  #autoName(
+    tool: string,
+    repoName: string,
+    branch?: string,
+  ): { name: string; takeover?: AgentRow } {
     const base = `${slugify(tool, 16)}-${slugify(repoName, 40)}`;
-    for (let i = 1; i < 100; i++) {
-      const name = i === 1 ? base : `${base}-${i}`;
+    const byBranch =
+      branch && !["main", "master", "HEAD", "trunk", "develop"].includes(branch)
+        ? `${base}-${slugify(branch, 24)}`
+        : undefined;
+    const candidates = [base, ...(byBranch ? [byBranch] : [])];
+    for (const name of candidates) {
+      const row = this.byName(name);
+      if (!row) return { name };
+      if (!isLive(row) && row.tool === tool && row.name_source === "auto")
+        return { name, takeover: row };
+    }
+    for (let i = 2; i < 100; i++) {
+      const name = `${byBranch ?? base}-${i}`;
       const row = this.byName(name);
       if (!row) return { name };
       if (!isLive(row) && row.tool === tool && row.name_source === "auto") {
@@ -225,11 +259,41 @@ export class Registry {
           holder.id,
         );
       }
+      const before = this.byId(agentId);
       store.run("UPDATE agents SET name = ?, name_source = 'user' WHERE id = ?", name, agentId);
+      store.run("DELETE FROM agent_aliases WHERE name = ?", name);
+      if (before && before.name !== name) {
+        store.run(
+          "INSERT OR REPLACE INTO agent_aliases (name, agent_id, created_at) VALUES (?, ?, ?)",
+          before.name,
+          agentId,
+          new Date().toISOString(),
+        );
+      }
     });
     const agent = this.byId(agentId);
     if (!agent) throw notFound(`agent ${agentId}`);
     this.#emit(agent);
+    return agent;
+  }
+
+  /** An agent by its current name, or by a name it had before a rename. */
+  resolveName(name: string): { agent: AgentRow; renamedFrom?: string } | undefined {
+    const current = this.byName(name);
+    if (current) return { agent: current };
+    const alias = this.#ctx.store.get<{ agent_id: string }>(
+      "SELECT agent_id FROM agent_aliases WHERE name = ?",
+      name.trim().toLowerCase(),
+    );
+    const agent = alias ? this.byId(alias.agent_id) : undefined;
+    return agent ? { agent, renamedFrom: name } : undefined;
+  }
+
+  /** Re-checks a live agent's process right away (instead of waiting for the next sweep). */
+  refreshLiveness(agent: AgentRow): AgentRow {
+    if (isLive(agent) && agent.pid && !isAlive(agent.pid, agent.pid_start ?? undefined)) {
+      return this.setState(agent.id, "offline") ?? agent;
+    }
     return agent;
   }
 

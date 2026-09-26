@@ -36,6 +36,7 @@ interface SendResponse {
   replies?: { message: MessageView; text: string; ack?: string }[];
   failed?: { to: string; state: string; note: string | null }[];
   paused?: boolean;
+  offline?: boolean;
   waited: boolean;
   timedOut?: boolean;
   asHuman?: boolean;
@@ -90,7 +91,21 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
       if (silent.length && res.timedOut)
         lines.push(c.yellow(`No answer yet from ${silent.join(", ")}.`));
     } else if (res.paused && res.waited) {
-      lines.push(c.yellow("agentlink is paused, so nothing was delivered yet (agentlink resume)."));
+      lines.push(
+        c.yellow(
+          res.asHuman
+            ? "agentlink is paused, so nothing was delivered yet (agentlink resume)."
+            : "agentlink is paused, so nothing was delivered yet; your user can resume it with agentlink resume.",
+        ),
+      );
+    } else if (res.offline && res.waited) {
+      lines.push(
+        c.yellow(
+          res.asHuman
+            ? `Not waiting: nobody it went to is online. The answer will land in your inbox (agentlink inbox).`
+            : `Not waiting: nobody it went to is online. The answer will be delivered to you when they are back.`,
+        ),
+      );
     } else if (res.failed?.length) {
       for (const f of res.failed) {
         if (!res.deliveries.some((d) => d.to === f.to && d.state === f.state)) {
@@ -128,8 +143,10 @@ async function sendCommon(
   },
 ): Promise<number> {
   if (!opts.text.trim()) throw new UsageError("message text is empty");
-  if (!KINDS.includes(opts.kind))
-    throw new UsageError(`unknown --kind "${opts.kind}" (use: ${KINDS.join(", ")})`);
+  const offered = ["info", "ask", "request", "handoff", "reply", "ack"];
+  if (!offered.includes(opts.kind)) {
+    throw new UsageError(`unknown --kind "${opts.kind}" (use: info, request, handoff, or ask)`);
+  }
   await ctx.client.ensureDaemon();
   const res = await ctx.client.request<SendResponse>(
     "POST",
@@ -452,7 +469,7 @@ export const log: Command = async (ctx) => {
       : res.messages
           .map(
             ({ message: m, deliveries }) =>
-              `${c.dim(ago(m.createdAt).padEnd(8))} ${c.bold(m.kind.padEnd(8))} ${c.cyan(m.from)} → ${
+              `${c.dim(ago(m.createdAt).padEnd(8))} ${c.dim(m.id.slice(0, 12))} ${c.bold(m.kind.padEnd(8))} ${c.cyan(m.from)} → ${
                 deliveries.length
                   ? deliveries.map((d) => `${d.to} ${deliveryColor(d.state)}`).join(", ")
                   : c.dim("(no recipient here)")

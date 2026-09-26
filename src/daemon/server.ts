@@ -16,7 +16,7 @@ import type { OpenCodeBridge } from "./deliverers.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import { type HookHandler, HookRequestSchema } from "./hooks.ts";
 import type { Mailbox } from "./mailbox.ts";
-import { agentView, type Registry } from "./registry.ts";
+import { agentView, isLive, type Registry } from "./registry.ts";
 import type { TeamManager } from "./team-manager.ts";
 import type { AgentRow, CallerInfo, InboxItem, MessageRow, Sender } from "./types.ts";
 
@@ -283,11 +283,13 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         reach: a.reach ?? null,
         address: `${a.member}/${a.name}`,
         host: a.host ?? null,
+        sid: a.sid ?? null,
         local: false,
       }));
     return {
       agents: [...local, ...remote],
       paused: mailbox.paused,
+      team: mailbox.remote?.teamName ?? null,
       you: { handle: selfHandle(), host: hostname() },
     };
   });
@@ -406,8 +408,25 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
     );
     let replies: ReturnType<typeof replyView>[] | undefined;
+    const offline = result.deliveries
+      .filter((d) => ["queued", "sent"].includes(String(d.state)))
+      .every((d) => {
+        const to = String(d.to);
+        if (to.includes("/") || to.startsWith("@")) {
+          const handle = to.startsWith("@") ? to.slice(1) : (to.split("/")[0] as string);
+          return handle !== mailbox.handle && mailbox.remote
+            ? !mailbox.remote.online(handle)
+            : false;
+        }
+        const agent = registry.byName(to);
+        return !!agent && !isLive(agent);
+      });
+    let offlineNote: string | undefined;
     if (input.waitMs && reachable && mailbox.paused) {
       timedOut = true; // nothing is delivered while paused, so there is nothing to wait for
+    } else if (input.waitMs && reachable && offline && result.deliveries.length > 0) {
+      timedOut = true;
+      offlineNote = "offline";
     } else if (input.waitMs && reachable) {
       const expected = result.deliveries.filter((d) =>
         ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
@@ -440,6 +459,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       ...(replies && replies.length > 1 ? { replies } : {}),
       ...(failed ? { failed } : {}),
       ...(mailbox.paused ? { paused: true } : {}),
+      ...(offlineNote ? { offline: true } : {}),
       waited: !!input.waitMs,
       timedOut,
       asHuman: !req.agent,
@@ -447,6 +467,12 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   });
 
   route("GET", "/v1/inbox", async (req) => {
+    if (req.agent?.muted) {
+      const text = `agentlink: ${req.agent.name} is muted; messages wait until your user runs \`agentlink unmute ${req.agent.name}\`.`;
+      return req.query.get("format") === "inject"
+        ? { count: 0, text, muted: true }
+        : { items: [], muted: true };
+    }
     if (req.agent && mailbox.paused) {
       // The kill switch covers reads too: a paused agent sees nothing until you resume.
       const text =
@@ -481,8 +507,16 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     return { items: items.map(itemView) };
   });
 
+  // Agents see only messages they sent or received; you (the human) see everything.
+  const takesPart = (agent: AgentRow, message: MessageRow): boolean =>
+    message.from_agent_id === agent.id ||
+    mailbox.deliveriesOf(message.id).some((d) => d.to_agent_id === agent.id);
+
   route("GET", "/v1/messages/:id", (req) => {
     const message = mailbox.resolveMessage(req.params.id as string);
+    if (req.agent && !takesPart(req.agent, message)) {
+      throw forbidden(`${message.id} was not sent to or by ${req.agent.name}`);
+    }
     const envelope = mailbox.envelopeOf(message);
     const deliveries = mailbox.deliveriesOf(message.id);
     const mine = deliveries.filter((d) =>
@@ -530,14 +564,22 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     return { message: result.message, deliveries: result.deliveries };
   });
 
-  route("GET", "/v1/threads/:id", (req) => ({
-    thread: mailbox.resolveThread(req.params.id as string),
-    messages: mailbox.thread(req.params.id as string).map(({ message, deliveries }) => ({
-      message: mailbox.messageView(message),
-      text: textOf(mailbox.envelopeOf(message)),
-      deliveries: deliveries.map((d) => mailbox.deliveryView(d)),
-    })),
-  }));
+  route("GET", "/v1/threads/:id", (req) => {
+    const all = mailbox.thread(req.params.id as string);
+    const visible = req.agent
+      ? all.filter(({ message }) => takesPart(req.agent as AgentRow, message))
+      : all;
+    if (req.agent && visible.length === 0)
+      throw forbidden(`${req.agent.name} is not part of that conversation`);
+    return {
+      thread: mailbox.resolveThread(req.params.id as string),
+      messages: visible.map(({ message, deliveries }) => ({
+        message: mailbox.messageView(message),
+        text: textOf(mailbox.envelopeOf(message)),
+        deliveries: deliveries.map((d) => mailbox.deliveryView(d)),
+      })),
+    };
+  });
 
   route("POST", "/v1/threads/:id/allow", (req) => {
     requireHuman(req);
@@ -554,11 +596,22 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       : req.agent
         ? { agentId: req.agent.id }
         : ({ human: true } as const);
+    // In a team, local names are shown as full addresses so a pasted log means the same anywhere.
+    const full = (name: string) =>
+      mailbox.remote && !name.includes("/") && !name.startsWith("@")
+        ? `${mailbox.handle}/${name}`
+        : name;
     return {
-      messages: mailbox.recent(limit, from).map((m) => ({
-        message: mailbox.messageView(m),
-        deliveries: mailbox.deliveriesOf(m.id).map((d) => mailbox.deliveryView(d)),
-      })),
+      messages: mailbox.recent(limit, from).map((m) => {
+        const view = mailbox.messageView(m);
+        return {
+          message: { ...view, from: full(String(view.from)) },
+          deliveries: mailbox.deliveriesOf(m.id).map((d) => {
+            const dv = mailbox.deliveryView(d);
+            return { ...dv, to: full(String(dv.to)) };
+          }),
+        };
+      }),
     };
   });
 
