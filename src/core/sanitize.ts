@@ -3,14 +3,14 @@
 const INVISIBLE =
   /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]|[\u{E0000}-\u{E007F}]/gu;
 // C0 controls except tab and newline, DEL, and C1 controls.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: finding control characters is the point
 const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: finding the escape character is the point
+const ESC = /\u001B/g;
 
 /** For terminals: escapes become visible (␛), other controls "?", invisible characters are removed. */
 export function safeTerminal(text: string): string {
-  return text
-    .replace(INVISIBLE, "")
-    .replace(/\u001B/g, "␛")
-    .replace(CONTROL, "?");
+  return text.replace(INVISIBLE, "").replace(ESC, "␛").replace(CONTROL, "?");
 }
 
 const LOOKALIKE_TAG = /<\s*\/?\s*agent\W{0,3}link\W{0,3}msg/i;
