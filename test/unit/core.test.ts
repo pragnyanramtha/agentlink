@@ -241,7 +241,7 @@ describe("sanitize", () => {
     );
     expect(out).not.toContain("\u001b");
     expect(out).toContain("␛[8m");
-    expect(out).not.toMatch(/[\u202e\u200b\u0007]/);
+    for (const ch of ["\u202e", "\u200b", "\u0007"]) expect(out).not.toContain(ch);
     expect(safeTerminal("line1\nline2\tx")).toBe("line1\nline2\tx");
   });
 
