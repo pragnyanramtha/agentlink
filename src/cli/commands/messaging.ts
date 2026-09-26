@@ -37,6 +37,7 @@ interface SendResponse {
   failed?: { to: string; state: string; note: string | null }[];
   paused?: boolean;
   offline?: boolean;
+  relayDown?: boolean;
   waited: boolean;
   timedOut?: boolean;
   asHuman?: boolean;
@@ -73,7 +74,9 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
         : `${c.cyan("→")} ${c.bold(d.to)}: ${d.note ?? d.state}`,
     );
     lines.push(
-      c.dim(`  message ${res.message.id} (${res.message.kind}, thread ${res.message.thread})`),
+      c.dim(
+        `  message ${res.message.id.slice(0, 12)} (${res.message.kind}, thread ${res.message.thread.slice(0, 12)})`,
+      ),
     );
     if (res.reply) {
       const all = res.replies ?? [res.reply];
@@ -96,6 +99,12 @@ function printSend(ctx: CliContext, res: SendResponse, waitMs: number): number {
           res.asHuman
             ? "agentlink is paused, so nothing was delivered yet (agentlink resume)."
             : "agentlink is paused, so nothing was delivered yet; your user can resume it with agentlink resume.",
+        ),
+      );
+    } else if (res.offline && res.relayDown && res.waited) {
+      lines.push(
+        c.yellow(
+          "Not waiting: the relay is unreachable. The message waits here and goes out when agentlink reconnects.",
         ),
       );
     } else if (res.offline && res.waited) {
@@ -175,6 +184,7 @@ export const send: Command = async (ctx) => {
     stdin: { type: "boolean" },
     ttl: { type: "string" },
     force: { type: "boolean" },
+    timeout: { type: "string" },
   });
   const [to, ...rest] = positionals;
   if (!to)
@@ -182,8 +192,13 @@ export const send: Command = async (ctx) => {
       'usage: agentlink send <agent>[,<agent>…] "<message>" [--kind ask|request|handoff]',
     );
   const kind = String(values.kind);
+  // --wait [d] and --timeout <d> both wait for an answer (same as ask).
   const waitMs =
-    values.wait !== undefined ? parseDuration(values.wait, LIMITS.cliAskDefaultWaitMs) : 0;
+    values.timeout !== undefined
+      ? parseDuration(values.timeout, LIMITS.cliAskDefaultWaitMs)
+      : values.wait !== undefined
+        ? parseDuration(values.wait, LIMITS.cliAskDefaultWaitMs)
+        : 0;
   return sendCommon(ctx, {
     to: splitRecipients(to),
     kind,
@@ -196,8 +211,9 @@ export const send: Command = async (ctx) => {
 };
 
 export const ask: Command = async (ctx) => {
-  const { values, positionals } = parse(ctx.argv, {
+  const { values, positionals } = parse(optionalValue(ctx.argv, "wait", "w"), {
     timeout: { type: "string" },
+    wait: { type: "string", short: "w" },
     "no-wait": { type: "boolean" },
     thread: { type: "string", short: "t" },
     stdin: { type: "boolean" },
@@ -211,7 +227,9 @@ export const ask: Command = async (ctx) => {
     kind: "ask",
     text: await readText(rest, Boolean(values.stdin)),
     ...(values.thread ? { thread: values.thread } : {}),
-    waitMs: values["no-wait"] ? 0 : parseDuration(values.timeout, LIMITS.cliAskDefaultWaitMs),
+    waitMs: values["no-wait"]
+      ? 0
+      : parseDuration(values.timeout ?? values.wait, LIMITS.cliAskDefaultWaitMs),
     ...(values.force ? { force: true } : {}),
   });
 };

@@ -10,19 +10,32 @@ describe.skipIf(!linux)("caller identity comes from the kernel", () => {
 
   beforeAll(async () => {
     t = await startTestDaemon({ verifyCallers: true });
-    // This test process becomes the agent "alpha"; every request it makes is alpha's.
-    await t.client().request("POST", "/v1/agents/register", {
-      tool: "generic",
-      name: "alpha",
-      pid: process.pid,
-      state: "idle",
-    });
     const victim = t.fakeAgentProcess("claude");
     await t.client().request("POST", "/v1/agents/register", {
       tool: "claude",
       name: "victim",
       pid: victim.pid,
       sessionId: "victim-session",
+      state: "idle",
+    });
+    // A conversation between two other agents (sent while this process is still "the human").
+    for (const name of ["p1", "p2"]) {
+      const proc = t.fakeAgentProcess("generic");
+      await t.client().request("POST", "/v1/agents/register", {
+        tool: "generic",
+        name,
+        pid: proc.pid,
+        state: "idle",
+      });
+    }
+    await t
+      .client("p1")
+      .request("POST", "/v1/messages", { to: ["p2"], text: "secret between others" });
+    // This test process becomes the agent "alpha"; every request it makes is alpha's.
+    await t.client().request("POST", "/v1/agents/register", {
+      tool: "generic",
+      name: "alpha",
+      pid: process.pid,
       state: "idle",
     });
   }, 30_000);
@@ -36,6 +49,31 @@ describe.skipIf(!linux)("caller identity comes from the kernel", () => {
       tty: true,
     });
     expect(who.data.agent?.name).toBe("alpha");
+  });
+
+  it("refuses an agent registering another process or a second name", async () => {
+    const other = t.fakeAgentProcess("generic");
+    const res = await t.raw("POST", "/v1/agents/register", {
+      tool: "generic",
+      name: "puppet",
+      pid: other.pid,
+    });
+    expect(res.status).toBe(403);
+    const twin = await t.raw("POST", "/v1/agents/register", {
+      tool: "generic",
+      name: "alpha2",
+      pid: process.pid,
+    });
+    expect(twin.status).toBe(409);
+  });
+
+  it("does not show an agent other agents' conversations in the log", async () => {
+    const res = await t
+      .client()
+      .request<{ messages: { message: { preview: string } }[] }>("GET", "/v1/log");
+    expect(res.messages.map((m) => m.message.preview)).not.toContain("secret between others");
+    const shown = await t.raw("GET", "/v1/threads/secret", undefined);
+    expect(shown.status).not.toBe(200);
   });
 
   it("refuses an agent acting as another agent", async () => {

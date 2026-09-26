@@ -221,6 +221,20 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   route("POST", "/v1/agents/register", (req) => {
     const input = RegisterSchema.parse(req.body);
     if (input.pid && !isAlive(input.pid)) throw invalid(`no running process with pid ${input.pid}`);
+    if (req.agent && input.pid && input.pid !== req.agent.pid) {
+      throw forbidden(`an agent can only register itself (you are ${req.agent.name})`);
+    }
+    // One process, one identity: a second name for a live process would be a look-alike.
+    const holder = input.pid
+      ? registry.list().find((a) => a.pid === input.pid && isLive(a))
+      : undefined;
+    if (holder && input.name && holder.name !== input.name.trim().toLowerCase()) {
+      throw new AgentLinkError(
+        "name_taken",
+        `process ${input.pid} is already registered as ${holder.name} (rename it with: agentlink name <new-name> --agent ${holder.name})`,
+        409,
+      );
+    }
     const previous = input.pid ? registry.byLivePid(input.tool, input.pid) : undefined;
     // The agent's own working directory decides its repo, not the shell that registered it.
     const cwd = (input.pid ? procCwd(input.pid) : undefined) ?? input.cwd;
@@ -394,7 +408,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         (d.state === "seen" && d.method === "longpoll"
           ? `delivered (${d.to} was waiting for this answer)`
           : d.state === "held"
-            ? `held for approval (${ctx.config.handle} runs: agentlink approvals)`
+            ? "held until a person on that machine approves it (agentlink approvals)"
             : d.state === "refused"
               ? "refused by policy"
               : d.state === "delivered" && String(d.to).startsWith("@")
@@ -426,7 +440,9 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       timedOut = true; // nothing is delivered while paused, so there is nothing to wait for
     } else if (input.waitMs && reachable && offline && result.deliveries.length > 0) {
       timedOut = true;
-      offlineNote = "offline";
+      const remoteOnly = result.deliveries.every((d) => String(d.to).includes("/"));
+      offlineNote =
+        remoteOnly && mailbox.remote && !mailbox.remote.connected() ? "relay" : "offline";
     } else if (input.waitMs && reachable) {
       const expected = result.deliveries.filter((d) =>
         ["queued", "sent", "delivered", "seen"].includes(String(d.state)),
@@ -459,7 +475,9 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       ...(replies && replies.length > 1 ? { replies } : {}),
       ...(failed ? { failed } : {}),
       ...(mailbox.paused ? { paused: true } : {}),
-      ...(offlineNote ? { offline: true } : {}),
+      ...(offlineNote
+        ? { offline: true, ...(offlineNote === "relay" ? { relayDown: true } : {}) }
+        : {}),
       waited: !!input.waitMs,
       timedOut,
       asHuman: !req.agent,
@@ -606,8 +624,12 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       mailbox.remote && !name.includes("/") && !name.startsWith("@")
         ? `${mailbox.handle}/${name}`
         : name;
+    const rows = mailbox.recent(req.agent ? Math.max(limit * 5, 100) : limit, from);
+    const visible = req.agent
+      ? rows.filter((m) => takesPart(req.agent as AgentRow, m)).slice(-limit)
+      : rows;
     return {
-      messages: mailbox.recent(limit, from).map((m) => {
+      messages: visible.map((m) => {
         const view = mailbox.messageView(m);
         return {
           message: { ...view, from: full(String(view.from)) },
@@ -729,7 +751,10 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     return { ok: true };
   });
 
-  route("GET", "/v1/approvals", () => ({ items: mailbox.held().map(itemView) }));
+  route("GET", "/v1/approvals", (req) => {
+    requireHuman(req, false);
+    return { items: mailbox.held().map(itemView) };
+  });
 
   route("POST", "/v1/approvals/:id", (req) => {
     requireHuman(req);
@@ -858,8 +883,10 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       let agent: AgentRow | undefined;
       if (!skipCaller) {
         agent = registry.resolveCaller(caller);
+        // Agents with hooks report busy/idle themselves; hook-less ones stay as registered.
         if (
           agent &&
+          agent.tool !== "generic" &&
           (agent.state === "offline" ||
             agent.state === "stale" ||
             (agent.state === "idle" && raw.method !== "GET"))

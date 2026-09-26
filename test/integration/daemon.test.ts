@@ -526,6 +526,42 @@ describe("usability fixes, round 3", () => {
     expect(todo.items.map((i) => i.text)).toEqual(["please run tests"]);
   });
 
+  it("when two agents accept a group handoff at once, the late one is told", async () => {
+    await register("hb");
+    await register("h1");
+    await register("h2");
+    const h = await t.client("hb").request<SendRes>("POST", "/v1/messages", {
+      to: ["h1", "h2"],
+      kind: "handoff",
+      text: "own the flaky test",
+    });
+    // simulate a race: h2's accept is recorded although h1 accepted first (as if it came from another machine)
+    await t.raw("POST", `/v1/messages/${h.message.id}/ack`, { ack: "accept" }, { as: "h1" });
+    const late = await t.raw(
+      "POST",
+      `/v1/messages/${h.message.id}/ack`,
+      { ack: "accept" },
+      { as: "h2" },
+    );
+    expect(late.status).toBe(400); // locally the second accept is refused outright
+    expect(JSON.stringify(late.data)).toContain("already accepted");
+  });
+
+  it("session tags from peers work as addresses", async () => {
+    const a = await register("tagged");
+    await register("tagger");
+    const tag = String(a.agent.id).slice(-4).toLowerCase();
+    const res = await t
+      .client("tagger")
+      .request<SendRes>("POST", "/v1/messages", { to: [`#${tag}`], text: "by tag" });
+    expect(res.deliveries[0]?.to).toBe("tagged");
+    const res2 = await t.client("tagger").request<SendRes>("POST", "/v1/messages", {
+      to: [`tagged #${tag}`],
+      text: "by name and tag",
+    });
+    expect(res2.deliveries[0]?.to).toBe("tagged");
+  });
+
   it("answers quote the question they answer", async () => {
     await register("qa");
     await register("qb");
@@ -576,7 +612,7 @@ describe("usability fixes, round 3", () => {
       )
       .catch((e: Error) => e);
     await new Promise((r) => setTimeout(r, 200));
-    await t.daemon.close(); // must resolve without an uncaught "database is not open"
+    await t.stop(); // must resolve without an uncaught "database is not open"
     expect(await waiting).toBeTruthy();
     t = await startTestDaemon();
   });

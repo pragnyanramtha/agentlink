@@ -82,6 +82,8 @@ export interface RemoteRouter {
   selfHandle: string;
   /** Whether any device of a teammate is connected to the relay. */
   online(handle: string): boolean;
+  /** Current name of a teammate's agent that used to be called `agent`. */
+  aliasesOf(handle: string, agent: string): string | undefined;
   /** Tool and host of a teammate's agent, from presence. */
   infoOf(handle: string, agent: string): { tool?: string; host?: string } | undefined;
   connected(): boolean;
@@ -156,8 +158,13 @@ export class Mailbox {
       "SELECT * FROM messages WHERE id LIKE ? ORDER BY id DESC LIMIT 2",
       `${key}%`,
     );
-    if (rows.length === 0)
-      throw notFound(`message "${idOrPrefix}" (ids are in agentlink log / inbox)`);
+    if (rows.length === 0) {
+      throw new AgentLinkError(
+        "not_found",
+        `no message "${idOrPrefix}" here (agentlink inbox and agentlink log show the ids you can use)`,
+        404,
+      );
+    }
     if (rows.length > 1) {
       throw invalid(`"${idOrPrefix}" matches several messages; use more characters of the id`);
     }
@@ -182,6 +189,29 @@ export class Mailbox {
       scope,
     );
     return Object.fromEntries(rows.map((r) => [r.kind, r.action]));
+  }
+
+  /**
+   * Addresses copied from peers may carry a session tag: "claude-web #7f3a" or "alice/codex-api#c01d"
+   * (the tag is dropped), or be just "#7f3a" (an agent on this machine).
+   */
+  #fromTag(input: string): string {
+    const m = /^\s*(\S*?)\s*#([a-z0-9]{1,8})\s*$/i.exec(input);
+    if (!m) return input;
+    const [, name, tag] = m as unknown as [string, string, string];
+    const t = tag.toLowerCase();
+    const local = this.#registry
+      .list({ includeOffline: true })
+      .find((a) => a.id.toLowerCase().endsWith(t));
+    if (!name) {
+      if (local) return local.name;
+      throw new AgentLinkError(
+        "not_found",
+        `no agent with session tag #${t}; see: agentlink peers`,
+        404,
+      );
+    }
+    return name;
   }
 
   #noSuchAgent(name: string): AgentLinkError {
@@ -224,6 +254,10 @@ export class Mailbox {
       }
       // Presence lists a teammate's agents; catch typos before anything waits on them.
       const theirs = remote.agentsOf(member);
+      if (agent && !theirs.includes(agent)) {
+        const renamed = remote.aliasesOf(member, agent);
+        if (renamed) agent = renamed;
+      }
       if (agent && theirs.length > 0 && !theirs.includes(agent)) {
         throw new AgentLinkError(
           "not_found",
@@ -255,7 +289,8 @@ export class Mailbox {
       } else throw invalid(`cannot route a reply to ${original.from_addr}`);
     }
 
-    for (const raw of to) {
+    for (const input of to) {
+      const raw = this.#fromTag(input);
       const spec = parseAddress(raw);
       switch (spec.kind) {
         case "name": {
@@ -491,7 +526,7 @@ export class Mailbox {
       !!original &&
       original.kind === "handoff" &&
       input.kind === "ack" &&
-      (input.ack === "accept" || input.ack === "decline") &&
+      input.ack === "accept" &&
       this.participants(this.envelopeOf(original)).length > 2;
     const authorFollowUp = !!original && !input.to?.length && this.#isAuthor(sender, original);
     if (input.replyAll || groupDecision || authorFollowUp) {
@@ -647,6 +682,8 @@ export class Mailbox {
     this.#ctx.events.publish({ type: "message", message: this.messageView(message) });
     for (const d of deliveries) this.#publishDelivery(d);
     if (original) this.#resolveReplyWaiters(original.id, message);
+    if (original && input.kind === "ack" && input.ack === "accept")
+      this.#settleHandoff(original, message);
     for (const r of recipients) this.#notifyInbox(r.human ? "human" : (r.agent?.id ?? ""));
 
     return {
@@ -752,7 +789,7 @@ export class Mailbox {
       const out: number[] = [];
       for (const addr of mine) {
         const human = addr.role === "human" || !addr.agent;
-        const agent = human ? undefined : this.#registry.byName(addr.agent as string);
+        const agent = human ? undefined : this.#registry.resolveName(addr.agent as string)?.agent;
         const theirAddr = human ? `@${this.handle}` : `${this.handle}/${addr.agent}`;
         if (!human && !agent) {
           receipts.push({
@@ -825,6 +862,8 @@ export class Mailbox {
     if (original) {
       for (const d of this.deliveriesOf(original.id)) this.#publishDelivery(d);
       this.#resolveReplyWaiters(original.id, message);
+      if (envelope.kind === "ack" && envelope.meta.ack === "accept")
+        this.#settleHandoff(original, message);
     }
     for (const d of deliveries) this.#notifyInbox(d.to_agent_id ?? "human");
     return {
@@ -846,6 +885,43 @@ export class Mailbox {
       `${handle}/%`,
     );
     if (res.changes > 0) for (const d of this.deliveriesOf(messageId)) this.#publishDelivery(d);
+  }
+
+  /**
+   * The handoff's author settles races: when a second accept arrives, the late acceptor is told
+   * who took it (the author's machine sees every accept).
+   */
+  #settleHandoff(original: MessageRow, accept: MessageRow): void {
+    if (original.kind !== "handoff") return;
+    const accepts = this.#ctx.store
+      .all<MessageRow>(
+        "SELECT * FROM messages WHERE reply_to = ? AND kind = 'ack' ORDER BY created_at, id",
+        original.id,
+      )
+      .filter((m) => this.envelopeOf(m).meta.ack === "accept");
+    const first = accepts[0];
+    if (!first || first.id === accept.id) return;
+    const text = `Automatic notice: ${first.from_addr} accepted this handoff before you (${original.id.slice(0, 12)} "${original.preview}"); it is theirs, so there is nothing for you to do.`;
+    const late = accept.from_agent_id ? this.#registry.byId(accept.from_agent_id) : undefined;
+    if (late) this.notify(late, text);
+    else if (accept.from_addr.includes("/") && this.remote) {
+      const handle = accept.from_addr.split("/")[0] as string;
+      const agent = accept.from_addr.split("/")[1] as string;
+      const author = original.from_agent_id
+        ? this.#registry.byId(original.from_agent_id)
+        : undefined;
+      const envelope = newEnvelope({
+        kind: "info",
+        from: author
+          ? { member: this.handle, agent: author.name, role: "agent" }
+          : { member: this.handle, role: "human" },
+        to: [{ member: handle, agent, role: "agent" }],
+        parts: [{ kind: "text", text }],
+        contextId: original.thread_id,
+        now: this.#ctx.now(),
+      });
+      this.remote.deliver(handle, envelope);
+    }
   }
 
   /** A teammate's daemon reports progress on a message we sent it. Never moves backwards. */
@@ -888,6 +964,21 @@ export class Mailbox {
     const updated = this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", d.id);
     if (updated) this.#publishDelivery(updated);
     this.#checkFailed(receipt.messageId);
+    if (["refused", "failed", "expired"].includes(receipt.state)) {
+      const message = this.#ctx.store.get<MessageRow>(
+        "SELECT * FROM messages WHERE id = ?",
+        receipt.messageId,
+      );
+      const author = message?.from_agent_id
+        ? this.#registry.byId(message.from_agent_id)
+        : undefined;
+      if (author && message) {
+        this.notify(
+          author,
+          `Your ${message.kind} ${message.id.slice(0, 12)} to ${receipt.to} was not delivered: ${receipt.state}${receipt.note ? ` (${receipt.note})` : ""}.`,
+        );
+      }
+    }
     return true;
   }
 
@@ -1073,13 +1164,31 @@ export class Mailbox {
         (p) => p !== item.delivery.to_addr && p !== item.message.from_addr,
       ),
       ...(env.from.role === "human" ? { fromHuman: true } : {}),
+      ...(env.from.role === "system" ? { fromSystem: true } : {}),
       ...(() => {
         if (!env.replyTo) return {};
-        const original = this.#ctx.store.get<{ preview: string }>(
-          "SELECT preview FROM messages WHERE id = ?",
+        const original = this.#ctx.store.get<MessageRow>(
+          "SELECT * FROM messages WHERE id = ?",
           env.replyTo,
         );
-        return original ? { replyToPreview: original.preview } : {};
+        if (!original) return {};
+        const readerIsAuthor = item.delivery.to_agent_id
+          ? original.from_agent_id === item.delivery.to_agent_id
+          : original.from_agent_id === null && original.from_addr === item.delivery.to_addr;
+        return {
+          replyToPreview: original.preview,
+          ...(readerIsAuthor ? {} : { replyToAuthor: original.from_addr }),
+        };
+      })(),
+      ...(() => {
+        if (env.kind !== "handoff") return {};
+        const taker = this.#ctx.store
+          .all<MessageRow>(
+            "SELECT * FROM messages WHERE reply_to = ? AND kind = 'ack'",
+            env.messageId,
+          )
+          .find((m) => this.envelopeOf(m).meta.ack === "accept");
+        return taker ? { takenBy: taker.from_addr } : {};
       })(),
     };
   }

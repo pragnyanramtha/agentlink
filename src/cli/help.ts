@@ -127,8 +127,10 @@ Show a message with its delivery receipts, or one attachment (--part N).
 
   thread: `agentlink thread <thread-or-message-id> [--allow N]
 
-Show a whole conversation. Threads between agents stop at 30 messages (loop guard);
---allow N lets one continue for N more (run it yourself, in a terminal).`,
+Show a whole conversation (any message id works). Loop guards stop a conversation at
+30 messages or 12 replies deep, with more room for groups (+10 messages and +4 depth
+per extra participant). --allow N lets it continue for N more on this machine; in a
+team, each machine's user decides for their own agents. Run it yourself, in a terminal.`,
 
   status: `agentlink status [<message-id>]
 
@@ -286,8 +288,8 @@ Drop a held message.`,
 
   mcp: `agentlink mcp
 
-Run the MCP server on stdio (tools: peers, ask, send, reply, ack, inbox, show, doing,
-claim, release). agentlink install registers it with your CLIs.`,
+Run the MCP server on stdio (tools: peers, whoami, ask, send, reply, ack, inbox, todo,
+thread, show, doing, claim, release). agentlink install registers it with your CLIs.`,
 
   hook: `agentlink hook <tool> <event> [json]
 

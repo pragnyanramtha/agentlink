@@ -58,8 +58,19 @@ function describeSend(res: SendResponse, waitMs: number): string {
 /** Error text for an MCP caller: point at tools, not CLI commands. */
 function forMcp(message: string): string {
   return message
-    .replace(/\(?(?:see|run):? agentlink (peers|inbox|log|team)( --all)?\)?/g, "(call the $1 tool)")
-    .replace(/agentlink (reply|ack|show|thread) /g, "the $1 tool with ");
+    .replace(
+      /;?\s*\(?(?:see|run):? agentlink (peers|inbox|log|team)( --all)?\)?/g,
+      "; call the $1 tool to see them",
+    )
+    .replace(
+      /\(agentlink inbox and agentlink log show the ids you can use\)/,
+      "(the inbox tool shows the ids you can use)",
+    )
+    .replace(
+      /answer it with agentlink reply, or confirm with agentlink ack \S+/,
+      'use the reply tool, or the ack tool with decision="processed"',
+    )
+    .replace(/agentlink (reply|ack|show|thread|todo) /g, "the $1 tool with ");
 }
 
 const recipients = z
@@ -143,7 +154,7 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
     {
       title: "Ask an agent",
       description:
-        "Ask another agent a question and wait for its answer (default 45s). If it does not answer in time, the answer is delivered to you later automatically.",
+        "Ask one or more agents a question and wait for the answers (default 45s here; the CLI waits 110s). With several recipients it waits for everyone. A late answer is delivered to you automatically.",
       inputSchema: {
         to: recipients,
         question: z.string().describe("The question; include the context the other agent needs"),

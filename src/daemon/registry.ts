@@ -289,6 +289,16 @@ export class Registry {
     return agent ? { agent, renamedFrom: name } : undefined;
   }
 
+  /** Names an agent had before renames (newest first). */
+  aliasesOf(agentId: string): string[] {
+    return this.#ctx.store
+      .all<{ name: string }>(
+        "SELECT name FROM agent_aliases WHERE agent_id = ? ORDER BY created_at DESC LIMIT 5",
+        agentId,
+      )
+      .map((r) => r.name);
+  }
+
   /** Re-checks a live agent's process right away (instead of waiting for the next sweep). */
   refreshLiveness(agent: AgentRow): AgentRow {
     if (isLive(agent) && agent.pid && !isAlive(agent.pid, agent.pid_start ?? undefined)) {
@@ -372,7 +382,7 @@ export class Registry {
     const fromTree = this.#fromChain(caller.chain);
     if (caller.verified) {
       if (caller.as) {
-        const target = this.require(caller.as);
+        const target = this.resolveName(caller.as)?.agent ?? this.require(caller.as);
         if (fromTree && fromTree.id !== target.id) {
           throw new AgentLinkError(
             "forbidden",

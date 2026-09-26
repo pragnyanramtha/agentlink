@@ -385,6 +385,75 @@ describe("team relay", () => {
     }
   }, 60_000);
 
+  it("keeps old names working across machines after a rename", async () => {
+    await registerAgent(bob, "codex-old");
+    await until(async () => {
+      const { agents } = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+      return agents.find((a) => a.name === "bob/codex-old");
+    }, 8_000);
+    await bob.client("codex-old").request("POST", "/v1/agents/rename", { name: "codex-new" });
+    await until(async () => {
+      const { agents } = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+      return agents.find((a) => a.name === "bob/codex-new");
+    }, 8_000);
+    const res = await alice.client("claude-web").request<SendRes>("POST", "/v1/messages", {
+      to: ["bob/codex-old"],
+      text: "still reachable under the old name?",
+    });
+    expect(res.deliveries[0]?.to).toBe("bob/codex-new");
+    const got = await until(async () => {
+      const r = await bob
+        .client("codex-new")
+        .request<{ items: { text: string }[] }>("GET", "/v1/inbox?all=1");
+      return r.items.find((i) => i.text === "still reachable under the old name?");
+    }, 8_000);
+    expect(got).toBeTruthy();
+  });
+
+  it("a teammate's denial reaches the agent that sent the request", async () => {
+    await bob.raw(
+      "POST",
+      "/v1/policy",
+      { scope: "teammate", kind: "request", action: "hold" },
+      { tty: true },
+    );
+    const res = await alice.client("claude-web").request<SendRes>("POST", "/v1/messages", {
+      to: [bobAgentName],
+      kind: "request",
+      text: "please deploy to prod",
+    });
+    const held = await until(async () => {
+      const r = await bob.raw<{ items: { delivery: { id: number } }[] }>(
+        "GET",
+        "/v1/approvals",
+        undefined,
+        { tty: true },
+      );
+      return r.data.items[0];
+    }, 8_000);
+    await bob.raw(
+      "POST",
+      `/v1/approvals/${held?.delivery.id}`,
+      { decision: "deny" },
+      { tty: true },
+    );
+    const notice = await until(async () => {
+      const r = await alice
+        .client("claude-web")
+        .request<{ items: { text: string }[] }>("GET", "/v1/inbox");
+      return r.items.find(
+        (i) => i.text.includes(res.message.id.slice(0, 12)) && i.text.includes("refused"),
+      );
+    }, 8_000);
+    expect(notice).toBeTruthy();
+    await bob.raw(
+      "POST",
+      "/v1/policy",
+      { scope: "teammate", kind: "request", action: "deliver" },
+      { tty: true },
+    );
+  });
+
   it("rejects unknown team members and needs a team for team addresses", async () => {
     const res = await alice.raw(
       "POST",

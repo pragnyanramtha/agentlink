@@ -95,6 +95,7 @@ export class TeamManager {
           stateAt: a.state_at,
           reach: this.#reach(a),
           sid: a.id.slice(-4).toLowerCase(),
+          aliases: this.#registry.aliasesOf(a.id),
         }));
     this.#client = client;
     this.#mailbox.remote = {
@@ -107,6 +108,9 @@ export class TeamManager {
       },
       connected: () => client.connected,
       handles: () => client.handles().filter((h) => h !== team.handle),
+      aliasesOf: (handle, agent) =>
+        client.remoteAgents().find((a) => a.member === handle && (a.aliases ?? []).includes(agent))
+          ?.name,
       agentsOf: (handle) =>
         client
           .remoteAgents()

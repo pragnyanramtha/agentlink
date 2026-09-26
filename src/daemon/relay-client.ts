@@ -56,6 +56,8 @@ export interface RemoteAgent {
   host?: string;
   /** Short session tag (last characters of its id on its own machine). */
   sid?: string;
+  /** Names it had before a rename (still accepted as addresses). */
+  aliases?: string[];
   at: string;
 }
 
@@ -317,6 +319,13 @@ export class RelayClient {
                 ...(safeField(a.reach, 40) ? { reach: safeField(a.reach, 40) as string } : {}),
                 ...(typeof a.sid === "string" && /^[a-z0-9]{1,8}$/.test(a.sid)
                   ? { sid: a.sid }
+                  : {}),
+                ...(Array.isArray(a.aliases)
+                  ? {
+                      aliases: (a.aliases as unknown[])
+                        .filter((x): x is string => typeof x === "string" && NAME_RE.test(x))
+                        .slice(0, 5),
+                    }
                   : {}),
                 member: member.handle,
                 deviceId: frame.deviceId,
