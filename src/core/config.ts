@@ -1,6 +1,5 @@
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { userInfo } from "node:os";
+import { hostname, userInfo } from "node:os";
 import { dirname } from "node:path";
 import { z } from "zod";
 import { slugify } from "./addr.ts";
@@ -22,20 +21,15 @@ export const ConfigSchema = z.object({
 });
 export type Config = z.infer<typeof ConfigSchema>;
 
+/** Short host name, e.g. "orin" for "orin.local"; how this machine appears to teammates. */
+export function machineName(): string {
+  return slugify(hostname().split(".")[0] ?? "", 24);
+}
+
+/** Default handle for a new install: the machine's short host name (handles are per device). */
 export function defaultHandle(): string {
-  let name: string | undefined;
-  try {
-    name = execFileSync("git", ["config", "--global", "user.name"], {
-      encoding: "utf8",
-      timeout: 1_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-      .trim()
-      .split(/\s+/)[0];
-  } catch {
-    // git missing or unset
-  }
-  return slugify(name || userInfo().username || "me", 24);
+  const host = machineName();
+  return host !== "x" ? host : slugify(userInfo().username || "me", 24);
 }
 
 export function loadConfig(paths: Paths): Config {

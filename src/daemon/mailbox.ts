@@ -78,6 +78,10 @@ export type WaitOutcome =
 /** How the mailbox reaches teammates (implemented by the relay client). */
 export interface RemoteRouter {
   teamName: string;
+  /** This device's handle in the team (how teammates address this machine). */
+  selfHandle: string;
+  /** Tool and host of a teammate's agent, from presence. */
+  infoOf(handle: string, agent: string): { tool?: string; host?: string } | undefined;
   connected(): boolean;
   handles(): string[];
   agentsOf(handle: string): string[];
@@ -957,13 +961,19 @@ export class Mailbox {
     const author = item.message.from_agent_id
       ? this.#registry.byId(item.message.from_agent_id)
       : undefined;
+    const remoteInfo =
+      !author && env.from.role === "agent" && env.from.agent
+        ? this.remote?.infoOf(env.from.member, env.from.agent)
+        : undefined;
     const fromLabel = author
       ? `${toolLabel(author.tool)} session "${author.name}"`
       : env.from.role === "system"
         ? "agentlink"
         : env.from.role === "human"
           ? env.from.member
-          : formatAddr(env.from, this.handle);
+          : remoteInfo
+            ? `${remoteInfo.tool ? `${toolLabel(remoteInfo.tool)} session` : "agent"} "${env.from.agent}" on ${env.from.member}${remoteInfo.host ? ` (${remoteInfo.host})` : ""}`
+            : formatAddr(env.from, this.handle);
     const attachments = env.parts
       .map((p, i) => ({ p, i }))
       .filter(({ p }) => p.kind !== "text")

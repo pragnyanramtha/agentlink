@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { hostname } from "node:os";
 import { z } from "zod";
 import { loadConfig } from "../core/config.ts";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
@@ -187,9 +188,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     agents: registry.list().length,
   }));
 
+  // How this machine is addressed by teammates (its team handle), plus its host name.
+  const selfHandle = () => mailbox.remote?.selfHandle ?? ctx.config.handle;
   route("GET", "/v1/whoami", (req) => ({
-    agent: req.agent ? agentView(req.agent) : null,
-    handle: ctx.config.handle,
+    agent: req.agent
+      ? { ...agentView(req.agent), address: `${selfHandle()}/${req.agent.name}` }
+      : null,
+    handle: selfHandle(),
+    host: hostname(),
+    team: mailbox.remote?.teamName ?? null,
     paused: mailbox.paused,
   }));
 
@@ -249,6 +256,9 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     const all = req.query.get("all") === "1";
     const local = registry.list({ includeOffline: all }).map((a) => ({
       ...agentView(a),
+      address: `${selfHandle()}/${a.name}`,
+      host: hostname(),
+      local: true,
       wakeVia: engine.delivererFor(a)?.id ?? null,
     }));
     const remote = (s.team.client?.remoteAgents() ?? [])
@@ -267,9 +277,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         muted: false,
         capabilities: {},
         reach: a.reach ?? null,
+        address: `${a.member}/${a.name}`,
+        host: a.host ?? null,
         local: false,
       }));
-    return { agents: [...local, ...remote], paused: mailbox.paused };
+    return {
+      agents: [...local, ...remote],
+      paused: mailbox.paused,
+      you: { handle: selfHandle(), host: hostname() },
+    };
   });
 
   // ------------------------------------------------------------------ team (relay)

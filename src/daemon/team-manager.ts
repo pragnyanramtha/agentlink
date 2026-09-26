@@ -98,6 +98,11 @@ export class TeamManager {
     this.#client = client;
     this.#mailbox.remote = {
       teamName: team.teamName,
+      selfHandle: team.handle,
+      infoOf: (handle, agent) => {
+        const a = client.remoteAgents().find((r) => r.member === handle && r.name === agent);
+        return a ? { tool: a.tool, ...(a.host ? { host: a.host } : {}) } : undefined;
+      },
       connected: () => client.connected,
       handles: () => client.handles().filter((h) => h !== team.handle),
       agentsOf: (handle) =>
@@ -202,7 +207,10 @@ export class TeamManager {
         connected: client?.connected ?? false,
         device: { id: keys.deviceId, fingerprint: fingerprint(keys.signPub) },
       },
-      members: client?.members() ?? [],
+      members: (client?.members() ?? []).map((m) => ({
+        ...m,
+        host: m.self ? hostname() : (client?.hostOf(m.deviceId) ?? m.deviceName ?? null),
+      })),
       agents: client?.remoteAgents() ?? [],
     };
   }

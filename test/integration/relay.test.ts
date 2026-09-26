@@ -70,6 +70,26 @@ afterAll(async () => {
 });
 
 describe("team relay", () => {
+  it("shows full addresses and host names for every agent", async () => {
+    const { hostname } = await import("node:os");
+    const { agents } = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+    const mine = agents.find((a) => a.name === "claude-web");
+    expect(mine?.address).toBe("alice/claude-web");
+    expect(mine?.host).toBe(hostname());
+    const theirs = await until(async () => {
+      const r = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+      const a = r.agents.find((x) => x.name === bobAgentName);
+      return a?.host ? a : undefined;
+    }, 8_000);
+    expect(theirs?.address).toBe("bob/codex-api");
+    expect(theirs?.host).toBe(hostname());
+    const who = await alice
+      .client("claude-web")
+      .request<{ agent: { address: string }; host: string }>("GET", "/v1/whoami");
+    expect(who.agent.address).toBe("alice/claude-web");
+    expect(who.host).toBe(hostname());
+  });
+
   it("both members see each other with fingerprints; invites are single-use", async () => {
     const status = await bob
       .client()

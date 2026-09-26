@@ -1,3 +1,4 @@
+import { hostname } from "node:os";
 import { WebSocket } from "ws";
 import {
   type DeviceKeys,
@@ -48,6 +49,8 @@ export interface RemoteAgent {
   stateAt?: string;
   /** How messages reach it on its own machine, e.g. "wake,mid-turn". */
   reach?: string;
+  /** Host name of the machine it runs on. */
+  host?: string;
   at: string;
 }
 
@@ -72,7 +75,10 @@ export class RelayClient {
   readonly #team: TeamState;
   readonly #keys: DeviceKeys;
   readonly #members = new Map<string, RemoteMember>();
-  readonly #presence = new Map<string, { handle: string; agents: RemoteAgent[]; at: string }>();
+  readonly #presence = new Map<
+    string,
+    { handle: string; agents: RemoteAgent[]; at: string; host?: string }
+  >();
   readonly #online = new Set<string>();
   readonly #waiters = new Map<string, (f: ServerFrame) => void>();
   #ws: WebSocket | undefined;
@@ -136,6 +142,11 @@ export class RelayClient {
     }));
   }
 
+  /** Host name a device last reported, falling back to the name in its member record. */
+  hostOf(deviceId: string): string | undefined {
+    return this.#presence.get(deviceId)?.host ?? this.#members.get(deviceId)?.deviceName;
+  }
+
   handles(): string[] {
     return [...new Set(this.members().map((m) => m.handle))];
   }
@@ -171,7 +182,7 @@ export class RelayClient {
       deviceId: this.#keys.deviceId,
       signPub: this.#keys.signPub,
       boxPub: this.#keys.boxPub,
-      deviceName: this.#ctx.config.handle,
+      deviceName: hostname().slice(0, 64),
       joinedAt: this.#team.joinedAt,
     };
     return { record, mac: teamMac(this.#team.teamKey, record) };
@@ -272,15 +283,19 @@ export class RelayClient {
             ),
           ) as {
             agents: Omit<RemoteAgent, "member" | "deviceId" | "at">[];
+            host?: string;
           };
+          const host = typeof p.host === "string" ? p.host.slice(0, 64) : undefined;
           this.#presence.set(frame.deviceId, {
             handle: member.handle,
             at: frame.at,
+            ...(host ? { host } : {}),
             agents: p.agents.slice(0, 100).map((a) => ({
               ...a,
               member: member.handle,
               deviceId: frame.deviceId,
               at: frame.at,
+              ...(host ? { host } : {}),
             })),
           });
           this.onRoster?.();
@@ -478,7 +493,7 @@ export class RelayClient {
       const agents = this.presenceSource();
       const box = teamEncrypt(
         this.#team.teamKey,
-        Buffer.from(JSON.stringify({ agents })),
+        Buffer.from(JSON.stringify({ agents, host: hostname() })),
         `presence|${this.#keys.deviceId}`,
       );
       this.#ws?.send(JSON.stringify({ t: "presence", box }));

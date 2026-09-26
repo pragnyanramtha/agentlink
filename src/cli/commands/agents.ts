@@ -1,4 +1,5 @@
 import { ancestry, detectTool, findToolProcess, procInfo } from "../../core/proc.ts";
+import { toolLabel } from "../../daemon/types.ts";
 import { type Command, out, parse, parseDuration, UsageError } from "../args.ts";
 import { ago, c, stateColor, table } from "../format.ts";
 
@@ -34,14 +35,24 @@ export const whoami: Command = async (ctx) => {
   parse(ctx.argv, {});
   await ctx.client.ensureDaemon();
   const res = await ctx.client.request<{
-    agent: AgentView | null;
+    agent: (AgentView & { address?: string }) | null;
     handle: string;
+    host: string;
+    team: string | null;
     paused: boolean;
   }>("GET", "/v1/whoami");
+  const paused = res.paused ? c.yellow(" · agentlink is paused") : "";
   out(ctx, res, () =>
     res.agent
-      ? `${c.bold(res.agent.name)} (${res.agent.tool}, ${stateColor(res.agent.state)}) · owner @${res.handle}${res.paused ? c.yellow(" · agentlink is paused") : ""}`
-      : `@${res.handle} (human, not inside an agent session)${res.paused ? c.yellow(" · agentlink is paused") : ""}`,
+      ? [
+          `${c.bold(res.agent.name)} (${toolLabel(res.agent.tool)}, ${stateColor(res.agent.state)}) on ${c.bold(res.host)}${paused}`,
+          c.dim(
+            res.team
+              ? `  agents on other machines in team ${res.team} reach it as ${res.agent.address}`
+              : `  address ${res.agent.address} (used once this machine joins a team)`,
+          ),
+        ].join("\n")
+      : `@${res.handle} on ${c.bold(res.host)} (human, not inside an agent session)${paused}`,
   );
   return 0;
 };
@@ -73,6 +84,7 @@ export const peers: Command = async (ctx) => {
     return table(
       res.agents.map((a) => [
         c.bold(a.name) + (who.agent?.id === a.id ? c.dim(" (you)") : ""),
+        (a as { host?: string | null }).host ?? "-",
         a.tool,
         stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
         reach(a),
@@ -81,7 +93,7 @@ export const peers: Command = async (ctx) => {
         a.status ?? "",
         c.dim(ago(a.state === "busy" || a.state === "idle" ? a.stateAt : a.lastSeenAt)),
       ]),
-      ["NAME", "TOOL", "STATE", "REACH", "REPO", "BRANCH", "DOING", "SINCE"],
+      ["NAME", "HOST", "TOOL", "STATE", "REACH", "REPO", "BRANCH", "DOING", "SINCE"],
     );
   }
 };
