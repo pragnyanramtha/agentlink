@@ -1,13 +1,22 @@
 import { hostname } from "node:os";
 import { slugify } from "../core/addr.ts";
+import { defaultRelay } from "../core/config.ts";
 import { fingerprint, newTeamKey, randomToken } from "../core/crypto.ts";
 import { invalid } from "../core/errors.ts";
+import {
+  codeId,
+  INVITE_CODE_RE,
+  newInviteCode,
+  normalizeCode,
+  openInvite,
+  sealInvite,
+} from "../core/invite-code.ts";
 import { decodeInvite, encodeInvite } from "../relay/protocol.ts";
 import type { DaemonContext } from "./context.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import { type Mailbox, remoteHandleOf } from "./mailbox.ts";
 import { isLive, type Registry } from "./registry.ts";
-import { RelayClient } from "./relay-client.ts";
+import { fetchCode, RelayClient } from "./relay-client.ts";
 import { clearTeam, deviceKeys, loadTeam, saveTeam, type TeamState } from "./team.ts";
 import {
   type AgentRow,
@@ -223,13 +232,13 @@ export class TeamManager {
 
   async create(
     name: string,
-    relay: string,
+    relay: string | undefined,
     handle?: string,
     createToken?: string,
   ): Promise<Record<string, unknown>> {
     if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
     const team: TeamState = {
-      relay: normalizeRelay(relay),
+      relay: normalizeRelay(relay ?? defaultRelay(this.#ctx.config)),
       teamId: `${slugify(name, 24)}-${randomToken(6)
         .toLowerCase()
         .replace(/[^a-z0-9]/g, "")}`.slice(0, 48),
@@ -244,14 +253,27 @@ export class TeamManager {
     return this.status();
   }
 
-  async invite(uses: number, ttlMs: number): Promise<string> {
+  /**
+   * A long invite (al1…, self-contained) and, unless disabled, a short code for the same invite
+   * that the relay hands out once (sealed under a key derived from the code).
+   */
+  async invite(
+    uses: number,
+    ttlMs: number,
+    opts: { code?: boolean; codeTtlMs?: number } = {},
+  ): Promise<{
+    invite: string;
+    code?: string;
+    codeExpiresAt?: string;
+    relay: string;
+    communityRelay: boolean;
+  }> {
     const team = loadTeam(this.#ctx.paths);
-    if (!team || !this.#client)
-      throw invalid("not in a team (agentlink team create <name> --relay <url>)");
+    if (!team || !this.#client) throw invalid("not in a team (agentlink team create <name>)");
     if (!team.admin) throw invalid("only the team admin can create invites");
     const token = await this.#client.invite(uses, ttlMs);
     const keys = deviceKeys(this.#ctx.paths);
-    return encodeInvite({
+    const invite = encodeInvite({
       v: 1,
       relay: team.relay,
       teamId: team.teamId,
@@ -260,6 +282,18 @@ export class TeamManager {
       teamKey: team.teamKey,
       by: { handle: team.handle, fingerprint: fingerprint(keys.signPub) },
     });
+    const base = {
+      invite,
+      relay: team.relay,
+      communityRelay: team.relay === defaultRelay(this.#ctx.config),
+    };
+    if (opts.code === false) return base;
+    const code = newInviteCode();
+    const codeExpiresAt = new Date(
+      Date.now() + Math.min(opts.codeTtlMs ?? 15 * 60_000, ttlMs),
+    ).toISOString();
+    await this.#client.putCode(codeId(code), sealInvite(code, invite), codeExpiresAt);
+    return { ...base, code, codeExpiresAt };
   }
 
   /** `relay` overrides the invite's address (same relay, reached differently, e.g. via a tunnel). */
@@ -269,6 +303,18 @@ export class TeamManager {
     relay?: string,
   ): Promise<Record<string, unknown>> {
     if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
+    // A short code is redeemed at the relay (once) for the full invite.
+    if (INVITE_CODE_RE.test(normalizeCode(inviteText))) {
+      const code = normalizeCode(inviteText);
+      const at = normalizeRelay(relay ?? defaultRelay(this.#ctx.config));
+      const box = await fetchCode(at, codeId(code)).catch((error: Error) => {
+        throw invalid(
+          `${error.message}${relay ? "" : ` (if the team uses another relay: --relay <url>)`}`,
+        );
+      });
+      inviteText = openInvite(code, box);
+      relay = at;
+    }
     let invite: ReturnType<typeof decodeInvite>;
     try {
       invite = decodeInvite(inviteText);

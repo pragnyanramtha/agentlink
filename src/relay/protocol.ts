@@ -66,6 +66,15 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
   z.object({ t: z.literal("presence"), box: TeamBoxSchema }),
   z.object({ t: z.literal("remove"), deviceId: z.string() }),
   z.object({ t: z.literal("ping") }),
+  // Short invite codes: a member stores the invite sealed under a code-derived key; anyone may
+  // fetch it once by the code-derived id (no auth), after which the relay deletes it.
+  z.object({
+    t: z.literal("code_put"),
+    id: z.string().min(16).max(64),
+    box: TeamBoxSchema,
+    expiresAt: z.string(),
+  }),
+  z.object({ t: z.literal("code_get"), id: z.string().min(16).max(64) }),
 ]);
 export type ClientFrame = z.infer<typeof ClientFrameSchema>;
 
@@ -86,6 +95,7 @@ export type ServerFrame =
   | { t: "sent"; id: string; queued: boolean }
   | { t: "ok"; op: string }
   | { t: "pong" }
+  | { t: "code"; box: z.infer<typeof TeamBoxSchema> }
   | { t: "error"; code: string; message: string; ref?: string };
 
 /** The part of a hello/create/join frame covered by the device signature. */

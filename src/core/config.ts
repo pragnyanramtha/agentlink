@@ -9,6 +9,8 @@ import type { Paths } from "./paths.ts";
 export const ConfigSchema = z.object({
   /** This machine's owner handle, e.g. "pragnyan". Used in team addresses (handle/agent). */
   handle: z.string().min(1),
+  /** Relay used when a command needs one and none is given (team create, short invite codes). */
+  relay: z.string().optional(),
   wake: z
     .object({
       policy: z.enum(["asks", "never", "always"]).default("asks"),
@@ -50,4 +52,11 @@ export function saveConfig(paths: Paths, config: Config): void {
   const tmp = `${paths.config}.tmp`;
   writeFileSync(tmp, `${JSON.stringify(ConfigSchema.parse(config), null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, paths.config);
+}
+
+/** The public community relay; override with config "relay" or AGENTLINK_RELAY. */
+export const COMMUNITY_RELAY = "wss://116-203-46-74.sslip.io";
+
+export function defaultRelay(config: Pick<Config, "relay">): string {
+  return process.env.AGENTLINK_RELAY || config.relay || COMMUNITY_RELAY;
 }

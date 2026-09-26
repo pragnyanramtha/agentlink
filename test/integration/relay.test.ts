@@ -454,6 +454,34 @@ describe("team relay", () => {
     );
   });
 
+  it("joins with a short invite code, which works only once", async () => {
+    const res = await alice
+      .client()
+      .request<{ code: string; invite: string }>("POST", "/v1/team/invite", { uses: 1 });
+    expect(res.code).toMatch(/^[a-z]+-[a-z]+-[a-z]+-[a-z]+-\d{2}$/);
+    const dave = await startTestDaemon({ handle: "dave" });
+    const eve = await startTestDaemon({ handle: "eve" });
+    try {
+      const joined = await dave.raw<{ team: { name: string; handle: string } }>(
+        "POST",
+        "/v1/team/join",
+        {
+          invite: res.code,
+          relay: relay.url,
+        },
+      );
+      expect(joined.status).toBe(200);
+      expect(joined.data.team.handle).toBe("dave");
+      const again = await eve.raw("POST", "/v1/team/join", { invite: res.code, relay: relay.url });
+      expect(again.status).toBe(400);
+      expect(JSON.stringify(again.data)).toContain("no such invite code");
+    } finally {
+      await dave.raw("POST", "/v1/team/leave", {});
+      await dave.stop();
+      await eve.stop();
+    }
+  }, 30_000);
+
   it("rejects unknown team members and needs a team for team addresses", async () => {
     const res = await alice.raw(
       "POST",

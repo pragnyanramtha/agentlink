@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS presence (
   PRIMARY KEY (team_id, device_id)
 );
 CREATE TABLE IF NOT EXISTS seen_nonces (nonce TEXT PRIMARY KEY, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS codes (
+  id TEXT PRIMARY KEY, team_id TEXT NOT NULL, box TEXT NOT NULL, expires_at TEXT NOT NULL
+);
 `;
 
 const QUEUE_TTL_MS = 7 * 24 * 3600_000;
@@ -47,6 +50,11 @@ const RATE_PER_MINUTE = 600;
 const FRAMES_PER_MINUTE = 1_200;
 const BYTES_PER_MINUTE = 50 * 1024 * 1024;
 const MAX_PRESENCE_BYTES = 64 * 1024;
+// Quotas for a public relay (anyone may create a team).
+const MAX_TEAMS = 10_000;
+const MAX_DEVICES_PER_TEAM = 100;
+const MAX_QUEUE_BYTES_PER_TEAM = 500 * 1024 * 1024;
+const TEAMS_PER_IP_PER_HOUR = 5;
 
 interface Conn {
   ws: WebSocket;
@@ -56,6 +64,9 @@ interface Conn {
   minute: number;
   framesThisMinute: number;
   bytesThisMinute: number;
+  codeTries: number;
+  /** Client address (from X-Forwarded-For when a local reverse proxy is in front). */
+  ip: string;
 }
 
 export interface RelayOptions {
@@ -93,6 +104,20 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const one = <T>(sql: string, ...p: (string | number | null)[]) =>
     db.prepare(sql).get(...p) as T | undefined;
   const run = (sql: string, ...p: (string | number | null)[]) => db.prepare(sql).run(...p);
+
+  // Per-IP budgets for unauthenticated or costly operations (reset every minute / hour).
+  const buckets = new Map<string, { at: number; n: number }>();
+  const budget = (key: string, max: number, windowMs: number): boolean => {
+    const now = Date.now();
+    const b = buckets.get(key);
+    if (!b || now - b.at > windowMs) {
+      buckets.set(key, { at: now, n: 1 });
+      if (buckets.size > 50_000) buckets.clear();
+      return true;
+    }
+    return ++b.n <= max;
+  };
+  const codeBudget = (ip: string) => budget(`code:${ip}`, 20, 60_000);
 
   const send = (c: Conn, frame: ServerFrame) => {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(frame));
@@ -166,6 +191,29 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const handle = (c: Conn, frame: ClientFrame) => {
     const now = new Date().toISOString();
     if (frame.t === "ping") return send(c, { t: "pong" });
+    if (frame.t === "code_get") {
+      // Unauthenticated by design (the joiner has only the code): few tries per connection and IP.
+      if (++c.codeTries > 5 || !codeBudget(c.ip)) {
+        return send(c, {
+          t: "error",
+          code: "rate",
+          message: "too many invite code attempts; wait a minute",
+        });
+      }
+      const row = one<{ box: string }>(
+        "SELECT box FROM codes WHERE id = ? AND expires_at > ?",
+        frame.id,
+        now,
+      );
+      if (!row)
+        return send(c, {
+          t: "error",
+          code: "invite",
+          message: "no such invite code, or it expired or was used",
+        });
+      run("DELETE FROM codes WHERE id = ?", frame.id);
+      return send(c, { t: "code", box: JSON.parse(row.box) });
+    }
     if (frame.t === "hello") {
       const dev = one<{ sign_pub: string }>(
         "SELECT sign_pub FROM devices WHERE team_id = ? AND device_id = ? AND removed_at IS NULL",
@@ -224,6 +272,20 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
             message: "this relay needs a create token to start a team (team create --create-token)",
           });
         }
+        if (!budget(`create:${c.ip}`, TEAMS_PER_IP_PER_HOUR, 3600_000)) {
+          return send(c, {
+            t: "error",
+            code: "rate",
+            message: "too many new teams from your address; try again later",
+          });
+        }
+        if ((one<{ n: number }>("SELECT COUNT(*) AS n FROM teams")?.n ?? 0) >= MAX_TEAMS) {
+          return send(c, {
+            t: "error",
+            code: "full",
+            message: "this relay is not accepting new teams",
+          });
+        }
         if (one("SELECT 1 FROM teams WHERE id = ?", frame.teamId)) {
           return send(c, { t: "error", code: "exists", message: "team already exists" });
         }
@@ -234,6 +296,18 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
           frame.teamId,
           sha256(frame.token),
         );
+        const members =
+          one<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM devices WHERE team_id = ? AND removed_at IS NULL",
+            frame.teamId,
+          )?.n ?? 0;
+        if (members >= MAX_DEVICES_PER_TEAM) {
+          return send(c, {
+            t: "error",
+            code: "full",
+            message: `this team already has ${members} devices (the limit)`,
+          });
+        }
         if (!inv || inv.uses_left < 1 || inv.expires_at < now) {
           return send(c, {
             t: "error",
@@ -332,7 +406,14 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
             teamId,
             frame.to,
           )?.b ?? 0;
-        if (queued >= MAX_QUEUE_PER_DEVICE || queuedBytes >= MAX_QUEUE_BYTES_PER_DEVICE) {
+        const teamBytes =
+          one<{ b: number | null }>("SELECT SUM(bytes) AS b FROM queue WHERE team_id = ?", teamId)
+            ?.b ?? 0;
+        if (
+          queued >= MAX_QUEUE_PER_DEVICE ||
+          queuedBytes >= MAX_QUEUE_BYTES_PER_DEVICE ||
+          teamBytes >= MAX_QUEUE_BYTES_PER_TEAM
+        ) {
           return send(c, {
             t: "error",
             code: "full",
@@ -356,6 +437,29 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         for (const t of targets)
           send(t, { t: "msg", id, from: c.deviceId, blob: frame.blob, at: now });
         return send(c, { t: "sent", id: frame.id, queued: targets.length === 0 });
+      }
+      case "code_put": {
+        const active = one<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM codes WHERE team_id = ? AND expires_at > ?",
+          teamId,
+          now,
+        )?.n;
+        if ((active ?? 0) >= 20) {
+          return send(c, {
+            t: "error",
+            code: "full",
+            message: "too many open invite codes for this team",
+          });
+        }
+        const maxExpiry = new Date(Date.now() + 24 * 3600_000).toISOString();
+        run(
+          "INSERT OR REPLACE INTO codes (id, team_id, box, expires_at) VALUES (?, ?, ?, ?)",
+          frame.id,
+          teamId,
+          JSON.stringify(frame.box),
+          frame.expiresAt < maxExpiry ? frame.expiresAt : maxExpiry,
+        );
+        return send(c, { t: "ok", op: "code_put" });
       }
       case "ack": {
         for (const id of frame.ids)
@@ -418,8 +522,22 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     res.end("agentlink relay: connect with a WebSocket client (agentlink team join)\n");
   });
   const wss = new WebSocketServer({ server: http, maxPayload: MAX_FRAME_BYTES });
-  wss.on("connection", (ws) => {
-    const c: Conn = { ws, sentThisMinute: 0, minute: 0, framesThisMinute: 0, bytesThisMinute: 0 };
+  wss.on("connection", (ws, req) => {
+    const direct = req.socket.remoteAddress ?? "";
+    const fromProxy = direct === "127.0.0.1" || direct === "::1" || direct === "::ffff:127.0.0.1";
+    const forwarded = String(req.headers["x-forwarded-for"] ?? "")
+      .split(",")
+      .pop()
+      ?.trim();
+    const c: Conn = {
+      ws,
+      sentThisMinute: 0,
+      minute: 0,
+      framesThisMinute: 0,
+      bytesThisMinute: 0,
+      codeTries: 0,
+      ip: fromProxy && forwarded ? forwarded : direct,
+    };
     conns.add(c);
     ws.on("message", (data) => {
       const minute = Math.floor(Date.now() / 60_000);
@@ -466,6 +584,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     const cutoff = new Date(Date.now() - QUEUE_TTL_MS).toISOString();
     run("DELETE FROM queue WHERE at < ?", cutoff);
     run("DELETE FROM seen_nonces WHERE at < ?", Date.now() - 2 * CLOCK_SKEW_MS);
+    run("DELETE FROM codes WHERE expires_at < ?", new Date().toISOString());
   }, 60_000);
   gc.unref();
 

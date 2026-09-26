@@ -101,9 +101,9 @@ export const team: Command = async (ctx) => {
         "create-token": { type: "string" },
       });
       const [name] = positionals;
-      if (!name || !values.relay) {
+      if (!name) {
         throw new UsageError(
-          "usage: agentlink team create <name> --relay ws://<host>:7700 [--handle <you>]",
+          "usage: agentlink team create <name> [--relay <url>] [--handle <you>]",
         );
       }
       await ctx.client.ensureDaemon();
@@ -112,7 +112,7 @@ export const team: Command = async (ctx) => {
         "/v1/team/create",
         {
           name,
-          relay: values.relay,
+          ...(values.relay ? { relay: values.relay } : {}),
           ...(values.handle ? { handle: values.handle } : {}),
           ...(values["create-token"] ? { createToken: values["create-token"] } : {}),
         },
@@ -132,6 +132,7 @@ export const team: Command = async (ctx) => {
       const { values } = parse(sub2.argv, {
         uses: { type: "string", default: "1" },
         ttl: { type: "string", default: "24h" },
+        "no-code": { type: "boolean" },
       });
       const ttlMs = parseDuration(String(values.ttl), 24 * 3600_000, "h");
       if (!(ttlMs > 0))
@@ -140,19 +141,30 @@ export const team: Command = async (ctx) => {
       if (!Number.isInteger(uses) || uses < 1 || uses > 100)
         throw new UsageError("--uses must be a whole number from 1 to 100");
       await ctx.client.ensureDaemon();
-      const res = await ctx.client.request<{ invite: string }>("POST", "/v1/team/invite", {
-        uses: Number(values.uses),
-        ttlMs,
-      });
+      const res = await ctx.client.request<{
+        invite: string;
+        code?: string;
+        codeExpiresAt?: string;
+        relay: string;
+        communityRelay: boolean;
+      }>("POST", "/v1/team/invite", { uses: Number(values.uses), ttlMs, code: !values["no-code"] });
+      const relayFlag = res.communityRelay ? "" : ` --relay ${res.relay}`;
+      const minutes = Math.round((Date.parse(res.codeExpiresAt ?? "") - Date.now()) / 60_000);
+      const long = `valid ${values.ttl}, ${values.uses} use${values.uses === "1" ? "" : "s"}`;
       out(ctx, res, () =>
         [
-          `${c.green("✓")} invite (valid ${values.ttl}, ${values.uses} use${values.uses === "1" ? "" : "s"}). Send it over a private channel:`,
+          res.code
+            ? `${c.green("✓")} invite code (one use, expires in ${minutes} min):`
+            : `${c.green("✓")} invite (${long}):`,
           "",
-          res.invite,
+          `    ${c.bold(res.code ?? res.invite)}`,
           "",
-          c.dim("They run: agentlink team join <invite>"),
+          `They run: ${c.bold(`agentlink team join ${res.code ? `${res.code}${relayFlag}` : "<invite>"}`)}`,
+          ...(res.code
+            ? ["", c.dim(`Long form (${long}, carries the relay address):`), c.dim(res.invite)]
+            : []),
           c.yellow(
-            "Anyone with this invite can join and read team messages: treat it like a password.",
+            "Anyone with this code or invite can join and read team messages: share it privately.",
           ),
         ].join("\n"),
       );
@@ -168,14 +180,13 @@ export const team: Command = async (ctx) => {
         throw new UsageError(
           "usage: agentlink team join <invite> [--handle <you>] [--relay <url>]",
         );
-      if (
-        !invite
-          .trim()
-          .replace(/^agentlink:\/\/join\//, "")
-          .startsWith("al1.")
-      ) {
+      const trimmed = invite
+        .trim()
+        .toLowerCase()
+        .replace(/^agentlink:\/\/join\//, "");
+      if (!trimmed.startsWith("al1.") && !/^[a-z]+-[a-z]+-[a-z]+-[a-z]+-\d{2}$/.test(trimmed)) {
         throw new UsageError(
-          "that is not an agentlink invite; invites start with al1. (get one with: agentlink team invite)",
+          "that is not an agentlink invite: use the code (like tiger-lamp-orbit-sun-42) or the al1.… string from agentlink team invite",
         );
       }
       await ctx.client.ensureDaemon();

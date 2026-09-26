@@ -316,7 +316,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     const body = z
       .object({
         name: z.string().min(1),
-        relay: z.string().min(1),
+        relay: z.string().min(1).optional(),
         handle: z.string().optional(),
         createToken: z.string().optional(),
       })
@@ -334,9 +334,10 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
           .int()
           .positive()
           .default(24 * 3600_000),
+        code: z.boolean().default(true),
       })
       .parse(req.body);
-    return { invite: await s.team.invite(body.uses, body.ttlMs) };
+    return s.team.invite(body.uses, body.ttlMs, { code: body.code });
   });
 
   route("POST", "/v1/team/join", async (req) => {

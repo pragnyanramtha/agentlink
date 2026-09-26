@@ -186,22 +186,27 @@ Release your claims (all of them when no path is given).`,
 List active file claims on this machine.`,
 
   team: `agentlink team [status]
-agentlink team create <name> --relay ws://<host>:7700 [--handle <you>] [--create-token <t>]
-agentlink team invite [--uses 1] [--ttl 24h]
-agentlink team join <invite> [--handle <you>] [--relay <url>]
+agentlink team create <name> [--relay <url>] [--handle <you>] [--create-token <t>]
+agentlink team invite [--uses 1] [--ttl 24h] [--no-code]
+agentlink team join <code | al1.invite> [--handle <you>] [--relay <url>]
 agentlink team relay <url>          use another address for the relay (after moving it)
 agentlink team leave
 
 Connect this machine to other machines and people. Messages are end-to-end
 encrypted to each device; the relay only stores and forwards ciphertext.
 After joining, teammates' agents show up in agentlink peers as alice/<agent>.
---relay reaches the same relay at another address (for example through an SSH tunnel).
+
+Without --relay, teams use the community relay (wss://116-203-46-74.sslip.io; set
+"relay" in ~/.agentlink/config.json or AGENTLINK_RELAY to change the default).
+
+invite prints a short code (one use, 15 minutes), e.g. tiger-lamp-orbit-sun-42, and a
+long al1.… invite that carries the relay address. Either works with team join; a code
+from a team on another relay needs --relay <that relay>.
 
 Typical setup:
-  (any machine)  agentlink relay serve --host 0.0.0.0
-  (you)          agentlink team create acme --relay ws://relay-host:7700
-  (you)          agentlink team invite            # send the al1.… string privately
-  (teammate)     agentlink team join al1.…`,
+  (you)          agentlink team create acme
+  (you)          agentlink team invite            # send the code privately
+  (teammate)     agentlink team join tiger-lamp-orbit-sun-42`,
 
   relay: `agentlink relay serve [--host 127.0.0.1] [--port 7700] [--data <dir>] [--create-token <t>]
 

@@ -345,6 +345,9 @@ export class RelayClient {
       case "error":
         this.#ctx.log.warn("relay error", { code: frame.code, message: frame.message });
         if (frame.ref) this.#waiters.get(frame.ref)?.(frame);
+        if (this.#ready) {
+          for (const op of ["op:code_put", "op:invite"]) this.#waiters.get(op)?.(frame);
+        }
         // Before the welcome, any refusal (bad invite, handle taken, …) ends a create/join.
         if (
           this.#onWelcome &&
@@ -564,7 +567,47 @@ export class RelayClient {
     return token;
   }
 
+  /** Stores a sealed invite under a short code's id on the relay (fetchable once). */
+  async putCode(id: string, box: { nonce: string; ct: string }, expiresAt: string): Promise<void> {
+    if (!this.#ready) throw new Error("not connected to the relay");
+    const done = new Promise<ServerFrame>((resolve) => {
+      this.#waiters.set("op:code_put", resolve);
+      setTimeout(
+        () => resolve({ t: "error", code: "timeout", message: "relay did not answer" }),
+        10_000,
+      ).unref();
+    });
+    this.#ws?.send(JSON.stringify({ t: "code_put", id, box, expiresAt }));
+    const res = await done;
+    this.#waiters.delete("op:code_put");
+    if (res.t === "error") throw new Error(res.message);
+  }
+
   removeSelf(): void {
     this.#ws?.send(JSON.stringify({ t: "remove", deviceId: this.#keys.deviceId }));
   }
+}
+
+/** Redeems a short invite code: fetches the sealed invite once, without joining anything. */
+export function fetchCode(relayUrl: string, id: string): Promise<{ nonce: string; ct: string }> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(relayUrl, { handshakeTimeout: 10_000, maxPayload: 1024 * 1024 });
+    const timer = setTimeout(() => {
+      ws.terminate();
+      reject(new Error(`the relay ${relayUrl} did not answer`));
+    }, 15_000);
+    ws.on("open", () => ws.send(JSON.stringify({ t: "code_get", id })));
+    ws.on("message", (data) => {
+      clearTimeout(timer);
+      const frame = JSON.parse(String(data)) as ServerFrame;
+      ws.close();
+      if (frame.t === "code") resolve(frame.box);
+      else
+        reject(new Error(frame.t === "error" ? frame.message : "unexpected answer from the relay"));
+    });
+    ws.on("error", (error) => {
+      clearTimeout(timer);
+      reject(new Error(`cannot reach the relay ${relayUrl}: ${error.message}`));
+    });
+  });
 }
