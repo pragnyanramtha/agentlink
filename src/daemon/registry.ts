@@ -226,13 +226,20 @@ export class Registry {
         ? `${withRepo}-${slugify(branch, 24)}`
         : undefined;
     const placeOf = (row: AgentRow) => row.repo_root ?? row.cwd ?? undefined;
+    // An offline agent's name (and queued mail) passes only to a session in the same place.
+    // Folder names are not unique (~/work/api, ~/oss/api), and an unknown place never matches.
+    const inheritable = (row: AgentRow) =>
+      !isLive(row) &&
+      row.tool === tool &&
+      row.name_source === "auto" &&
+      !!place &&
+      placeOf(row) === place;
     for (const name of [short, withRepo, ...(byBranch ? [byBranch] : [])]) {
       const row = this.byName(name);
       if (!row) return { name };
-      if (isLive(row) || row.tool !== tool || row.name_source !== "auto") continue;
-      // Folder names are not unique (~/work/api, ~/oss/api): every name needs the same place.
-      if (!place || placeOf(row) === place) return { name, takeover: row };
-      if (name !== short) continue;
+      if (inheritable(row)) return { name, takeover: row };
+      if (isLive(row) || row.tool !== tool || row.name_source !== "auto" || name !== short)
+        continue;
       // Deliberately no alias for the vacated name: it now belongs to the new session.
       const aside = this.#freeName(
         `${short}-${slugify(basename(placeOf(row) ?? "") || "old", 40)}`,
@@ -249,9 +256,7 @@ export class Registry {
       const name = `${byBranch ?? withRepo}-${i}`;
       const row = this.byName(name);
       if (!row) return { name };
-      if (!isLive(row) && row.tool === tool && row.name_source === "auto") {
-        return { name, takeover: row };
-      }
+      if (inheritable(row)) return { name, takeover: row };
     }
     return { name: `${withRepo}-${ulid().slice(-6).toLowerCase()}` };
   }

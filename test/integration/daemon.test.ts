@@ -160,8 +160,31 @@ describe("names across projects with the same folder name", () => {
       (x) => x.name,
     );
     expect(names).toContain("codex-api-2");
-    keep.kill();
+    // Now an offline numbered name from b/api must not pass to a session in a/api either.
+    await t
+      .client("sender2")
+      .request("POST", "/v1/messages", { to: ["codex-api-2"], text: "for b/api only" });
     b.kill();
+    await until(async () =>
+      (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents.find(
+        (x) => x.name === "codex-api-2" && x.state === "offline",
+      ),
+    );
+    const blocker = t.fakeAgentProcess("codex"); // resumes codex-api (same place: a/api)
+    await t.hook("codex", "session-start", { session_id: "sc", cwd: one }, blocker);
+    const again = t.fakeAgentProcess("codex");
+    const third = await t.hook<Json>(
+      "codex",
+      "session-start",
+      { session_id: "sd", cwd: one },
+      again,
+    );
+    expect(third.stdout).not.toContain("for b/api only");
+    const all = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents;
+    expect(all.find((x) => x.name === "codex-api-2")?.state).toBe("offline"); // still b/api's
+    keep.kill();
+    blocker.kill();
+    again.kill();
   });
 });
 
