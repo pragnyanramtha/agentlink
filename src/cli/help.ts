@@ -339,7 +339,12 @@ Drop a held message.`,
   mcp: `agentlink mcp
 
 Run the MCP server on stdio (tools: peers, whoami, ask, send, reply, ack, inbox, todo,
-thread, show, doing, claim, release). agentlink install registers it with your CLIs.`,
+thread, show, doing, claim, release). agentlink install registers it with your CLIs.
+
+The server acts as the agent whose process started it (its process tree). For an app
+without agentlink hooks, register the app's process first:
+  agentlink register --name desktop --pid <app pid>
+(--as works only from a terminal.)`,
 
   hook: `agentlink hook <tool> <event> [json]
 

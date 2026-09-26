@@ -34,7 +34,7 @@ async function registerAgent(t: TestDaemon, name: string) {
 
 beforeAll(async () => {
   relayDir = mkdtempSync(join(tmpdir(), "agentlink-relay-"));
-  relay = await startRelay({ dataDir: relayDir, port: 0, logger: silentLogger });
+  relay = await startRelay({ dataDir: relayDir, port: 0, logger: silentLogger, pageStallMs: 500 });
   alice = await startTestDaemon({ handle: "alice" });
   bob = await startTestDaemon({ handle: "bob" });
 
@@ -548,6 +548,25 @@ describe("team relay", () => {
     for (let i = 0; i < total; i++) {
       await alice.client().request("POST", "/v1/messages", { to: ["@bob"], text: `backlog ${i}` });
     }
+    // A full page of messages bob will never ack (from a device not in its roster) sits in front
+    // of the backlog; it must not stop the rest from arriving.
+    const { DatabaseSync } = await import("node:sqlite");
+    const db = new DatabaseSync(join(relayDir, "relay.db"));
+    const dev = db
+      .prepare("SELECT team_id, device_id FROM devices WHERE member LIKE ? AND removed_at IS NULL")
+      .get('%"handle":"bob"%') as { team_id: string; device_id: string };
+    const insert = db.prepare(
+      "INSERT INTO queue (id, team_id, to_device, from_device, blob, bytes, at) VALUES (?, ?, ?, 'dev_ghost', '{}', 2, ?)",
+    );
+    for (let i = 0; i < 500; i++) {
+      insert.run(
+        `ghost-${i}`,
+        dev.team_id,
+        dev.device_id,
+        `2000-01-01T00:00:${String(i % 60).padStart(2, "0")}.${String(i).padStart(3, "0")}Z`,
+      );
+    }
+    db.close();
     bob = await startTestDaemon({ handle: "bob", home });
     const got = await until(async () => {
       const r = await bob

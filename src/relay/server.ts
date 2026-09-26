@@ -68,6 +68,9 @@ interface Conn {
   /** Queued messages sent on this connection and not acked yet (backlog paging). */
   inFlight?: Set<string>;
   pageSize?: number;
+  /** Last queued message sent on this connection (backlog paging continues after it). */
+  cursor?: { at: string; id: string };
+  pageTimer?: ReturnType<typeof setTimeout>;
   /** Client address (from X-Forwarded-For when a local reverse proxy is in front). */
   ip: string;
 }
@@ -79,6 +82,8 @@ export interface RelayOptions {
   logger: Logger;
   /** If set, creating a team requires this token (keeps a public relay from being used by anyone). */
   createToken?: string;
+  /** Send the next backlog page after this long even if the current one is not acked (tests). */
+  pageStallMs?: number;
 }
 
 export interface RunningRelay {
@@ -152,18 +157,34 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     return undefined;
   };
 
-  // Queued messages go out in pages of 500; the next page follows once the device has acked
-  // everything sent so far (see "ack").
+  // Queued messages go out in pages of 500, oldest first, continuing after the last one sent
+  // (a cursor), so messages the device does not ack (sender not in its roster yet) cannot hold up
+  // the rest; they stay queued for the next connection. The next page follows when the device has
+  // acked most of the current one, or after 30 seconds.
   const flushQueue = (c: Conn) => {
+    clearTimeout(c.pageTimer);
+    const after = c.cursor ?? { at: "", id: "" };
     const rows = q<{ id: string; from_device: string; blob: string; at: string }>(
-      "SELECT id, from_device, blob, at FROM queue WHERE team_id = ? AND to_device = ? ORDER BY at LIMIT 500",
+      `SELECT id, from_device, blob, at FROM queue WHERE team_id = ? AND to_device = ?
+         AND (at > ? OR (at = ? AND id > ?)) ORDER BY at, id LIMIT 500`,
       c.teamId as string,
       c.deviceId as string,
+      after.at,
+      after.at,
+      after.id,
     );
-    c.inFlight = new Set(rows.map((r) => r.id));
+    const last = rows[rows.length - 1];
+    if (last) c.cursor = { at: last.at, id: last.id };
+    c.inFlight = rows.length >= 500 ? new Set(rows.map((r) => r.id)) : undefined;
     c.pageSize = rows.length;
     for (const r of rows)
       send(c, { t: "msg", id: r.id, from: r.from_device, blob: JSON.parse(r.blob), at: r.at });
+    if (c.inFlight) {
+      c.pageTimer = setTimeout(() => {
+        if (c.ws.readyState === c.ws.OPEN) flushQueue(c);
+      }, opts.pageStallMs ?? 30_000);
+      c.pageTimer.unref();
+    }
   };
 
   const welcome = (c: Conn) => {
@@ -476,6 +497,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
             t: "error",
             code: "full",
             message: "too many open invite codes for this team",
+            ...(frame.ref ? { ref: frame.ref } : {}),
           });
         }
         const maxExpiry = new Date(Date.now() + 24 * 3600_000).toISOString();
@@ -498,13 +520,8 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
           );
           c.inFlight?.delete(id);
         }
-        // Next page of a long backlog once (nearly) all of this one is acked. A few messages may
-        // stay unacked on purpose (sender not in the roster yet); they are simply sent again.
-        if (c.inFlight && c.inFlight.size <= Math.floor((c.pageSize ?? 0) / 10)) {
-          const more = (c.pageSize ?? 0) >= 500;
-          c.inFlight = undefined;
-          if (more) flushQueue(c);
-        }
+        // Next page of a long backlog once (nearly) all of this one is acked.
+        if (c.inFlight && c.inFlight.size <= Math.floor((c.pageSize ?? 0) / 10)) flushQueue(c);
         return;
       }
       case "presence": {
@@ -614,6 +631,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
       }
     });
     ws.on("close", () => {
+      clearTimeout(c.pageTimer);
       conns.delete(c);
       if (c.teamId && c.deviceId && !peersOf(c.teamId).some((p) => p.deviceId === c.deviceId)) {
         for (const p of peersOf(c.teamId))
