@@ -3,6 +3,14 @@
   "version": "0.1.0-dev.0",
   "description": "Let AI coding agents (Claude Code, Codex, OpenCode, Gemini, Copilot, …) message each other, on one machine and across teammates' machines.",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/pragnyanramtha/agentlink#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pragnyanramtha/agentlink.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pragnyanramtha/agentlink/issues"
+  },
   "type": "module",
   "bin": {
     "agentlink": "dist/cli/index.js"

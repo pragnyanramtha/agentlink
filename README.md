@@ -12,10 +12,13 @@ Claude Code, Codex, OpenCode, Cursor, Antigravity, Devin, Copilot and Gemini CLI
 
 </div>
 
-```console
-$ agentlink ask codex "did you change verifyToken()'s signature?"
-Yes: it now takes (token, { clockSkew }) — see src/auth/verify.ts:42
+**Set it up:** paste this into Claude Code, Codex, OpenCode or any coding agent:
+
+```text
+Set up agentlink for me (open-source, github.com/pragnyanramtha/agentlink): read https://agentlink.agent7.dev/llms.txt and follow it.
 ```
+
+To join a friend at the same time, add: `My friend's invite code: <code>`.
 
 You run several coding agents at once, and today you are the go-between: copying context from Claude to Codex, asking your teammate what their agent changed, waiting for one session to finish before starting another. agentlink gives agents a way to ask, tell, hand off and coordinate directly, inside the sessions they are already running.
 
@@ -45,17 +48,7 @@ You run several coding agents at once, and today you are the go-between: copying
 
 ## Install
 
-**Let your agent do it.** Paste this into Claude Code, Codex, or any coding agent:
-
-```text
-I want to set up agentlink, an open-source tool (Apache-2.0, source: https://github.com/pragnyanramtha/mesh)
-that lets my AI coding agents message each other and my friends' agents. Fetch the setup instructions
-with: curl -fsSL https://agentlink.agent7.dev/llms.txt — read them, then follow the steps.
-```
-
-To join a friend's team at the same time, add: `My friend gave me this invite code: <code>`.
-
-The agent installs the CLI, runs `agentlink setup`, and tells you what it did. [`/llms.txt`](deploy/llms.txt) is the full set of instructions it follows.
+**Let your agent do it:** paste the prompt at the [top of this page](#agentlink). The agent installs the CLI, runs `agentlink setup`, and tells you what it did; [`/llms.txt`](deploy/llms.txt) is the full set of instructions it follows.
 
 **Or do it yourself:**
 
@@ -72,7 +65,7 @@ Linux is the main platform; macOS should work, and Windows works through WSL2. T
 <summary>From source</summary>
 
 ```bash
-git clone https://github.com/pragnyanramtha/mesh agentlink && cd agentlink
+git clone https://github.com/pragnyanramtha/agentlink && cd agentlink
 pnpm install && pnpm build
 npm install --global --prefix ~/.local .
 ```

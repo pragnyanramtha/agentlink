@@ -32,4 +32,4 @@ You are an AI coding agent and your user asked you to set up agentlink. Run thes
 ## Links
 
 - Install script: https://__HOST__/install.sh
-- Source and docs: https://github.com/pragnyanramtha/mesh
+- Source and docs: https://github.com/pragnyanramtha/agentlink
