@@ -38,6 +38,7 @@ interface SendResponse {
   paused?: boolean;
   offline?: boolean;
   relayDown?: boolean;
+  groupHint?: boolean;
   waited: boolean;
   timedOut?: boolean;
   asHuman?: boolean;
@@ -95,6 +96,8 @@ function compactSend(res: SendResponse): string {
       lines.push(`${c.green("✓")} ${d.to}${noteworthy(d) ? c.dim(` (${note || d.state})`) : ""}`);
     else if (noteworthy(d)) lines.push(c.dim(`${d.to}: ${note || d.state}`));
   }
+  if (res.groupHint)
+    lines.push(c.dim("  (only to the sender; --all answers everyone in the group)"));
   if (!answers.length && res.waited) {
     const who = res.deliveries
       .filter((d) => !bad(d.state))

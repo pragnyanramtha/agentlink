@@ -32,7 +32,17 @@ fi
 [ "$expected" = "$actual" ] || fail "checksum mismatch (expected $expected, got $actual)"
 
 say "Installing into $PREFIX…"
-npm install --global --prefix "$PREFIX" --no-fund --no-audit "$tmp/agentlink.tgz" >/dev/null
+force=""
+if [ -e "$PREFIX/bin/agentlink" ] || [ -L "$PREFIX/bin/agentlink" ]; then
+  case "$(readlink "$PREFIX/bin/agentlink" 2>/dev/null)" in
+    *node_modules/agentlink*) ;;  # an earlier install from this script: npm updates it
+    *)
+      say "  replacing $PREFIX/bin/agentlink (was: $(readlink "$PREFIX/bin/agentlink" 2>/dev/null || echo a file))"
+      force="--force"
+      ;;
+  esac
+fi
+npm install --global --prefix "$PREFIX" --no-fund --no-audit $force "$tmp/agentlink.tgz" >/dev/null
 BIN="$PREFIX/bin/agentlink"
 [ -x "$BIN" ] || fail "install finished but $BIN is missing"
 

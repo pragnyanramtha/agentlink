@@ -101,7 +101,7 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 function requireHuman(req: Req, needTty = true): void {
   if (req.agent) {
     throw forbidden(
-      "only your human user can do this, not an AI agent (run it in your own terminal)",
+      `only a person can do this, and this command runs inside the agent session "${req.agent.name}" (commands started from an agent, including its "!" shell prefix, count as the agent). Run it in a separate terminal.`,
     );
   }
   if (needTty && !req.caller.tty) throw forbidden("run this from an interactive terminal");
@@ -486,6 +486,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       waited: !!input.waitMs,
       timedOut,
       asHuman: !req.agent,
+      // A plain reply in a group reaches only the sender; say so (feedback: this surprised agents).
+      ...(input.kind === "reply" && input.replyTo && !input.replyAll
+        ? (() => {
+            const others = mailbox.participants(
+              mailbox.envelopeOf(mailbox.resolveMessage(input.replyTo)),
+            ).length;
+            return others > 2 ? { groupHint: true } : {};
+          })()
+        : {}),
     };
   });
 

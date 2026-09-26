@@ -140,9 +140,18 @@ export const name: Command = async (ctx) => {
 export const doing: Command = async (ctx) => {
   const { values, positionals } = parse(ctx.argv, { clear: { type: "boolean" } });
   const text = positionals.join(" ").trim();
-  if (!text && !values.clear)
-    throw new UsageError('usage: agentlink doing "<what you are working on>" | --clear');
   await ctx.client.ensureDaemon();
+  if (!text && !values.clear) {
+    const who = await ctx.client.request<{ agent: AgentView | null }>("GET", "/v1/whoami");
+    if (!who.agent)
+      throw new UsageError('usage: agentlink doing "<what you are working on>" | --clear');
+    out(ctx, { agent: who.agent }, () =>
+      who.agent?.status
+        ? `${who.agent.name}: ${who.agent.status}`
+        : c.dim(`${who.agent?.name ?? "you"}: nothing set (agentlink doing "<text>")`),
+    );
+    return 0;
+  }
   const res = await ctx.client.request<{ agent: AgentView }>("POST", "/v1/agents/status", {
     text: values.clear ? null : text,
   });

@@ -230,6 +230,16 @@ export const doctor: Command = async (ctx) => {
         : "'ss' is missing (install iproute2): agents' identities are not verified",
     });
   }
+  if (process.platform === "linux" && health) {
+    const unregistered = await unregisteredSessions(ctx);
+    if (unregistered.length) {
+      rows.push({
+        ok: false,
+        label: "sessions",
+        detail: `not connected (started before setup?): ${unregistered.join(", ")}; restart them`,
+      });
+    }
+  }
   const onPathAt = onPath(["agentlink"]);
   const pinned = onPathAt ? launcherHome(onPathAt) : undefined;
   const otherHome = !!pinned && resolve(pinned) !== resolve(ctx.paths.home);
@@ -425,3 +435,43 @@ export const setup: Command = async (ctx) => {
   out(ctx, { tools: found, joined: !!values.join }, () => lines.join("\n"));
   return 0;
 };
+
+/** Agent CLI processes of this user that are running but not registered with agentlink. */
+async function unregisteredSessions(ctx: CliContext): Promise<string[]> {
+  const { readdirSync, statSync } = await import("node:fs");
+  const uid = process.getuid?.();
+  const { matchesTool, procInfo } = await import("../../core/proc.ts");
+  const res = await ctx.client
+    .request<{ agents: { pid?: number | null; local?: boolean }[] }>("GET", "/v1/agents?all=1")
+    .catch(() => ({ agents: [] }));
+  const known = new Set<number>();
+  // A registered session and every process above it (wrappers/launchers) count as connected.
+  const { ancestry } = await import("../../core/proc.ts");
+  for (const a of res.agents) {
+    if (a.local === false || !a.pid) continue;
+    for (const p of ancestry(a.pid)) known.add(p.pid);
+  }
+  const tools = ["claude", "codex", "opencode", "cursor", "gemini", "copilot", "agy", "devin"];
+  const found: string[] = [];
+  for (const entry of readdirSync("/proc")) {
+    const pid = Number(entry);
+    if (!Number.isInteger(pid) || pid === process.pid || known.has(pid)) continue;
+    try {
+      if (statSync(`/proc/${pid}`).uid !== uid) continue;
+    } catch {
+      continue;
+    }
+    const info = procInfo(pid);
+    if (!info) continue;
+    const tool = tools.find((t) => matchesTool(t, info));
+    if (!tool) continue;
+    // Cursor's CLI binary is called "agent", a name other programs use too.
+    if (tool === "cursor" && !/cursor/i.test(info.cmd.join(" "))) continue;
+    // Only the session process itself, not its helpers (children of the same tool).
+    const parent = procInfo(info.ppid);
+    if (parent && matchesTool(tool, parent)) continue;
+    found.push(`${tool} (pid ${pid})`);
+    if (found.length >= 8) break;
+  }
+  return found;
+}

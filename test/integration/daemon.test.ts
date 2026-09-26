@@ -595,6 +595,36 @@ describe("usability fixes, round 3", () => {
     expect(real.status).toBe(200);
   });
 
+  it("a plain reply in a group says it reached only the sender", async () => {
+    await register("gh0");
+    await register("gh1");
+    await register("gh2");
+    const q = await t
+      .client("gh0")
+      .request<SendRes>("POST", "/v1/messages", {
+        to: ["gh1", "gh2"],
+        kind: "ask",
+        text: "lunch?",
+      });
+    const one = await t
+      .client("gh1")
+      .request<{ groupHint?: boolean }>("POST", "/v1/messages", {
+        kind: "reply",
+        replyTo: q.message.id,
+        text: "yes",
+      });
+    expect(one.groupHint).toBe(true);
+    const all = await t
+      .client("gh2")
+      .request<{ groupHint?: boolean }>("POST", "/v1/messages", {
+        kind: "reply",
+        replyTo: q.message.id,
+        replyAll: true,
+        text: "yes too",
+      });
+    expect(all.groupHint).toBeUndefined();
+  });
+
   it("answers quote the question they answer", async () => {
     await register("qa");
     await register("qb");

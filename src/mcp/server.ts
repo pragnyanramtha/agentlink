@@ -24,12 +24,15 @@ interface SendResponse {
   failed?: unknown[];
   paused?: boolean;
   offline?: boolean;
+  groupHint?: boolean;
   waited: boolean;
 }
 
 function describeSend(res: SendResponse, waitMs: number): string {
   const lines = res.deliveries.map((d) => `→ ${d.to}: ${d.note ?? d.state}`);
   lines.push(`message id ${res.message.id} (thread ${res.message.thread})`);
+  if (res.groupHint)
+    lines.push("(sent only to the sender; all=true answers everyone in the group)");
   const answers = res.replies ?? (res.reply ? [res.reply] : []);
   for (const r of answers) {
     lines.push(
@@ -162,9 +165,11 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
           .number()
           .int()
           .min(0)
-          .max(600)
+          .max(50)
           .optional()
-          .describe("How long to wait for the answer (default 45; 0 = send and don't wait)"),
+          .describe(
+            "How long to wait for the answer (default 45, max 50; 0 = send and don't wait). Later answers reach you anyway.",
+          ),
         thread: z.string().optional().describe("Thread id to continue a conversation"),
       },
     },
@@ -275,9 +280,9 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
           .number()
           .int()
           .min(0)
-          .max(120)
+          .max(50)
           .optional()
-          .describe("Wait this long for a new message"),
+          .describe("Wait this long for a new message (max 50; MCP clients time out around 60s)"),
       },
     },
     guard(async ({ include_read, wait_seconds }) => {

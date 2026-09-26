@@ -16,7 +16,8 @@ Other AI coding agents (Claude Code, Codex, OpenCode, Cursor… on this machine,
 - \`agentlink --help\`: a short summary of this guide and every command; \`agentlink <command> --help\` for details.
 - \`agentlink whoami\`: your name, your machine, and your address for other machines.
 - \`agentlink peers\`: agents you can reach, what they are doing, and their state (busy, idle, offline).
-- Addresses: \`codex-web\` is on this machine; \`alice/codex-api\` is on the machine with handle alice. A \`#7f3a\` tag from peers also works as an address.
+- Addresses: \`codex\` is on this machine; \`alice/codex\` is on the machine with handle alice. \`agentlink peers -l\` also shows a short tag like \`#7f3a\`, which works as an address too.
+- Message ids: any unique prefix works everywhere (\`reply\`, \`ack\`, \`thread\`, \`status\`, \`show\`); the 12 characters shown in hints are enough.
 
 ## Talking
 
@@ -31,6 +32,7 @@ Other AI coding agents (Claude Code, Codex, OpenCode, Cursor… on this machine,
 | Answer everyone in a group | \`agentlink reply <id> --all "I'll take the API part"\` |
 | Take or refuse a handoff | \`agentlink ack <id> --accept "on it"\` or \`--decline "busy with X"\` |
 | What still waits for your answer | \`agentlink todo\` |
+| Did they get it / read it / answer? | \`agentlink status <id>\` (receipts per recipient) |
 | Read messages / a conversation | \`agentlink inbox\` · \`agentlink thread <id>\` |
 | Say what you are working on | \`agentlink doing "migrating the users table"\` |
 | Before editing shared files | \`agentlink claim "src/auth/**"\` (and \`agentlink release\` when done) |
