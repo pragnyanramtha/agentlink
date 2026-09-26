@@ -110,6 +110,7 @@ export class Registry {
             input.tool,
             repo?.name || basename(input.cwd ?? "") || "agent",
             repo?.branch ?? undefined,
+            repo?.root ?? input.cwd,
           );
       if (chosen.takeover) {
         if (
@@ -197,32 +198,57 @@ export class Registry {
    * `<tool>-<repo>`; a second live session in the same repo is told apart by its branch
    * (`claude-web-feat-login`) when it has one, and by a number otherwise.
    */
+  /**
+   * Names stay short: the first session of a tool is just `codex`. Another live session of the
+   * same tool gets its repo (`codex-api`), then its branch (`codex-api-feat-login`), then a number.
+   * An offline agent's name is taken over by a new session in the same repo (it resumes its mail);
+   * an offline agent from another repo is moved aside to `<tool>-<its repo>`.
+   */
   #autoName(
     tool: string,
     repoName: string,
     branch?: string,
+    repoRoot?: string,
   ): { name: string; takeover?: AgentRow } {
-    const base = `${slugify(tool, 16)}-${slugify(repoName, 40)}`;
+    const short = slugify(tool, 16);
+    const withRepo = `${short}-${slugify(repoName, 40)}`;
     const byBranch =
       branch && !["main", "master", "HEAD", "trunk", "develop"].includes(branch)
-        ? `${base}-${slugify(branch, 24)}`
+        ? `${withRepo}-${slugify(branch, 24)}`
         : undefined;
-    const candidates = [base, ...(byBranch ? [byBranch] : [])];
-    for (const name of candidates) {
+    const sameRepo = (row: AgentRow) => !!repoRoot && row.repo_root === repoRoot;
+    for (const name of [short, withRepo, ...(byBranch ? [byBranch] : [])]) {
       const row = this.byName(name);
       if (!row) return { name };
-      if (!isLive(row) && row.tool === tool && row.name_source === "auto")
-        return { name, takeover: row };
+      if (isLive(row) || row.tool !== tool || row.name_source !== "auto") continue;
+      if (sameRepo(row) || name !== short) return { name, takeover: row };
+      // The short name belongs to whoever runs now; the offline one keeps its mail under a longer name.
+      const aside = this.#freeName(
+        `${short}-${slugify(basename(row.repo_root ?? "") || "old", 40)}`,
+      );
+      this.#ctx.store.run("UPDATE agents SET name = ? WHERE id = ?", aside, row.id);
+      this.#ctx.store.run(
+        "UPDATE deliveries SET to_addr = ? WHERE to_agent_id = ? AND state IN ('queued','delivered','held')",
+        aside,
+        row.id,
+      );
+      return { name };
     }
     for (let i = 2; i < 100; i++) {
-      const name = `${byBranch ?? base}-${i}`;
+      const name = `${byBranch ?? withRepo}-${i}`;
       const row = this.byName(name);
       if (!row) return { name };
       if (!isLive(row) && row.tool === tool && row.name_source === "auto") {
         return { name, takeover: row };
       }
     }
-    return { name: `${base}-${ulid().slice(-6).toLowerCase()}` };
+    return { name: `${withRepo}-${ulid().slice(-6).toLowerCase()}` };
+  }
+
+  #freeName(base: string): string {
+    if (!this.byName(base)) return base;
+    for (let i = 2; i < 100; i++) if (!this.byName(`${base}-${i}`)) return `${base}-${i}`;
+    return `${base}-${ulid().slice(-6).toLowerCase()}`;
   }
 
   #claimUserName(raw: string): { name: string; takeover?: AgentRow } {

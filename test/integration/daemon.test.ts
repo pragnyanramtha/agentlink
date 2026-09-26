@@ -61,7 +61,7 @@ describe("registry & presence", () => {
     expect(offline).toBeTruthy();
   });
 
-  it("auto-names agents after tool+repo and takes over offline names", async () => {
+  it("names agents after their tool, adds the repo for a second session, and takes over offline names", async () => {
     const a = t.fakeAgentProcess("codex");
     const first = await t.hook<Json>(
       "codex",
@@ -72,7 +72,16 @@ describe("registry & presence", () => {
     expect(first.stdout).toContain("agentlink: you are");
     const agents1 = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents;
     const name = String(agents1[0]?.name);
-    expect(name).toMatch(/^codex-agentlink-test-/);
+    expect(name).toBe("codex");
+    // a second live codex session gets the repo in its name
+    const other = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "s-other", cwd: t.home }, other);
+    const both = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents.map(
+      (x) => x.name,
+    );
+    expect(both).toContain("codex");
+    expect(both.some((n) => String(n).startsWith("codex-agentlink-test-"))).toBe(true);
+    other.kill();
     a.kill();
     await until(async () =>
       (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents.find(
@@ -83,7 +92,7 @@ describe("registry & presence", () => {
     const b = t.fakeAgentProcess("codex");
     await t.hook("codex", "session-start", { session_id: "s2", cwd: t.home }, b);
     const agents2 = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents;
-    expect(agents2.map((x) => x.name)).toEqual([name]);
+    expect(agents2.map((x) => x.name)).toContain(name);
   });
 });
 
@@ -618,6 +627,30 @@ describe("usability fixes, round 3", () => {
   });
 });
 
+describe("runs only while needed", () => {
+  it("stops by itself when no agent session is running", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { resolvePaths } = await import("../../src/core/paths.ts");
+    const { startDaemon } = await import("../../src/daemon/main.ts");
+    const { silentLogger } = await import("../../src/core/log.ts");
+    const home = mkdtempSync(join(tmpdir(), "agentlink-idle-"));
+    let stopped = false;
+    await startDaemon({
+      paths: resolvePaths({ AGENTLINK_HOME: home, HOME: home } as NodeJS.ProcessEnv),
+      logger: silentLogger,
+      sweepMs: 50,
+      idleExitMs: 200,
+      onIdleExit: () => {
+        stopped = true;
+      },
+    });
+    await until(async () => stopped || undefined, 5_000);
+    expect(stopped).toBe(true);
+  });
+});
+
 describe("guards", () => {
   it("stops echo loops and caps threads", async () => {
     await register("alpha");
@@ -861,7 +894,7 @@ describe("hooks", () => {
     const name = String(
       (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents[0]?.name,
     );
-    expect(name).toMatch(/^agy-/);
+    expect(name).toBe("agy");
     await register("alpha");
     await t
       .client("alpha")

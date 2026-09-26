@@ -29,7 +29,7 @@ import { DeliveryEngine } from "./delivery.ts";
 import { EventBus } from "./events.ts";
 import { HookHandler } from "./hooks.ts";
 import { Mailbox } from "./mailbox.ts";
-import { Registry } from "./registry.ts";
+import { isLive, Registry } from "./registry.ts";
 import { createDaemonServer, type Services } from "./server.ts";
 import { Store } from "./store/db.ts";
 import { TeamManager } from "./team-manager.ts";
@@ -99,6 +99,12 @@ export async function startDaemon(
     sweepMs?: number;
     /** Tests only: accept the caller identity the client claims. */
     trustClientCaller?: boolean;
+    /**
+     * Stop after this long with no running agent session and no open client connection. The
+     * daemon starts again by itself on the next hook or command. Off when unset.
+     */
+    idleExitMs?: number;
+    onIdleExit?: () => void;
   } = {},
 ): Promise<RunningDaemon> {
   const paths = opts.paths ?? resolvePaths();
@@ -206,12 +212,28 @@ export async function startDaemon(
   registry.sweep();
   engine.refreshAll();
   team.resume();
+  let lastActivity = Date.now();
+  server.on("request", () => {
+    lastActivity = Date.now();
+  });
   const sweep = setInterval(() => {
     try {
       registry.sweep();
     } catch (error) {
       log.warn("sweep failed", { error: String(error) });
     }
+    if (!opts.idleExitMs) return;
+    if (registry.list().some(isLive)) {
+      lastActivity = Date.now();
+      return;
+    }
+    server.getConnections((error, open) => {
+      if (error || open > 0 || Date.now() - lastActivity < (opts.idleExitMs as number)) return;
+      log.info(
+        `no agent sessions for ${Math.round((opts.idleExitMs as number) / 60_000)} min; stopping (starts again when needed)`,
+      );
+      void close().then(() => opts.onIdleExit?.());
+    });
   }, opts.sweepMs ?? 5_000);
   const expiry = setInterval(() => {
     try {
