@@ -1,7 +1,9 @@
 import { hostname } from "node:os";
 import { WebSocket } from "ws";
+import { NAME_RE } from "../core/addr.ts";
 import {
   type DeviceKeys,
+  deviceIdOf,
   fingerprint,
   open,
   publicPart,
@@ -16,6 +18,7 @@ import {
   verifyJson,
 } from "../core/crypto.ts";
 import { ulid } from "../core/ids.ts";
+import { safeField } from "../core/sanitize.ts";
 import {
   authPayload,
   type MemberRecord,
@@ -65,7 +68,10 @@ export type Inbound =
       from: RemoteMember;
     };
 
-type Mode = { kind: "hello" } | { kind: "create" } | { kind: "join"; token: string };
+type Mode =
+  | { kind: "hello" }
+  | { kind: "create"; createToken?: string }
+  | { kind: "join"; token: string };
 
 const aad = (teamId: string, from: string, to: string) => `agentlink/v1|${teamId}|${from}|${to}`;
 
@@ -202,7 +208,10 @@ export class RelayClient {
         device: publicPart(this.#keys),
         member: this.#record(),
       };
-    return { ...frame, sig: signJson(this.#keys, authPayload(frame as never)) };
+    const signed = { ...frame, sig: signJson(this.#keys, authPayload(frame as never)) };
+    return this.#mode.kind === "create" && this.#mode.createToken
+      ? { ...signed, createToken: this.#mode.createToken }
+      : signed;
   }
 
   #connect(): void {
@@ -285,18 +294,29 @@ export class RelayClient {
             agents: Omit<RemoteAgent, "member" | "deviceId" | "at">[];
             host?: string;
           };
-          const host = typeof p.host === "string" ? p.host.slice(0, 64) : undefined;
+          const host = safeField(p.host, 64) ?? undefined;
           this.#presence.set(frame.deviceId, {
             handle: member.handle,
             at: frame.at,
             ...(host ? { host } : {}),
-            agents: p.agents.slice(0, 100).map((a) => ({
-              ...a,
-              member: member.handle,
-              deviceId: frame.deviceId,
-              at: frame.at,
-              ...(host ? { host } : {}),
-            })),
+            // Presence comes from another machine: keep only well-formed, bounded, printable fields.
+            agents: (Array.isArray(p.agents) ? p.agents : [])
+              .slice(0, 100)
+              .filter((a) => typeof a?.name === "string" && NAME_RE.test(a.name))
+              .map((a) => ({
+                name: a.name,
+                tool: safeField(a.tool, 32) ?? "unknown",
+                state: ["busy", "idle", "offline", "stale"].includes(a.state) ? a.state : "offline",
+                repo: safeField(a.repo, 200),
+                branch: safeField(a.branch, 100),
+                status: safeField(a.status, 200),
+                ...(typeof a.stateAt === "string" ? { stateAt: a.stateAt.slice(0, 40) } : {}),
+                ...(safeField(a.reach, 40) ? { reach: safeField(a.reach, 40) as string } : {}),
+                member: member.handle,
+                deviceId: frame.deviceId,
+                at: frame.at,
+                ...(host ? { host } : {}),
+              })),
           });
           this.onRoster?.();
         } catch {
@@ -342,7 +362,11 @@ export class RelayClient {
   #setRoster(roster: SignedMember[]): void {
     const seen = new Set<string>();
     for (const { record, mac } of roster) {
-      if (record.teamId !== this.#team.teamId || !teamMacOk(this.#team.teamKey, record, mac)) {
+      if (
+        record.teamId !== this.#team.teamId ||
+        record.deviceId !== deviceIdOf(record.signPub) ||
+        !teamMacOk(this.#team.teamKey, record, mac)
+      ) {
         this.#ctx.log.warn("ignoring roster entry with a bad team MAC", {
           deviceId: record.deviceId,
         });

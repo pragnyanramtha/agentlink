@@ -20,7 +20,7 @@ import {
   type PolicyOverrides,
   type Trust,
 } from "../core/policy.ts";
-import { scanSecrets } from "../core/redact.ts";
+import { scanParts } from "../core/redact.ts";
 import { type RenderItem, renderInjection } from "../core/render.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
@@ -367,6 +367,20 @@ export class Mailbox {
     hops: number,
   ): void {
     if (hops > LIMITS.maxHops) throw invalid(`too many forwarding hops (max ${LIMITS.maxHops})`);
+    // Applies to every sender, humans included: a full inbox means "wait until they catch up".
+    for (const r of recipients) {
+      if (r.remote) continue;
+      const unread = this.#ctx.store.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM deliveries WHERE ${r.agent ? "to_agent_id = ?" : "to_agent_id IS NULL AND to_addr = ?"} AND state IN ('queued','delivered','held')`,
+        r.agent ? r.agent.id : r.toAddr,
+      )?.n;
+      if ((unread ?? 0) >= LIMITS.maxUnreadPerRecipient) {
+        throw limited(
+          "inbox_full",
+          `${r.toAddr} has ${unread} unread messages; wait until it catches up`,
+        );
+      }
+    }
     if (sender.kind !== "agent") return; // humans are never throttled
     const { store } = this.#ctx;
     // `agentlink thread <id> --allow N` (by a human) raises both the thread cap and reply depth.
@@ -464,11 +478,14 @@ export class Mailbox {
       original?.thread_id ?? (input.thread ? this.resolveThread(input.thread) : undefined);
     const key = echoKey(`${input.kind}:${text}`);
     this.#checkGuards(sender, recipients, thread, original, key, input.hops ?? 0);
-    if (recipients.some((r) => r.remote) && !input.force) {
-      const secrets = scanSecrets(text);
-      if (secrets.length > 0) {
+    if (recipients.some((r) => r.remote)) {
+      // Anything leaving this machine is scanned: text, file names and bytes, and data parts.
+      const secrets = scanParts(input.parts ?? [{ kind: "text", text }]);
+      if (secrets.length > 0 && (!input.force || sender.kind === "agent")) {
         throw invalid(
-          `refusing to send what looks like a secret to a teammate (${[...new Set(secrets.map((s) => s.type))].join(", ")}); remove it, or resend with --force`,
+          sender.kind === "agent"
+            ? `refusing to send what looks like a secret to a teammate (${secrets.join(", ")}); remove it (only your user can override this)`
+            : `refusing to send what looks like a secret to a teammate (${secrets.join(", ")}); remove it, or resend with --force`,
         );
       }
     }

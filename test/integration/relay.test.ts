@@ -196,13 +196,54 @@ describe("team relay", () => {
     );
     expect(res.status).toBe(400);
     expect(JSON.stringify(res.data)).toContain("secret");
-    const forced = await alice.raw(
+    // an agent cannot override the scan; its user can
+    const agentForced = await alice.raw(
       "POST",
       "/v1/messages",
       { to: [bobAgentName], text: "key AKIAABCDEFGHIJKLMNOP", force: true },
       { as: "claude-web" },
     );
-    expect(forced.status).toBe(200);
+    expect(agentForced.status).toBe(400);
+    const humanForced = await alice.raw("POST", "/v1/messages", {
+      to: [bobAgentName],
+      text: "key AKIAABCDEFGHIJKLMNOP",
+      force: true,
+    });
+    expect(humanForced.status).toBe(200);
+    // secrets hide in files and data too
+    const inFile = await alice.raw("POST", "/v1/messages", {
+      to: [bobAgentName],
+      parts: [
+        {
+          kind: "file",
+          file: {
+            name: "notes.txt",
+            bytes: Buffer.from("token ghp_" + "a".repeat(36)).toString("base64"),
+          },
+        },
+      ],
+    });
+    expect(inFile.status).toBe(400);
+    const keyFile = await alice.raw("POST", "/v1/messages", {
+      to: [bobAgentName],
+      parts: [
+        { kind: "file", file: { name: "id_rsa", bytes: Buffer.from("hello").toString("base64") } },
+      ],
+    });
+    expect(keyFile.status).toBe(400);
+    const url = await alice.raw("POST", "/v1/messages", {
+      to: [bobAgentName],
+      text: "DATABASE_URL=postgres://admin:S3cretPass@db.internal:5432/prod",
+    });
+    expect(url.status).toBe(400);
+    // status text is shared with teammates, so it is scanned as well
+    const doing = await alice.raw(
+      "POST",
+      "/v1/agents/status",
+      { text: "debugging with AKIAIOSFODNN7EXAMPLE" },
+      { as: "claude-web" },
+    );
+    expect(doing.status).toBe(400);
   });
 
   it("queues for an offline machine and delivers when it comes back", async () => {

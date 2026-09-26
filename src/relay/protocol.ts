@@ -44,6 +44,7 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
     teamId: z.string().regex(/^[a-z0-9_-]{6,64}$/),
     device: PublicDeviceSchema,
     member: SignedMemberSchema,
+    createToken: z.string().max(200).optional(),
     ...Signed,
   }),
   z.object({

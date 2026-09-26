@@ -94,6 +94,7 @@ export const team: Command = async (ctx) => {
       const { values, positionals } = parse(sub2.argv, {
         relay: { type: "string", short: "r" },
         handle: { type: "string" },
+        "create-token": { type: "string" },
       });
       const [name] = positionals;
       if (!name || !values.relay) {
@@ -105,7 +106,12 @@ export const team: Command = async (ctx) => {
       const s = await ctx.client.request<TeamStatus>(
         "POST",
         "/v1/team/create",
-        { name, relay: values.relay, ...(values.handle ? { handle: values.handle } : {}) },
+        {
+          name,
+          relay: values.relay,
+          ...(values.handle ? { handle: values.handle } : {}),
+          ...(values["create-token"] ? { createToken: values["create-token"] } : {}),
+        },
         { timeoutMs: 20_000 },
       );
       out(ctx, s, () =>
@@ -232,13 +238,17 @@ export const relay: Command = async (ctx) => {
     host: { type: "string", default: "127.0.0.1" },
     port: { type: "string", default: "7700" },
     data: { type: "string" },
+    "create-token": { type: "string" },
   });
+  const createToken = values["create-token"] ?? process.env.AGENTLINK_RELAY_CREATE_TOKEN;
   const { startRelay } = await import("../../relay/server.ts");
+  process.umask(0o077);
   const running = await startRelay({
     dataDir: values.data ?? join(ctx.paths.home, "relay"),
     host: String(values.host),
     port: Number(values.port),
     logger: createLogger({ stderr: true }),
+    ...(createToken ? { createToken } : {}),
   });
   process.stdout.write(
     [

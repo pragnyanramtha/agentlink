@@ -215,7 +215,12 @@ export class TeamManager {
     };
   }
 
-  async create(name: string, relay: string, handle?: string): Promise<Record<string, unknown>> {
+  async create(
+    name: string,
+    relay: string,
+    handle?: string,
+    createToken?: string,
+  ): Promise<Record<string, unknown>> {
     if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
     const team: TeamState = {
       relay: normalizeRelay(relay),
@@ -228,7 +233,7 @@ export class TeamManager {
       admin: true,
       joinedAt: new Date().toISOString(),
     };
-    await this.#attach(team, { kind: "create" });
+    await this.#attach(team, { kind: "create", ...(createToken ? { createToken } : {}) });
     saveTeam(this.#ctx.paths, team);
     return this.status();
   }

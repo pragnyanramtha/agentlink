@@ -64,11 +64,16 @@ export function fingerprint(signPub: string): string {
   return hex.match(/.{4}/g)?.join("-") ?? hex;
 }
 
+/** A device id is derived from its signing key, so nobody can claim someone else's id. */
+export function deviceIdOf(signPub: string): string {
+  return `dev_${fingerprint(signPub).replace(/-/g, "").slice(0, 16)}`;
+}
+
 export function generateDeviceKeys(): DeviceKeys {
   const s = rawKeys("ed25519");
   const x = rawKeys("x25519");
   return {
-    deviceId: `dev_${fingerprint(s.pub).replace(/-/g, "").slice(0, 16)}`,
+    deviceId: deviceIdOf(s.pub),
     signPub: s.pub,
     signPriv: s.priv,
     boxPub: x.pub,

@@ -15,6 +15,8 @@ export const LIMITS = {
   cliAskDefaultWaitMs: 110_000,
   mcpAskDefaultWaitMs: 45_000,
   maxInboxBatch: 10,
+  /** Unread messages an agent (or your inbox) may pile up before senders are told to wait. */
+  maxUnreadPerRecipient: 500,
 } as const;
 
 /** Normalized content key for echo detection (case/whitespace/punctuation-insensitive). */

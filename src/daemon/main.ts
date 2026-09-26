@@ -3,6 +3,7 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -11,7 +12,7 @@ import {
   writeSync,
 } from "node:fs";
 import { connect } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { loadConfig } from "../core/config.ts";
 import { createLogger, type Logger } from "../core/log.ts";
 import { type Paths, resolvePaths } from "../core/paths.ts";
@@ -102,6 +103,16 @@ export async function startDaemon(
 ): Promise<RunningDaemon> {
   const paths = opts.paths ?? resolvePaths();
   mkdirSync(paths.runDir, { recursive: true, mode: 0o700 });
+  const socketDir = dirname(paths.socket);
+  if (socketDir !== paths.runDir) {
+    mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+    const st = lstatSync(socketDir);
+    if (!st.isDirectory() || st.uid !== process.getuid?.()) {
+      throw new Error(
+        `socket directory ${socketDir} is not a directory owned by you; refusing to use it`,
+      );
+    }
+  }
   chmodSync(paths.home, 0o700);
   chmodSync(paths.runDir, 0o700);
   const releaseLock = acquireLock(paths.runDir);
@@ -117,6 +128,14 @@ export async function startDaemon(
 
   const log = opts.logger ?? createLogger({ file: paths.log });
   const store = new Store(paths.db);
+  // The database holds message bodies: owner-only, including SQLite's side files.
+  for (const f of [paths.db, `${paths.db}-wal`, `${paths.db}-shm`]) {
+    try {
+      chmodSync(f, 0o600);
+    } catch {
+      // created later, under the daemon's umask
+    }
+  }
   const ctx: DaemonContext = {
     paths,
     config: loadConfig(paths),

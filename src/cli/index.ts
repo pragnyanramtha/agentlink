@@ -126,7 +126,8 @@ async function main(argv: string[]): Promise<number> {
   const paths = resolvePaths();
   const ctx: CliContext = {
     paths,
-    client: new Client(paths, globals.as ? { as: globals.as } : {}),
+    // Human-readable output gets terminal-safe strings; --json stays exactly as sent.
+    client: new Client(paths, { ...(globals.as ? { as: globals.as } : {}), clean: !globals.json }),
     json: globals.json,
     ...(globals.as ? { as: globals.as } : {}),
     argv: rest,

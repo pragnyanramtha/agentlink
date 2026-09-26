@@ -1,9 +1,9 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { WebSocket, WebSocketServer } from "ws";
-import { sha256, verifyJson } from "../core/crypto.ts";
+import { deviceIdOf, sha256, verifyJson } from "../core/crypto.ts";
 import { ulid } from "../core/ids.ts";
 import type { Logger } from "../core/log.ts";
 import { VERSION } from "../version.ts";
@@ -42,7 +42,11 @@ CREATE TABLE IF NOT EXISTS seen_nonces (nonce TEXT PRIMARY KEY, at INTEGER NOT N
 
 const QUEUE_TTL_MS = 7 * 24 * 3600_000;
 const MAX_QUEUE_PER_DEVICE = 5_000;
+const MAX_QUEUE_BYTES_PER_DEVICE = 100 * 1024 * 1024;
 const RATE_PER_MINUTE = 600;
+const FRAMES_PER_MINUTE = 1_200;
+const BYTES_PER_MINUTE = 50 * 1024 * 1024;
+const MAX_PRESENCE_BYTES = 64 * 1024;
 
 interface Conn {
   ws: WebSocket;
@@ -50,6 +54,8 @@ interface Conn {
   deviceId?: string;
   sentThisMinute: number;
   minute: number;
+  framesThisMinute: number;
+  bytesThisMinute: number;
 }
 
 export interface RelayOptions {
@@ -57,6 +63,8 @@ export interface RelayOptions {
   host?: string;
   port?: number;
   logger: Logger;
+  /** If set, creating a team requires this token (keeps a public relay from being used by anyone). */
+  createToken?: string;
 }
 
 export interface RunningRelay {
@@ -68,6 +76,14 @@ export interface RunningRelay {
 /** Self-hostable store-and-forward relay for sealed agentlink traffic. */
 export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   mkdirSync(opts.dataDir, { recursive: true, mode: 0o700 });
+  chmodSync(opts.dataDir, 0o700);
+  for (const f of ["relay.db", "relay.db-wal", "relay.db-shm"]) {
+    try {
+      chmodSync(join(opts.dataDir, f), 0o600);
+    } catch {
+      // not created yet
+    }
+  }
   const db = new DatabaseSync(join(opts.dataDir, "relay.db"));
   db.exec("PRAGMA journal_mode = WAL");
   db.exec(SCHEMA);
@@ -166,6 +182,25 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
       return welcome(c);
     }
     if (frame.t === "create" || frame.t === "join") {
+      if (frame.device.deviceId !== deviceIdOf(frame.device.signPub)) {
+        return send(c, {
+          t: "error",
+          code: "invalid",
+          message: "device id does not match its signing key",
+        });
+      }
+      const existing = one<{ sign_pub: string }>(
+        "SELECT sign_pub FROM devices WHERE team_id = ? AND device_id = ?",
+        frame.teamId,
+        frame.device.deviceId,
+      );
+      if (existing && existing.sign_pub !== frame.device.signPub) {
+        return send(c, {
+          t: "error",
+          code: "invalid",
+          message: "that device id belongs to another key",
+        });
+      }
       if (
         frame.member.record.deviceId !== frame.device.deviceId ||
         frame.member.record.signPub !== frame.device.signPub
@@ -179,6 +214,13 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
       const bad = verifySigned(frame, frame.device.signPub);
       if (bad) return send(c, { t: "error", code: "auth", message: bad });
       if (frame.t === "create") {
+        if (opts.createToken && frame.createToken !== opts.createToken) {
+          return send(c, {
+            t: "error",
+            code: "auth",
+            message: "this relay needs a create token to start a team (team create --create-token)",
+          });
+        }
         if (one("SELECT 1 FROM teams WHERE id = ?", frame.teamId)) {
           return send(c, { t: "error", code: "exists", message: "team already exists" });
         }
@@ -258,11 +300,6 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         return send(c, { t: "ok", op: "invite" });
       }
       case "send": {
-        const minute = Math.floor(Date.now() / 60_000);
-        if (c.minute !== minute) {
-          c.minute = minute;
-          c.sentThisMinute = 0;
-        }
         if (++c.sentThisMinute > RATE_PER_MINUTE) {
           return send(c, { t: "error", code: "rate", message: "rate limited", ref: frame.id });
         }
@@ -286,7 +323,13 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
             teamId,
             frame.to,
           )?.n ?? 0;
-        if (queued >= MAX_QUEUE_PER_DEVICE) {
+        const queuedBytes =
+          one<{ b: number | null }>(
+            "SELECT SUM(bytes) AS b FROM queue WHERE team_id = ? AND to_device = ?",
+            teamId,
+            frame.to,
+          )?.b ?? 0;
+        if (queued >= MAX_QUEUE_PER_DEVICE || queuedBytes >= MAX_QUEUE_BYTES_PER_DEVICE) {
           return send(c, {
             t: "error",
             code: "full",
@@ -322,6 +365,9 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         return;
       }
       case "presence": {
+        if (frame.box.ct.length > MAX_PRESENCE_BYTES) {
+          return send(c, { t: "error", code: "too_large", message: "presence is too large" });
+        }
         run(
           "INSERT INTO presence (team_id, device_id, box, at) VALUES (?, ?, ?, ?) ON CONFLICT(team_id, device_id) DO UPDATE SET box = excluded.box, at = excluded.at",
           teamId,
@@ -370,9 +416,22 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   });
   const wss = new WebSocketServer({ server: http, maxPayload: MAX_FRAME_BYTES });
   wss.on("connection", (ws) => {
-    const c: Conn = { ws, sentThisMinute: 0, minute: 0 };
+    const c: Conn = { ws, sentThisMinute: 0, minute: 0, framesThisMinute: 0, bytesThisMinute: 0 };
     conns.add(c);
     ws.on("message", (data) => {
+      const minute = Math.floor(Date.now() / 60_000);
+      if (c.minute !== minute) {
+        c.minute = minute;
+        c.sentThisMinute = 0;
+        c.framesThisMinute = 0;
+        c.bytesThisMinute = 0;
+      }
+      c.bytesThisMinute += (data as Buffer).length ?? 0;
+      if (++c.framesThisMinute > FRAMES_PER_MINUTE || c.bytesThisMinute > BYTES_PER_MINUTE) {
+        send(c, { t: "error", code: "rate", message: "too many frames; slow down" });
+        if (c.framesThisMinute > FRAMES_PER_MINUTE * 2) ws.close(4008, "rate limited");
+        return;
+      }
       let frame: ClientFrame;
       try {
         frame = ClientFrameSchema.parse(JSON.parse(String(data)));

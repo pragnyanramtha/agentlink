@@ -7,6 +7,7 @@ import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
 import { peerPid, stdinIsTty } from "../core/peer.ts";
 import { DEFAULT_POLICY, POLICY_ACTIONS, TRUSTS } from "../core/policy.ts";
 import { ancestry, isAlive, procCwd, procInfo } from "../core/proc.ts";
+import { scanSecrets } from "../core/redact.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { PROTOCOL_VERSION, VERSION } from "../version.ts";
 import type { Claims } from "./claims.ts";
@@ -297,9 +298,14 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   route("POST", "/v1/team/create", async (req) => {
     requireHuman(req, false);
     const body = z
-      .object({ name: z.string().min(1), relay: z.string().min(1), handle: z.string().optional() })
+      .object({
+        name: z.string().min(1),
+        relay: z.string().min(1),
+        handle: z.string().optional(),
+        createToken: z.string().optional(),
+      })
       .parse(req.body);
-    return s.team.create(body.name, body.relay, body.handle);
+    return s.team.create(body.name, body.relay, body.handle, body.createToken);
   });
 
   route("POST", "/v1/team/invite", async (req) => {
@@ -351,6 +357,13 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
 
   route("POST", "/v1/agents/status", (req) => {
     const body = z.object({ text: z.string().max(200).nullable() }).parse(req.body);
+    // Status text is shown to teammates on other machines.
+    const secrets = body.text ? scanSecrets(body.text) : [];
+    if (secrets.length) {
+      throw invalid(
+        `your status looks like it contains a secret (${[...new Set(secrets.map((f) => f.type))].join(", ")})`,
+      );
+    }
     return { agent: agentView(registry.setStatus(requireAgent(req).id, body.text || null)) };
   });
 

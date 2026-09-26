@@ -177,7 +177,7 @@ Release your claims (all of them when no path is given).`,
 List active file claims on this machine.`,
 
   team: `agentlink team [status]
-agentlink team create <name> --relay ws://<host>:7700 [--handle <you>]
+agentlink team create <name> --relay ws://<host>:7700 [--handle <you>] [--create-token <t>]
 agentlink team invite [--uses 1] [--ttl 24h]
 agentlink team join <invite> [--handle <you>] [--relay <url>]
 agentlink team relay <url>          use another address for the relay (after moving it)
@@ -194,11 +194,13 @@ Typical setup:
   (you)          agentlink team invite            # send the al1.… string privately
   (teammate)     agentlink team join al1.…`,
 
-  relay: `agentlink relay serve [--host 127.0.0.1] [--port 7700] [--data <dir>]
+  relay: `agentlink relay serve [--host 127.0.0.1] [--port 7700] [--data <dir>] [--create-token <t>]
 
 Run a self-hosted relay. It authenticates devices and queues sealed messages for
 offline machines; it cannot read them. Use --host 0.0.0.0 or a tailnet address
-so other machines can reach it. Default data dir: ~/.agentlink/relay.`,
+so other machines can reach it. Default data dir: ~/.agentlink/relay.
+On a public address, set --create-token (or AGENTLINK_RELAY_CREATE_TOKEN) so only
+people with the token can start teams: agentlink team create … --create-token <t>`,
 
   init: `agentlink init [--handle <you>]
 

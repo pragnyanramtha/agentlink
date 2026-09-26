@@ -2,6 +2,7 @@ import { type AckValue, type Kind, preview } from "./envelope.ts";
 import { boundaryToken } from "./ids.ts";
 import { LIMITS } from "./limits.ts";
 import type { Trust } from "./policy.ts";
+import { safeInject } from "./sanitize.ts";
 
 export interface RenderItem {
   id: string;
@@ -61,13 +62,15 @@ function action(item: RenderItem): string {
 
 /** Prevents message bodies from imitating our wrapper tags. */
 function neutralize(text: string): string {
-  return text.replace(/<\/?\s*agentlink-msg/gi, (m) => m.replace("agentlink-msg", "agentlink_msg"));
+  return text.replace(/<\s*\/?\s*agentlink-msg/gi, (m) =>
+    m.replace(/agentlink-msg/i, "agentlink_msg"),
+  );
 }
 
 function renderOne(item: RenderItem, maxBodyChars: number): string {
   const token = boundaryToken();
   const open = `<${TAG}-${token} id="${item.id}" thread="${item.thread}" kind="${item.kind}" from="${item.from}" trust="${item.trust}" sent="${item.sentAt}">`;
-  let body = neutralize(item.text);
+  let body = neutralize(safeInject(item.text));
   if (body.length > maxBodyChars) {
     body = `${body.slice(0, maxBodyChars)}\n… (truncated; full text: agentlink show ${item.id})`;
   }
@@ -78,7 +81,7 @@ function renderOne(item: RenderItem, maxBodyChars: number): string {
     );
   }
   lines.push("---", body);
-  for (const att of item.attachments) lines.push(`[${att}]`);
+  for (const att of item.attachments) lines.push(`[${neutralize(safeInject(att))}]`);
   lines.push(`</${TAG}-${token}>`);
   return lines.join("\n");
 }

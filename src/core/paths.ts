@@ -24,8 +24,11 @@ export function resolvePaths(env: NodeJS.ProcessEnv = process.env): Paths {
   const runDir = join(home, "run");
   let socket = join(runDir, "agentlink.sock");
   if (socket.length > MAX_SOCKET_PATH) {
+    // Too long for a Unix socket: use the per-user runtime dir, or a private dir under /tmp
+    // (the daemon creates it 0700 and refuses it if someone else owns it).
     const tag = createHash("sha256").update(home).digest("hex").slice(0, 12);
-    socket = join(tmpdir(), `agentlink-${userInfo().uid}-${tag}.sock`);
+    const base = env.XDG_RUNTIME_DIR || join(tmpdir(), `agentlink-${userInfo().uid}`);
+    socket = join(base, `agentlink-${tag}.sock`);
   }
   return {
     home,

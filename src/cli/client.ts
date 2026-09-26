@@ -4,6 +4,7 @@ import { request } from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Paths } from "../core/paths.ts";
 import { ancestry } from "../core/proc.ts";
+import { safeTerminal } from "../core/sanitize.ts";
 
 export class ApiError extends Error {
   readonly code: string;
@@ -51,10 +52,14 @@ export class Client {
   readonly #timeoutMs: number;
   #caller: string | undefined;
 
-  constructor(paths: Paths, opts: { as?: string; timeoutMs?: number } = {}) {
+  readonly #clean: boolean;
+
+  /** `clean` makes every string in responses safe for a terminal (for human-readable output). */
+  constructor(paths: Paths, opts: { as?: string; timeoutMs?: number; clean?: boolean } = {}) {
     this.paths = paths;
     this.#as = opts.as;
     this.#timeoutMs = opts.timeoutMs ?? 15_000;
+    this.#clean = opts.clean ?? false;
   }
 
   #header(): string {
@@ -118,7 +123,7 @@ export class Client {
                 ),
               );
             }
-            resolve(data as T);
+            resolve((this.#clean ? cleanStrings(data) : data) as T);
           });
         },
       );
@@ -242,4 +247,13 @@ export function spawnDaemon(paths: Paths): void {
     },
   );
   child.unref();
+}
+
+function cleanStrings(value: unknown): unknown {
+  if (typeof value === "string") return safeTerminal(value);
+  if (Array.isArray(value)) return value.map(cleanStrings);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, cleanStrings(v)]));
+  }
+  return value;
 }
