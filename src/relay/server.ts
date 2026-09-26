@@ -160,7 +160,9 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   // Queued messages go out in pages of 500, oldest first, continuing after the last one sent
   // (a cursor), so messages the device does not ack (sender not in its roster yet) cannot hold up
   // the rest; they stay queued for the next connection. The next page follows when the device has
-  // acked most of the current one, or after 30 seconds.
+  // acked most of the current one, or after 30 seconds. Messages that also went out live while a
+  // device catches up may be sent twice; daemons drop duplicates by message id. Ordering uses the
+  // relay's clock: if it jumps backwards, a message may wait for the device's next connection.
   const flushQueue = (c: Conn) => {
     clearTimeout(c.pageTimer);
     const after = c.cursor ?? { at: "", id: "" };
