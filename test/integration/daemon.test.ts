@@ -128,6 +128,43 @@ describe("names across projects", () => {
   });
 });
 
+describe("names across projects with the same folder name", () => {
+  it("does not take over <tool>-<folder> from another place with that folder name", async () => {
+    const { mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const [one, two, busy] = [
+      join(t.home, "a", "api"),
+      join(t.home, "b", "api"),
+      join(t.home, "c"),
+    ];
+    for (const d of [one, two, busy]) mkdirSync(d, { recursive: true });
+    // "codex" stays taken by a live session, so the others are named after their folder
+    const keep = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "keep", cwd: busy }, keep);
+    const a = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "sa", cwd: one }, a);
+    await register("sender2");
+    await t
+      .client("sender2")
+      .request("POST", "/v1/messages", { to: ["codex-api"], text: "for a/api only" });
+    a.kill();
+    await until(async () =>
+      (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents.find(
+        (x) => x.name === "codex-api" && x.state === "offline",
+      ),
+    );
+    const b = t.fakeAgentProcess("codex");
+    const started = await t.hook<Json>("codex", "session-start", { session_id: "sb", cwd: two }, b);
+    expect(started.stdout).not.toContain("for a/api only");
+    const names = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents.map(
+      (x) => x.name,
+    );
+    expect(names).toContain("codex-api-2");
+    keep.kill();
+    b.kill();
+  });
+});
+
 describe("messaging", () => {
   it("ask blocks until the reply arrives; the reply is not injected twice", async () => {
     await register("alpha");

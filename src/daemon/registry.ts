@@ -230,7 +230,10 @@ export class Registry {
       const row = this.byName(name);
       if (!row) return { name };
       if (isLive(row) || row.tool !== tool || row.name_source !== "auto") continue;
-      if (name !== short || (place && placeOf(row) === place)) return { name, takeover: row };
+      // Folder names are not unique (~/work/api, ~/oss/api): every name needs the same place.
+      if (!place || placeOf(row) === place) return { name, takeover: row };
+      if (name !== short) continue;
+      // Deliberately no alias for the vacated name: it now belongs to the new session.
       const aside = this.#freeName(
         `${short}-${slugify(basename(placeOf(row) ?? "") || "old", 40)}`,
       );
