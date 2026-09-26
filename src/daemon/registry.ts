@@ -203,10 +203,6 @@ export class Registry {
   }
 
   /**
-   * `<tool>-<repo>`; a second live session in the same repo is told apart by its branch
-   * (`claude-web-feat-login`) when it has one, and by a number otherwise.
-   */
-  /**
    * Names stay short: the first session of a tool is just `codex`. Another live session of the
    * same tool gets its repo (`codex-api`), then its branch (`codex-api-feat-login`), then a number.
    * A new session in the same place (git repo, else working directory) takes over an offline
