@@ -11,6 +11,7 @@ import {
   onPath,
   planCore,
   planTool,
+  skillPath,
   TOOL_BINARIES,
   VirtualFs,
 } from "../../adapters/install/targets.ts";
@@ -76,8 +77,9 @@ async function run(ctx: CliContext, install: boolean): Promise<number> {
   if (!install) {
     // Keep instruction blocks that tools we are not removing still use (e.g. a shared AGENTS.md).
     for (const other of INSTALL_TOOLS.filter((t) => !tools.includes(t))) {
-      const path = instructionPath(other, ictx);
-      if (path && isWired(other, ictx)) fs.revert(path);
+      if (!isWired(other, ictx)) continue;
+      for (const path of [instructionPath(other, ictx), skillPath(other, ictx)])
+        if (path) fs.revert(path);
     }
   }
   const changes = fs.changes();
@@ -299,4 +301,11 @@ export const doctor: Command = async (ctx) => {
       .join("\n"),
   );
   return rows.some((r) => r.ok === false) ? 1 : 0;
+};
+
+export const guide: Command = async (ctx) => {
+  parse(ctx.argv, {});
+  const { GUIDE } = await import("../../adapters/install/skill.ts");
+  process.stdout.write(GUIDE);
+  return 0;
 };

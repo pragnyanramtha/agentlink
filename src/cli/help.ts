@@ -24,6 +24,7 @@ Teams (other machines, other people)
   relay serve                        run a relay (self-hosted)
 
 Setup & control
+  guide                              how agents should use agentlink (what the skill contains)
   init · install <tool…|all> · uninstall · doctor
   daemon start|stop|restart|status|logs · watch · log
   pause · resume · mute <agent> · unmute <agent>
@@ -217,7 +218,8 @@ Set your handle (how teammates address you) and start the daemon.`,
   install: `agentlink install <tool…|all> [--project <dir>] [--dry-run] [--no-mcp]
 
 Wire agentlink into agent CLIs: hooks (presence + message delivery), the MCP server,
-and a short instruction block. Existing hooks are kept; every file is backed up
+an agentlink skill (the full guide, loaded when relevant) and one line in each CLI's
+instruction file (AGENTS.md, CLAUDE.md, …). Existing hooks are kept; every file is backed up
 under ~/.agentlink/backups. Tools: claude codex opencode cursor devin agy copilot gemini.
 
   -p, --project <dir>   install into one project instead of your user config
@@ -228,6 +230,12 @@ Examples:
   agentlink install all --dry-run
   agentlink install claude codex
   agentlink install all --project .`,
+
+  guide: `agentlink guide
+
+Print the guide agents follow: how to find peers, ask, reply, hand off work, and treat
+incoming messages. install puts the same text in each CLI's agentlink skill; the
+instruction files (AGENTS.md, CLAUDE.md, …) only get one line pointing to it.`,
 
   uninstall: `agentlink uninstall <tool…|all> [--project <dir>] [--dry-run]
 

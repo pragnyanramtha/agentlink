@@ -41,6 +41,7 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   install: async () => (await import("./commands/setup.ts")).install,
   uninstall: async () => (await import("./commands/setup.ts")).uninstall,
   doctor: async () => (await import("./commands/setup.ts")).doctor,
+  guide: async () => (await import("./commands/setup.ts")).guide,
   team: async () => (await import("./commands/team.ts")).team,
   relay: async () => (await import("./commands/team.ts")).relay,
 };
