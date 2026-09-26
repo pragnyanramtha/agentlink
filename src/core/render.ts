@@ -83,7 +83,7 @@ function action(item: RenderItem): string {
       return `${verb} ${whose} ${item.ack === "processed" || !item.ack ? "message" : "handoff"} ${about(item)}.`;
     }
     case "info":
-      return "FYI.";
+      return "FYI: no reply needed.";
   }
 }
 

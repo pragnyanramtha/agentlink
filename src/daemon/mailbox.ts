@@ -530,6 +530,19 @@ export class Mailbox {
       input.ack === "accept" &&
       this.participants(this.envelopeOf(original)).length > 2;
     const authorFollowUp = !!original && !input.to?.length && this.#isAuthor(sender, original);
+    // Seen in practice: an agent "clearing" an FYI with reply --all "processed" pings everyone.
+    if (
+      input.replyAll &&
+      sender.kind === "agent" &&
+      original?.kind === "info" &&
+      /^\s*(ok(ay)?|processed|noted|ack(nowledged)?|got it|thanks?( you)?|received|done|seen|read)\W*$/i.test(
+        text,
+      )
+    ) {
+      throw invalid(
+        `${original.id.slice(0, 12)} was an FYI: nobody needs an answer. Carry on (or confirm to the sender only: agentlink ack ${original.id.slice(0, 12)})`,
+      );
+    }
     if (input.replyAll || groupDecision || authorFollowUp) {
       if (!original) throw invalid("--all needs a message to answer");
       const me = sender.kind === "agent" ? sender.agent.name : `@${this.handle}`;

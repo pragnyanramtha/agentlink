@@ -571,6 +571,30 @@ describe("usability fixes, round 3", () => {
     expect(res2.deliveries[0]?.to).toBe("tagged");
   });
 
+  it("an agent cannot reply-all 'processed' to an FYI, but can add something real", async () => {
+    await register("fy0");
+    await register("fy1");
+    await register("fy2");
+    const fyi = await t
+      .client("fy0")
+      .request<SendRes>("POST", "/v1/messages", { to: ["fy1", "fy2"], text: "hello world" });
+    const noise = await t.raw(
+      "POST",
+      "/v1/messages",
+      { kind: "reply", replyTo: fyi.message.id, replyAll: true, text: "processed" },
+      { as: "fy1" },
+    );
+    expect(noise.status).toBe(400);
+    expect(JSON.stringify(noise.data)).toContain("was an FYI");
+    const real = await t.raw(
+      "POST",
+      "/v1/messages",
+      { kind: "reply", replyTo: fyi.message.id, replyAll: true, text: "heads up: main is red" },
+      { as: "fy1" },
+    );
+    expect(real.status).toBe(200);
+  });
+
   it("answers quote the question they answer", async () => {
     await register("qa");
     await register("qb");

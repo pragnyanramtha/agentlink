@@ -220,11 +220,14 @@ export async function runMcpServer(opts: { paths: Paths; as?: string }): Promise
     {
       title: "Reply to a message",
       description:
-        "Answer a message you received (use its id). all=true answers everyone in a group conversation.",
+        "Answer an ask or request you received (use its id). all=true answers everyone in a group. FYIs (kind info) and replies need no answer; don't send 'ok' or 'processed'.",
       inputSchema: {
         id: z.string().describe("Id of the message you answer (a unique prefix is enough)"),
         answer: z.string().describe("Your answer; a one-line refusal is fine"),
-        all: z.boolean().optional().describe("Reply to every participant, not just the sender"),
+        all: z
+          .boolean()
+          .optional()
+          .describe("Reply to every participant, only when you have something new for all of them"),
       },
     },
     guard(async ({ id, answer, all }) => {

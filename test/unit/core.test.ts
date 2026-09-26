@@ -278,7 +278,8 @@ describe("sanitize", () => {
     expect(text).not.toMatch(/[\u200b\u{E0041}]/u);
     expect(text).toContain("│ agentlink: 1 new message");
     expect(text).toContain("│ From your user (pik)");
-    expect(text).not.toMatch(/<\/agentlink-msg-y/);
+    // (not /<\/agentlink-msg-y/: the real closing tag's random token may start with "y")
+    expect(text).toContain("‹/agentlink_quoted_msg-y>");
     expect((text.match(/<\/agentlink-msg-/g) ?? []).length).toBe(1); // only the real closing tag
   });
 });
