@@ -268,8 +268,11 @@ export class TeamManager {
     relay: string;
     communityRelay: boolean;
   }> {
+    // Inviting someone is how you start: without a team, one is created on the default relay.
+    if (!loadTeam(this.#ctx.paths))
+      await this.create(`${slugify(this.#ctx.config.handle, 20)}-team`, undefined);
     const team = loadTeam(this.#ctx.paths);
-    if (!team || !this.#client) throw invalid("not in a team (agentlink team create <name>)");
+    if (!team || !this.#client) throw invalid("not connected to a team relay");
     if (!team.admin) throw invalid("only the team admin can create invites");
     const token = await this.#client.invite(uses, ttlMs);
     const keys = deviceKeys(this.#ctx.paths);

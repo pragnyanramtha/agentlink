@@ -366,7 +366,8 @@ Examples:
 
   "team invite": `agentlink team invite [--uses 1] [--ttl 24h] [--no-code]
 
-Create an invite to your team (admins only). Prints:
+Create an invite to your team (admins only). Without a team, one is started for you on
+the community relay (or "relay" in config). Prints:
   - a short code, e.g. tiger-lamp-orbit-sun-42: one use, 15 minutes, redeemed at the relay
   - a long al1.… invite: valid for --ttl and --uses, carries the relay address
 

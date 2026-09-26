@@ -510,6 +510,27 @@ describe("team relay", () => {
     expect(ok.status).toBe(200);
   });
 
+  it("inviting without a team starts one on the default relay", async () => {
+    const before = process.env.AGENTLINK_RELAY;
+    process.env.AGENTLINK_RELAY = relay.url; // never the real community relay in tests
+    const solo = await startTestDaemon({ handle: "solo" });
+    try {
+      const inv = await solo.raw<{ code: string }>("POST", "/v1/team/invite", {});
+      expect(inv.status).toBe(200);
+      expect(inv.data.code).toMatch(/^[a-z]+-[a-z]+-[a-z]+-[a-z]+-\d{2}$/);
+      const team = await solo
+        .client()
+        .request<{ team: { name: string; admin: boolean; relay: string } }>("GET", "/v1/team");
+      expect(team.team.admin).toBe(true);
+      expect(team.team.relay).toBe(relay.url);
+    } finally {
+      if (before === undefined) delete process.env.AGENTLINK_RELAY;
+      else process.env.AGENTLINK_RELAY = before;
+      await solo.raw("POST", "/v1/team/leave", {});
+      await solo.stop();
+    }
+  }, 30_000);
+
   it("rejects unknown team members and needs a team for team addresses", async () => {
     const res = await alice.raw(
       "POST",
