@@ -477,14 +477,12 @@ describe("usability fixes, round 3", () => {
   it("asking an offline agent returns at once, and a renamed agent keeps its old name as an alias", async () => {
     const asker = await register("q1");
     const gone = t.fakeAgentProcess("generic");
-    await t
-      .client()
-      .request("POST", "/v1/agents/register", {
-        tool: "generic",
-        name: "gone",
-        pid: gone.pid,
-        state: "idle",
-      });
+    await t.client().request("POST", "/v1/agents/register", {
+      tool: "generic",
+      name: "gone",
+      pid: gone.pid,
+      state: "idle",
+    });
     gone.kill();
     await new Promise((r) => setTimeout(r, 100));
     const started = Date.now();
@@ -510,13 +508,11 @@ describe("usability fixes, round 3", () => {
   it("answers quote the question they answer", async () => {
     await register("qa");
     await register("qb");
-    const ask = await t
-      .client("qa")
-      .request<SendRes>("POST", "/v1/messages", {
-        to: ["qb"],
-        kind: "ask",
-        text: "Should we use pnpm or npm?",
-      });
+    const ask = await t.client("qa").request<SendRes>("POST", "/v1/messages", {
+      to: ["qb"],
+      kind: "ask",
+      text: "Should we use pnpm or npm?",
+    });
     await t
       .client("qb")
       .request("POST", "/v1/messages", { kind: "reply", replyTo: ask.message.id, text: "pnpm" });
@@ -533,13 +529,11 @@ describe("usability fixes, round 3", () => {
       { scope: "local", kind: "request", action: "hold" },
       { tty: true },
     );
-    const res = await t
-      .client("dn1")
-      .request<SendRes>("POST", "/v1/messages", {
-        to: ["dn2"],
-        kind: "request",
-        text: "rm -rf build",
-      });
+    const res = await t.client("dn1").request<SendRes>("POST", "/v1/messages", {
+      to: ["dn2"],
+      kind: "request",
+      text: "rm -rf build",
+    });
     await t.raw("POST", `/v1/approvals/${res.message.id}`, { decision: "deny" }, { tty: true });
     const notice = await t.client("dn1").request<{ items: Item[] }>("GET", "/v1/inbox");
     expect(notice.items.some((i) => i.text.includes("denied"))).toBe(true);
