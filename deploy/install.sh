@@ -42,6 +42,11 @@ case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
   *) say "  Add it to your PATH:  export PATH=\"$PREFIX/bin:\$PATH\"  (and put that in your shell profile)";;
 esac
+if [ "$(uname -s)" = "Linux" ] && ! command -v ss >/dev/null 2>&1; then
+  say ""
+  say "! 'ss' is missing (package iproute2). Without it agentlink cannot check which agent is"
+  say "  calling and trusts what callers claim. Install it, e.g.: sudo apt install iproute2"
+fi
 say ""
 say "Next:"
 say "  agentlink setup                     # wire up every agent CLI on this machine (--dry-run to preview)"

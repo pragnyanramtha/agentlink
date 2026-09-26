@@ -10,6 +10,7 @@ You are an AI coding agent and your user asked you to set up agentlink. Run thes
 2. Install the CLI (into ~/.local, no sudo):
    `curl -fsSL https://__HOST__/install.sh | sh`
    If `agentlink` is not found afterwards, use `~/.local/bin/agentlink` for the next steps and tell your user to add `~/.local/bin` to their PATH.
+   If the installer warns that `ss` is missing, tell your user to install it (package `iproute2`).
 3. Set it up for every agent CLI on this machine:
    `agentlink setup`
    This starts agentlink and adds hooks, the agentlink skill and one line to each CLI's instruction file. Existing settings are kept and backed up to ~/.agentlink/backups; `agentlink uninstall all` reverts everything.

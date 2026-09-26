@@ -541,6 +541,32 @@ describe("team relay", () => {
     expect(res.status).toBe(404);
   });
 
+  it("asking a teammate's agent whose session ended returns at once (its daemon is still up)", async () => {
+    const gone = await registerAgent(bob, "short-lived");
+    await until(async () => {
+      const { agents } = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+      return agents.find((a) => a.name === "bob/short-lived" && a.state === "idle");
+    }, 8_000);
+    gone.kill();
+    await until(async () => {
+      const { agents } = await alice
+        .client()
+        .request<{ agents: Json[] }>("GET", "/v1/agents?all=1");
+      return agents.find((a) => a.name === "bob/short-lived" && a.state === "offline");
+    }, 15_000);
+    const started = Date.now();
+    const res = await alice
+      .client("claude-web")
+      .request<SendRes & { offline?: boolean }>(
+        "POST",
+        "/v1/messages",
+        { to: ["bob/short-lived"], kind: "ask", text: "still there?", waitMs: 20_000 },
+        { timeoutMs: 25_000 },
+      );
+    expect(res.offline).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5_000);
+  }, 40_000);
+
   it("delivers a backlog longer than one page after a device comes back", async () => {
     const home = bob.home;
     await bob.stop(true);

@@ -220,6 +220,16 @@ export const doctor: Command = async (ctx) => {
     label: "launcher",
     detail: executable(ictx.shim) ? ictx.shim : `missing ${ictx.shim} (agentlink install <tool>)`,
   });
+  if (process.platform === "linux") {
+    const ss = onPath(["ss"]);
+    rows.push({
+      ok: !!ss,
+      label: "caller check",
+      detail: ss
+        ? "verifies which agent is calling (kernel socket table via ss)"
+        : "'ss' is missing (install iproute2): agents' identities are not verified",
+    });
+  }
   const onPathAt = onPath(["agentlink"]);
   const pinned = onPathAt ? launcherHome(onPathAt) : undefined;
   const otherHome = !!pinned && resolve(pinned) !== resolve(ctx.paths.home);
@@ -355,6 +365,13 @@ export const setup: Command = async (ctx) => {
     return started.code;
   }
   lines.push(`${c.green("✓")} agentlink is running (${ctx.paths.home})`);
+  if (process.platform === "linux" && !onPath(["ss"])) {
+    lines.push(
+      c.yellow(
+        "! 'ss' (package iproute2) is missing: agentlink cannot verify which agent is calling. Install it.",
+      ),
+    );
+  }
   if (found.length === 0) {
     lines.push(
       c.yellow(

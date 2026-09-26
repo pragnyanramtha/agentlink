@@ -111,6 +111,14 @@ export class TeamManager {
       teamName: team.teamName,
       selfHandle: team.handle,
       online: (handle) => client.members().some((m) => m.handle === handle && m.online),
+      agentOnline: (handle, agent) =>
+        client.members().some((m) => m.handle === handle && m.online) &&
+        client
+          .remoteAgents()
+          .some(
+            (r) =>
+              r.member === handle && r.name === agent && (r.state === "busy" || r.state === "idle"),
+          ),
       infoOf: (handle, agent) => {
         const a = client.remoteAgents().find((r) => r.member === handle && r.name === agent);
         return a ? { tool: a.tool, ...(a.host ? { host: a.host } : {}) } : undefined;

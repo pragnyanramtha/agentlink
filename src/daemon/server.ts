@@ -428,10 +428,14 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       .every((d) => {
         const to = String(d.to);
         if (to.includes("/") || to.startsWith("@")) {
-          const handle = to.startsWith("@") ? to.slice(1) : (to.split("/")[0] as string);
-          return handle !== mailbox.handle && mailbox.remote
-            ? !mailbox.remote.online(handle)
-            : false;
+          const [handle, agent] = to.startsWith("@")
+            ? [to.slice(1), undefined]
+            : (to.split("/") as [string, string]);
+          if (handle === mailbox.handle || !mailbox.remote) return false;
+          // A teammate's agent is reachable only while its session runs, not just its daemon.
+          return agent
+            ? !mailbox.remote.agentOnline(handle, agent)
+            : !mailbox.remote.online(handle);
         }
         const agent = registry.byName(to);
         return !!agent && !isLive(agent);

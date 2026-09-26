@@ -83,6 +83,8 @@ export interface RemoteRouter {
   selfHandle: string;
   /** Whether any device of a teammate is connected to the relay. */
   online(handle: string): boolean;
+  /** Whether that teammate's agent session is running (its device is connected and says so). */
+  agentOnline(handle: string, agent: string): boolean;
   /** Current name of a teammate's agent that used to be called `agent`. */
   aliasesOf(handle: string, agent: string): string | undefined;
   /** Tool and host of a teammate's agent, from presence. */
