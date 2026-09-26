@@ -242,6 +242,16 @@ describe("proc", () => {
     expect(findToolProcess("codex", chain)?.pid).toBe(8);
     expect(findToolProcess("gemini", chain)?.pid).toBe(8);
   });
+  it("counts the caller itself when a plugin calls from inside the agent (OpenCode)", async () => {
+    const { detectTool } = await import("../../src/core/proc.ts");
+    // opencode run started from a shell; the plugin's request comes from the opencode process
+    const chain = [
+      { pid: 933, ppid: 927, cmd: ["opencode", "run", "-m", "x"] },
+      { pid: 927, ppid: 1, cmd: ["sh", "-c", "opencode run …"] },
+    ];
+    expect(detectTool(chain)?.proc.pid).toBe(933);
+    expect(findToolProcess("opencode", chain)?.pid).toBe(933);
+  });
 });
 
 describe("sanitize", () => {

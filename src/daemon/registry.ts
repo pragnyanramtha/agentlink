@@ -112,6 +112,14 @@ export class Registry {
             repo?.branch ?? undefined,
           );
       if (chosen.takeover) {
+        if (!input.pid) {
+          // Never keep the previous session's process: it is gone, and a stale pid would make the
+          // new session's own calls look like someone else's.
+          this.#ctx.store.run(
+            "UPDATE agents SET pid = NULL, pid_start = NULL WHERE id = ?",
+            chosen.takeover.id,
+          );
+        }
         if (
           input.sessionId &&
           chosen.takeover.session_id &&

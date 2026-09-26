@@ -100,7 +100,9 @@ export function matchesTool(tool: string, info: ProcInfo): boolean {
  * named on the hook command line is only a hint.
  */
 export function detectTool(chain: ProcInfo[]): { tool: string; proc: ProcInfo } | undefined {
-  for (const proc of chain.slice(1)) {
+  // The caller itself counts too: plugins (OpenCode) call from inside the agent process, while
+  // hook commands are a child of it (their own entry never matches a tool).
+  for (const proc of chain) {
     for (const tool of Object.keys(TOOL_PATTERNS)) {
       if (matchesTool(tool, proc)) return { tool, proc };
     }
@@ -115,9 +117,9 @@ const SHELLS = /(^|\/)(sh|bash|zsh|dash|fish|env|timeout|nohup|script)$/;
  * tool binary, else the first non-shell ancestor above the hook process.
  */
 export function findToolProcess(tool: string, chain: ProcInfo[]): ProcInfo | undefined {
-  const above = chain.slice(1);
-  const byName = above.find((p) => matchesTool(tool, p));
+  const byName = chain.find((p) => matchesTool(tool, p));
   if (byName) return byName;
+  const above = chain.slice(1);
   return above.find((p) => !SHELLS.test(p.cmd[0] ?? "") && !/agentlink/.test(p.cmd.join(" ")));
 }
 
