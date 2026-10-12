@@ -137,4 +137,9 @@ export const MIGRATIONS: string[] = [
     created_at TEXT NOT NULL
   );
   `,
+  // 5: history browsing (log/search filters, prune by age). The full-text index (messages_fts)
+  // is created at startup by ensureSearchIndex: SQLite builds without FTS5 must still start.
+  `
+  CREATE INDEX messages_created ON messages(created_at);
+  `,
 ];

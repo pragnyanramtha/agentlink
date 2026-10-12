@@ -29,6 +29,7 @@ import { DeliveryEngine } from "./delivery.ts";
 import { EventBus } from "./events.ts";
 import { HookHandler } from "./hooks.ts";
 import { Mailbox } from "./mailbox.ts";
+import { DesktopNotifier } from "./notify.ts";
 import { isLive, Registry } from "./registry.ts";
 import { createDaemonServer, type Services } from "./server.ts";
 import { Store } from "./store/db.ts";
@@ -161,6 +162,8 @@ export async function startDaemon(
   const hooks = new HookHandler(ctx, registry, mailbox, engine);
   const claims = new Claims(ctx);
   const team = new TeamManager(ctx, registry, mailbox, engine);
+  const notifier = new DesktopNotifier(ctx, mailbox);
+  const stopNotifier = notifier.start();
   const services: Services = {
     ctx,
     registry,
@@ -170,6 +173,7 @@ export async function startDaemon(
     claims,
     opencode,
     team,
+    notifier,
     ...(opts.trustClientCaller ? { trustClientCaller: true } : {}),
   };
 
@@ -178,6 +182,7 @@ export async function startDaemon(
     closing ??= new Promise<void>((resolve) => {
       clearInterval(sweep);
       clearInterval(expiry);
+      stopNotifier();
       team.stop();
       server.close(() => {
         rmSync(paths.socket, { force: true });
@@ -216,11 +221,23 @@ export async function startDaemon(
   server.on("request", () => {
     lastActivity = Date.now();
   });
+  let lastPrune = 0;
   const sweep = setInterval(() => {
     try {
       registry.sweep();
     } catch (error) {
       log.warn("sweep failed", { error: String(error) });
+    }
+    // Config retention: prune finished messages at most hourly (follows config reloads).
+    const days = ctx.config.retention?.days;
+    if (days && Date.now() - lastPrune >= 3_600_000) {
+      lastPrune = Date.now();
+      try {
+        const pruned = mailbox.prune(Math.max(days * 86_400_000, 3_600_000));
+        if (pruned.messages) log.info("retention pruned messages", pruned);
+      } catch (error) {
+        log.warn("retention prune failed", { error: String(error) });
+      }
     }
     if (!opts.idleExitMs) return;
     if (registry.list().some(isLive)) {

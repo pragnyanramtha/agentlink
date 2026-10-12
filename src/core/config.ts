@@ -20,6 +20,10 @@ export const ConfigSchema = z.object({
       tmux: z.boolean().default(true),
     })
     .prefault({}),
+  /** Delete finished messages older than this in the daemon's sweep. Unset: keep forever. */
+  retention: z.object({ days: z.number().positive().max(36_500).optional() }).optional(),
+  /** Desktop notifications for you: new mail, approvals needed (notify-send / osascript). */
+  notify: z.object({ desktop: z.boolean().default(false) }).prefault({}),
 });
 export type Config = z.infer<typeof ConfigSchema>;
 

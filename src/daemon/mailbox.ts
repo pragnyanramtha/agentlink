@@ -2,6 +2,7 @@ import { formatAddr, parseAddress } from "../core/addr.ts";
 import {
   type AckValue,
   type Addr,
+  AddrSchema,
   describePart,
   type Envelope,
   EnvelopeSchema,
@@ -28,6 +29,7 @@ import { safeField } from "../core/sanitize.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import { isLive, type Registry } from "./registry.ts";
+import { ensureSearchIndex, searchDoc } from "./store/search.ts";
 import {
   type AgentRow,
   type DeliveryRow,
@@ -72,6 +74,48 @@ export interface SendResult {
 }
 
 export type InboxTarget = { agent: AgentRow } | { human: true };
+
+/** History filters (search, log). Addresses as people type them: "alpha", "me/alpha", "@bob". */
+export interface MessageFilter {
+  from?: string;
+  to?: string;
+  kinds?: Kind[];
+  since?: string;
+  until?: string;
+  thread?: string;
+  repo?: string;
+  /** Only what the viewer sent. */
+  mine?: boolean;
+}
+
+export interface SearchRow {
+  id: string;
+  thread: string;
+  kind: Kind;
+  from: string;
+  to: string[];
+  createdAt: string;
+  snippet: string;
+  tokens: number;
+}
+
+export interface ThreadSummary {
+  thread: string;
+  subject: string;
+  participants: string[];
+  messages: number;
+  lastAt: string;
+  lastFrom: string;
+  lastPreview: string;
+  open: boolean;
+  /** An ask/request/handoff in it waits for the viewer's answer. */
+  needsAnswer: boolean;
+  /** The viewer waits for someone else's answer. */
+  waiting: boolean;
+  unread: number;
+}
+
+const EXPECTING = "('ask','request','handoff','review_request')";
 
 export type WaitOutcome =
   | { kind: "reply"; message: MessageRow }
@@ -130,10 +174,15 @@ export class Mailbox {
   readonly #replyWaiters = new Map<string, Set<() => void>>();
   readonly #inboxWaiters = new Map<string, Set<() => void>>();
   remote: RemoteRouter | undefined;
+  /** Full-text index available (SQLite FTS5); otherwise search uses LIKE. */
+  readonly fts: boolean;
 
   constructor(ctx: DaemonContext, registry: Registry) {
     this.#ctx = ctx;
     this.#registry = registry;
+    // AGENTLINK_NO_FTS=1 (tests) exercises the LIKE fallback.
+    this.fts =
+      process.env.AGENTLINK_NO_FTS !== "1" && ctx.store.tx(() => ensureSearchIndex(ctx.store.db));
   }
 
   /** How this machine is addressed: its team handle when in a team (it may differ from config). */
@@ -153,15 +202,22 @@ export class Mailbox {
 
   // ---------------------------------------------------------------- lookups
 
-  resolveMessage(idOrPrefix: string): MessageRow {
+  /** With a `viewer`, messages it may not see don't exist (same error as an unknown id). */
+  resolveMessage(idOrPrefix: string, viewer?: InboxTarget): MessageRow {
     const key = idOrPrefix.trim().toUpperCase();
-    const exact = this.#ctx.store.get<MessageRow>("SELECT * FROM messages WHERE id = ?", key);
+    const [vis, vp]: [string, string[]] = viewer ? this.#visibleSql(viewer) : ["1", []];
+    const exact = this.#ctx.store.get<MessageRow>(
+      `SELECT m.* FROM messages m WHERE m.id = ? AND ${vis}`,
+      key,
+      ...vp,
+    );
     if (exact) return exact;
     if (key.length < 4)
       throw invalid(`"${idOrPrefix}" is too short; use at least 4 characters of the message id`);
     const rows = this.#ctx.store.all<MessageRow>(
-      "SELECT * FROM messages WHERE id LIKE ? ORDER BY id DESC LIMIT 2",
+      `SELECT m.* FROM messages m WHERE m.id LIKE ? AND ${vis} ORDER BY m.id DESC LIMIT 2`,
       `${key}%`,
+      ...vp,
     );
     if (rows.length === 0) {
       throw new AgentLinkError(
@@ -519,7 +575,9 @@ export class Mailbox {
     if (Buffer.byteLength(text) > LIMITS.maxTextBytes) {
       throw invalid(`message too large (max ${LIMITS.maxTextBytes} bytes); attach a file instead`);
     }
-    const original = input.replyTo ? this.resolveMessage(input.replyTo) : undefined;
+    // An agent can only answer or continue conversations it takes part in; others don't exist.
+    const self: InboxTarget = sender.kind === "agent" ? { agent: sender.agent } : { human: true };
+    const original = input.replyTo ? this.resolveMessage(input.replyTo, self) : undefined;
     if (!original && ["reply", "ack", "review_result"].includes(input.kind)) {
       throw invalid(`a ${input.kind} must answer a message (replyTo)`);
     }
@@ -559,7 +617,7 @@ export class Mailbox {
     }
     const recipients = this.#resolveRecipients(sender, to, original);
     const thread =
-      original?.thread_id ?? (input.thread ? this.resolveThread(input.thread) : undefined);
+      original?.thread_id ?? (input.thread ? this.resolveThread(input.thread, self) : undefined);
     const key = echoKey(`${input.kind}:${text}`);
     this.#checkGuards(sender, recipients, thread, original, key, input.hops ?? 0);
     if (sender.kind === "agent" && partsHaveInvite(parts)) {
@@ -664,6 +722,7 @@ export class Mailbox {
         );
         ids.push(res.lastInsertRowid);
       }
+      this.#index(envelope.messageId);
       if (original) {
         this.#markAnswered(
           original,
@@ -856,6 +915,7 @@ export class Mailbox {
           deliveryId: res.lastInsertRowid,
         });
       }
+      this.#index(envelope.messageId);
       if (original) {
         const isAck = envelope.kind === "ack";
         store.run(
@@ -1007,21 +1067,27 @@ export class Mailbox {
     return true;
   }
 
-  /** A thread id, or the id (or unique prefix) of any message in the thread. */
-  resolveThread(idOrPrefix: string): string {
+  /**
+   * A thread id, or the id (or unique prefix) of any message in the thread. With a `viewer`, only
+   * threads in which it can see a message exist.
+   */
+  resolveThread(idOrPrefix: string, viewer?: InboxTarget): string {
     const key = idOrPrefix.trim().toUpperCase();
+    const [vis, vp]: [string, string[]] = viewer ? this.#visibleSql(viewer) : ["1", []];
     const direct = this.#ctx.store.get<{ thread_id: string }>(
-      "SELECT thread_id FROM messages WHERE thread_id = ? OR id = ? LIMIT 1",
+      `SELECT m.thread_id FROM messages m WHERE (m.thread_id = ? OR m.id = ?) AND ${vis} LIMIT 1`,
       key,
       key,
+      ...vp,
     );
     if (direct) return direct.thread_id;
     if (key.length < 4)
       throw invalid(`"${idOrPrefix}" is too short; use at least 4 characters of the id`);
     const rows = this.#ctx.store.all<{ thread_id: string }>(
-      "SELECT DISTINCT thread_id FROM messages WHERE thread_id LIKE ? OR id LIKE ? LIMIT 2",
+      `SELECT DISTINCT m.thread_id FROM messages m WHERE (m.thread_id LIKE ? OR m.id LIKE ?) AND ${vis} LIMIT 2`,
       `${key}%`,
       `${key}%`,
+      ...vp,
     );
     if (rows.length === 0) throw notFound(`thread or message "${idOrPrefix}"`);
     if (rows.length > 1)
@@ -1043,7 +1109,7 @@ export class Mailbox {
     const states = opts.unreadOnly ? UNREAD : null;
     const rows = this.#ctx.store.all<DeliveryRow & { m_envelope: string }>(
       `SELECT d.*, m.envelope AS m_envelope FROM deliveries d JOIN messages m ON m.id = d.message_id
-       WHERE ${clause} ${states ? `AND d.state IN (${states.map(() => "?").join(",")})` : "AND d.state != 'refused'"}
+       WHERE ${clause} ${states ? `AND d.state IN (${states.map(() => "?").join(",")})` : "AND d.state NOT IN ('refused','held')"}
        ORDER BY d.id DESC LIMIT ?`,
       param,
       ...(states ?? []),
@@ -1138,7 +1204,7 @@ export class Mailbox {
   }
 
   /** Everyone in a message's conversation (sender and recipients), as addressed from here. */
-  participants(env: Envelope): string[] {
+  participants(env: Pick<Envelope, "from" | "to">): string[] {
     const local = (a: Envelope["from"]): string | undefined => {
       if (a.role === "system") return undefined;
       const human = a.role === "human" || !a.agent;
@@ -1197,7 +1263,7 @@ export class Mailbox {
           "SELECT * FROM messages WHERE id = ?",
           env.replyTo,
         );
-        if (!original) return {};
+        if (!original || !this.#sees(item.delivery.to_agent_id, original)) return {};
         const readerIsAuthor = item.delivery.to_agent_id
           ? original.from_agent_id === item.delivery.to_agent_id
           : original.from_agent_id === null && original.from_addr === item.delivery.to_addr;
@@ -1241,23 +1307,6 @@ export class Mailbox {
       id,
       extra,
     );
-  }
-
-  /** Recent messages; `from` narrows to one local agent (by id, so renames keep history) or you. */
-  recent(limit: number, from?: { agentId: string } | { human: true }): MessageRow[] {
-    const where = !from
-      ? ""
-      : "agentId" in from
-        ? "WHERE from_agent_id = ?"
-        : "WHERE from_agent_id IS NULL AND from_addr = ?";
-    const params = !from ? [] : "agentId" in from ? [from.agentId] : [`@${this.handle}`];
-    return this.#ctx.store
-      .all<MessageRow>(
-        `SELECT * FROM messages ${where} ORDER BY created_at DESC, id DESC LIMIT ?`,
-        ...params,
-        limit,
-      )
-      .reverse();
   }
 
   // ---------------------------------------------------------------- waiting
@@ -1455,13 +1504,15 @@ export class Mailbox {
         envelope.createdAt,
         envelope.meta.expiresAt,
       );
-      return this.#ctx.store.run(
+      const rowid = this.#ctx.store.run(
         "INSERT INTO deliveries (message_id, to_addr, to_agent_id, state, created_at) VALUES (?, ?, ?, 'queued', ?)",
         envelope.messageId,
         agent.name,
         agent.id,
         stamp,
       ).lastInsertRowid;
+      this.#index(envelope.messageId);
+      return rowid;
     });
     const delivery = this.#ctx.store.get<DeliveryRow>(
       "SELECT * FROM deliveries WHERE id = ?",
@@ -1472,9 +1523,382 @@ export class Mailbox {
     return this.#item(delivery);
   }
 
+  // ---------------------------------------------------------------- history
+
+  /** Agents see what they sent or what reached them (not held or refused); you see everything. */
+  visibleTo(viewer: InboxTarget, m: MessageRow): boolean {
+    return this.#sees("agent" in viewer ? viewer.agent.id : null, m);
+  }
+
+  #sees(agentId: string | null, m: MessageRow): boolean {
+    return (
+      agentId === null ||
+      m.from_agent_id === agentId ||
+      this.deliveriesOf(m.id).some(
+        (d) => d.to_agent_id === agentId && d.state !== "held" && d.state !== "refused",
+      )
+    );
+  }
+
+  /** visibleTo as SQL over messages aliased `a` (+: find deliveries by message, not by agent). */
+  #visibleSql(viewer: InboxTarget, a = "m"): [string, string[]] {
+    if (!("agent" in viewer)) return ["1", []];
+    return [
+      `(${a}.from_agent_id = ? OR EXISTS (SELECT 1 FROM deliveries vd WHERE vd.message_id = ${a}.id AND +vd.to_agent_id = ? AND vd.state NOT IN ('held','refused')))`,
+      [viewer.agent.id, viewer.agent.id],
+    ];
+  }
+
+  #index(id: string): void {
+    if (!this.fts) return;
+    const m = this.#ctx.store.get<MessageRow>(
+      "SELECT from_addr, envelope FROM messages WHERE id = ?",
+      id,
+    );
+    if (!m) return;
+    const doc = searchDoc(
+      m.from_addr,
+      m.envelope,
+      this.deliveriesOf(id).map((d) => d.to_addr),
+    );
+    this.#ctx.store.run(
+      "INSERT INTO messages_fts (id, body, names, addrs) VALUES (?, ?, ?, ?)",
+      id,
+      doc.body,
+      doc.names,
+      doc.addrs,
+    );
+  }
+
+  /** An address as typed ("alpha", "me/alpha", "@bob", a renamed agent's old name). */
+  #addrKey(input: string): { addr: string; agentId: string | null } {
+    let addr = input.trim().toLowerCase();
+    if (addr.startsWith(`${this.handle}/`)) addr = addr.slice(this.handle.length + 1);
+    const agent =
+      addr.includes("/") || addr.startsWith("@")
+        ? undefined
+        : this.#registry.resolveName(addr)?.agent;
+    if (!agent && addr === this.handle) addr = `@${addr}`;
+    return { addr, agentId: agent?.id ?? null };
+  }
+
+  #filterSql(viewer: InboxTarget, f: MessageFilter): [string, (string | null)[]] {
+    const [vis, params] = this.#visibleSql(viewer);
+    const where: string[] = [vis];
+    const out: (string | null)[] = [...params];
+    const add = (sql: string, ...p: (string | null)[]) => {
+      where.push(sql);
+      out.push(...p);
+    };
+    if (f.from) {
+      const k = this.#addrKey(f.from);
+      add("(m.from_addr = ? OR m.from_agent_id = ?)", k.addr, k.agentId);
+    }
+    if (f.mine) {
+      if ("agent" in viewer) add("m.from_agent_id = ?", viewer.agent.id);
+      else add("(m.from_agent_id IS NULL AND m.from_addr = ?)", `@${this.handle}`);
+    }
+    if (f.to) {
+      const k = this.#addrKey(f.to);
+      add(
+        "EXISTS (SELECT 1 FROM deliveries fd WHERE fd.message_id = m.id AND (fd.to_addr = ? OR fd.to_agent_id = ?))",
+        k.addr,
+        k.agentId,
+      );
+    }
+    if (f.kinds?.length) add(`m.kind IN (${f.kinds.map(() => "?").join(",")})`, ...f.kinds);
+    if (f.since) add("m.created_at >= ?", f.since);
+    if (f.until) add("m.created_at <= ?", f.until);
+    if (f.thread) add("m.thread_id = ?", f.thread);
+    if (f.repo) {
+      add(
+        `(instr(lower(coalesce(json_extract(m.envelope, '$.meta.repo'), '')), lower(?)) > 0
+          OR m.from_agent_id IN (SELECT id FROM agents WHERE instr(lower(coalesce(repo_root, '') || ' ' || coalesce(repo_remote, '')), lower(?)) > 0))`,
+        f.repo,
+        f.repo,
+      );
+    }
+    return [where.join(" AND "), out];
+  }
+
+  /** The newest `limit` messages matching `f` that `viewer` may see, oldest first. */
+  history(viewer: InboxTarget, f: MessageFilter, limit: number): MessageRow[] {
+    const [where, params] = this.#filterSql(viewer, f);
+    return this.#ctx.store
+      .all<MessageRow>(
+        `SELECT m.* FROM messages m WHERE ${where} ORDER BY m.created_at DESC, m.id DESC LIMIT ?`,
+        ...params,
+        limit,
+      )
+      .reverse();
+  }
+
+  /**
+   * Compact search hits, newest first. `q` is plain words (all must match, as prefixes); no
+   * query syntax reaches FTS5. Without `q`, lists what the filters match.
+   */
+  search(
+    viewer: InboxTarget,
+    f: MessageFilter,
+    q: string | undefined,
+    limit: number,
+    offset: number,
+  ): SearchRow[] {
+    const { store } = this.#ctx;
+    const [where, params] = this.#filterSql(viewer, f);
+    const tail = "ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?";
+    const text = q?.trim() ?? "";
+    let words: string[] = [];
+    let rows: (MessageRow & { snip?: string | null })[];
+    if (!text) {
+      rows = store.all(
+        `SELECT m.* FROM messages m WHERE ${where} ${tail}`,
+        ...params,
+        limit,
+        offset,
+      );
+    } else if (this.fts) {
+      words = (text.match(/[\p{L}\p{N}\p{M}]+/gu) ?? []).slice(0, 16).map((w) => w.slice(0, 64));
+      if (words.length === 0) return [];
+      try {
+        rows = store.all(
+          `SELECT m.*, snippet(messages_fts, 1, '«', '»', '…', 16) AS snip
+           FROM messages_fts JOIN messages m ON m.id = messages_fts.id
+           WHERE messages_fts MATCH ? AND ${where} ${tail}`,
+          words.map((w) => `"${w}"*`).join(" "),
+          ...params,
+          limit,
+          offset,
+        );
+      } catch (error) {
+        throw invalid(`cannot search for that (${(error as Error).message})`);
+      }
+    } else {
+      words = text.split(/\s+/).slice(0, 16);
+      const like = (w: string) => `%${w.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+      rows = store.all(
+        `SELECT m.* FROM messages m WHERE ${words.map(() => "(m.preview LIKE ? ESCAPE '\\' OR m.envelope LIKE ? ESCAPE '\\')").join(" AND ")}
+           AND ${where} ${tail}`,
+        ...words.flatMap((w) => [like(w), like(w)]),
+        ...params,
+        limit,
+        offset,
+      );
+    }
+    return rows.map((m) => {
+      const env = this.envelopeOf(m);
+      const full = textOf(env);
+      return {
+        id: m.id,
+        thread: m.thread_id,
+        kind: m.kind,
+        from: m.from_addr,
+        to: this.participants(env).filter((p) => p !== m.from_addr),
+        createdAt: m.created_at,
+        snippet: safeField(m.snip || highlight(full, words) || m.preview, 300) ?? "",
+        tokens: Math.ceil(full.length / 4),
+      };
+    });
+  }
+
+  /** Conversations by last activity, built only from messages `viewer` may see. */
+  threads(
+    viewer: InboxTarget,
+    opts: { limit: number; offset: number; with?: string; open?: boolean },
+  ): ThreadSummary[] {
+    const { store } = this.#ctx;
+    const agentId = "agent" in viewer ? viewer.agent.id : null;
+    // Unary + keeps SQLite on the per-thread/per-message indexes instead of scanning every
+    // delivery or message of the caller once per thread.
+    const toMe = (a: string) =>
+      agentId ? `+${a}.to_agent_id = ?` : `+${a}.to_agent_id IS NULL AND ${a}.to_addr = ?`;
+    const me = agentId ?? `@${this.handle}`;
+    const byMe = agentId ? "+q.from_agent_id = ?" : "+q.from_agent_id IS NULL AND q.from_addr = ?";
+    const [vis, visParams] = this.#visibleSql(viewer);
+    const params: (string | number | null)[] = [me, me, me, ...visParams];
+    let having = "";
+    if (opts.with) {
+      const k = this.#addrKey(opts.with);
+      having = `HAVING SUM(m.from_addr = ? OR m.from_agent_id = ? OR EXISTS (SELECT 1 FROM deliveries wd
+        WHERE wd.message_id = m.id AND (wd.to_addr = ? OR wd.to_agent_id = ?))) > 0`;
+      params.push(k.addr, k.agentId, k.addr, k.agentId);
+    }
+    // Without the open filter, only the page's threads get the per-thread subqueries.
+    const order = "ORDER BY last_at DESC, thread DESC";
+    const page = `${order} LIMIT ? OFFSET ?`;
+    // Open: an ask/request/handoff/review the caller still has to answer (yours), or still
+    // waits on (theirs).
+    const rows = store.all<{
+      thread: string;
+      n: number;
+      last_at: string;
+      yours: number;
+      theirs: number;
+      unread: number;
+    }>(
+      `SELECT * FROM (
+         SELECT t.*,
+           EXISTS (SELECT 1 FROM messages q JOIN deliveries d ON d.message_id = q.id
+             WHERE q.thread_id = t.thread AND q.kind IN ${EXPECTING}
+               AND ${toMe("d")} AND +d.state IN ('queued','delivered','seen')) AS yours,
+           EXISTS (SELECT 1 FROM messages q JOIN deliveries d ON d.message_id = q.id
+             WHERE q.thread_id = t.thread AND q.kind IN ${EXPECTING}
+               AND ${byMe} AND +d.state IN ('queued','sent','held','delivered','seen')
+               AND NOT EXISTS (SELECT 1 FROM deliveries x WHERE x.message_id = q.id AND x.state IN ('replied','acked'))
+           ) AS theirs,
+           (SELECT COUNT(*) FROM messages um JOIN deliveries u ON u.message_id = um.id
+             WHERE um.thread_id = t.thread AND ${toMe("u")} AND +u.state IN ('queued','delivered')) AS unread
+         FROM (
+           SELECT m.thread_id AS thread, COUNT(*) AS n, MAX(m.created_at) AS last_at
+           FROM messages m WHERE ${vis} GROUP BY m.thread_id ${having} ${opts.open ? "" : page}
+         ) t
+       ) ${opts.open ? `WHERE yours = 1 OR theirs = 1 ${page}` : order}`,
+      ...params,
+      opts.limit,
+      opts.offset,
+    );
+    const edge = (dir: "" | " DESC", thread: string) =>
+      store.get<{ preview: string; from_addr: string }>(
+        `SELECT m.preview, m.from_addr FROM messages m WHERE m.thread_id = ? AND ${vis}
+         ORDER BY m.created_at${dir}, m.id${dir} LIMIT 1`,
+        thread,
+        ...visParams,
+      ) as { preview: string; from_addr: string };
+    return rows.map((r) => {
+      const first = edge("", r.thread);
+      const last = edge(" DESC", r.thread);
+      // Distinct sender/recipient sets in order of first appearance: the same participants, in
+      // the same order, as walking every message, without loading each one into JS.
+      const parties = store.all<{ p: string }>(
+        `SELECT p FROM (
+           SELECT json_extract(m.envelope, '$.from', '$.to') AS p,
+             ROW_NUMBER() OVER (ORDER BY m.created_at, m.id) AS seq
+           FROM messages m WHERE m.thread_id = ? AND ${vis}
+         ) GROUP BY p ORDER BY MIN(seq)`,
+        r.thread,
+        ...visParams,
+      );
+      return {
+        thread: r.thread,
+        subject: first.preview,
+        participants: [
+          ...new Set(
+            parties.flatMap(({ p }) => {
+              const [from, to] = JSON.parse(p) as [unknown, unknown[]];
+              return this.participants({
+                from: AddrSchema.parse(from),
+                to: to.map((a) => AddrSchema.parse(a)),
+              });
+            }),
+          ),
+        ],
+        messages: r.n,
+        lastAt: r.last_at,
+        lastFrom: last.from_addr,
+        lastPreview: last.preview,
+        open: r.yours === 1 || r.theirs === 1,
+        needsAnswer: r.yours === 1,
+        waiting: r.theirs === 1,
+        unread: r.unread,
+      };
+    });
+  }
+
+  /** Unread mail and unanswered asks/requests/handoffs for `target` (as in inbox and todo). */
+  counts(target: InboxTarget): { unread: number; todo: number } {
+    this.expireSweep();
+    const [clause, param] = this.#targetClause(target);
+    const n = (sql: string) => this.#ctx.store.get<{ n: number }>(sql, param)?.n ?? 0;
+    return {
+      unread: n(
+        `SELECT COUNT(*) AS n FROM deliveries d WHERE ${clause} AND d.state IN ('queued','delivered')`,
+      ),
+      todo: n(
+        `SELECT COUNT(*) AS n FROM deliveries d JOIN messages m ON m.id = d.message_id
+         WHERE ${clause} AND m.kind IN ${EXPECTING} AND d.state IN ('queued','delivered','seen')`,
+      ),
+    };
+  }
+
+  /**
+   * Deletes messages older than `olderThanMs` whose every delivery is finished: read (and, for
+   * asks/requests/handoffs/reviews, answered), refused, expired or failed. Never unread, held,
+   * queued or in-flight mail, nor a message someone is blocked waiting on.
+   */
+  prune(
+    olderThanMs: number,
+    dryRun = false,
+  ): {
+    dryRun: boolean;
+    cutoff: string;
+    messages: number;
+    deliveries: number;
+    threads: number;
+    kept: number;
+  } {
+    this.expireSweep();
+    const { store } = this.#ctx;
+    const cutoff = iso(new Date(this.#ctx.now().getTime() - olderThanMs));
+    const old = store.all<{ id: string; thread_id: string; busy: number }>(
+      `SELECT m.id, m.thread_id, EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND (
+         d.state NOT IN ('seen','acked','replied','refused','expired','failed')
+         OR (d.state = 'seen' AND m.kind IN ${EXPECTING}))) AS busy
+       FROM messages m WHERE m.created_at < ?`,
+      cutoff,
+    );
+    const doomed = old.filter((r) => !r.busy && !this.hasReplyWaiter(r.id));
+    const perThread = new Map<string, number>();
+    for (const r of doomed) perThread.set(r.thread_id, (perThread.get(r.thread_id) ?? 0) + 1);
+    const emptied = [...perThread].filter(
+      ([thread, n]) =>
+        store.get<{ n: number }>("SELECT COUNT(*) AS n FROM messages WHERE thread_id = ?", thread)
+          ?.n === n,
+    );
+    let deliveries = 0;
+    store.tx(() => {
+      for (let i = 0; i < doomed.length; i += 500) {
+        const ids = doomed.slice(i, i + 500).map((r) => r.id);
+        const marks = ids.map(() => "?").join(",");
+        deliveries +=
+          store.get<{ n: number }>(
+            `SELECT COUNT(*) AS n FROM deliveries WHERE message_id IN (${marks})`,
+            ...ids,
+          )?.n ?? 0;
+        if (dryRun) continue;
+        if (this.fts) store.run(`DELETE FROM messages_fts WHERE id IN (${marks})`, ...ids);
+        store.run(`DELETE FROM deliveries WHERE message_id IN (${marks})`, ...ids);
+        store.run(`DELETE FROM messages WHERE id IN (${marks})`, ...ids);
+      }
+      if (!dryRun) {
+        for (const [thread] of emptied)
+          store.run("DELETE FROM thread_state WHERE thread_id = ?", thread);
+      }
+    });
+    if (!dryRun && doomed.length) {
+      this.#ctx.events.publish({
+        type: "notice",
+        level: "info",
+        text: `agentlink pruned ${doomed.length} old message${doomed.length === 1 ? "" : "s"}`,
+      });
+    }
+    return {
+      dryRun,
+      cutoff,
+      messages: doomed.length,
+      deliveries,
+      threads: emptied.length,
+      kept: old.length - doomed.length,
+    };
+  }
+
   // ---------------------------------------------------------------- views
 
-  messageView(m: MessageRow): Record<string, unknown> {
+  /** With a viewer, adds `re` (the parent message) when the viewer may see it. */
+  messageView(m: MessageRow, viewer?: InboxTarget): Record<string, unknown> {
+    const parent =
+      viewer && m.reply_to
+        ? this.#ctx.store.get<MessageRow>("SELECT * FROM messages WHERE id = ?", m.reply_to)
+        : undefined;
     return {
       id: m.id,
       thread: m.thread_id,
@@ -1486,6 +1910,9 @@ export class Mailbox {
       preview: m.preview,
       createdAt: m.created_at,
       expiresAt: m.expires_at,
+      ...(parent && viewer && this.visibleTo(viewer, parent)
+        ? { re: { id: parent.id, from: parent.from_addr, preview: parent.preview } }
+        : {}),
     };
   }
 
@@ -1528,6 +1955,20 @@ function teamNotReady(addr: string): AgentLinkError {
     `"${addr}" is a team address; join a team first (agentlink team join <invite>)`,
     400,
   );
+}
+
+/** A one-line window around the first of `words` found in `text`, marked «like this». */
+function highlight(text: string, words: string[]): string | undefined {
+  const flat = text.replace(/\s+/g, " ");
+  const lower = flat.toLowerCase();
+  for (const w of words) {
+    const i = w ? lower.indexOf(w.toLowerCase()) : -1;
+    if (i < 0) continue;
+    const start = Math.max(0, i - 60);
+    const end = i + w.length;
+    return `${start > 0 ? "…" : ""}${flat.slice(start, i)}«${flat.slice(i, end)}»${flat.slice(end, end + 100)}${end + 100 < flat.length ? "…" : ""}`;
+  }
+  return undefined;
 }
 
 /** How an acknowledgement reads in receipts: "accepted: on it" / "declined: busy". */

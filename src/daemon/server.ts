@@ -16,7 +16,8 @@ import type { OpenCodeBridge } from "./deliverers.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import type { DaemonEvent } from "./events.ts";
 import { type HookHandler, HookRequestSchema } from "./hooks.ts";
-import type { Mailbox } from "./mailbox.ts";
+import type { InboxTarget, Mailbox, MessageFilter } from "./mailbox.ts";
+import type { DesktopNotifier } from "./notify.ts";
 import { agentView, isLive, type Registry } from "./registry.ts";
 import type { TeamManager } from "./team-manager.ts";
 import type { AgentRow, CallerInfo, InboxItem, MessageRow, Sender } from "./types.ts";
@@ -30,6 +31,7 @@ export interface Services {
   claims: Claims;
   opencode: OpenCodeBridge;
   team: TeamManager;
+  notifier: DesktopNotifier;
   /** Tests only: take the caller's claimed process tree/TTY at face value. */
   trustClientCaller?: boolean;
 }
@@ -117,6 +119,7 @@ function requireAgent(req: Req): AgentRow {
 
 const sender = (req: Req): Sender =>
   req.agent ? { kind: "agent", agent: req.agent } : { kind: "human" };
+const viewer = (req: Req): InboxTarget => (req.agent ? { agent: req.agent } : { human: true });
 
 const SendSchema = z.object({
   to: z.array(z.string()).optional(),
@@ -164,18 +167,18 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     routes.push({ method, re, keys, handler });
   };
 
-  const itemView = (item: InboxItem) => ({
+  const itemView = (item: InboxItem, who: InboxTarget) => ({
     delivery: mailbox.deliveryView(item.delivery),
-    message: mailbox.messageView(item.message),
+    message: mailbox.messageView(item.message, who),
     text: textOf(item.envelope),
     attachments: mailbox.renderItem(item).attachments,
     ...(item.envelope.meta.ack ? { ack: item.envelope.meta.ack } : {}),
   });
 
-  const replyView = (m: MessageRow) => {
+  const replyView = (m: MessageRow, who: InboxTarget) => {
     const env = mailbox.envelopeOf(m);
     return {
-      message: mailbox.messageView(m),
+      message: mailbox.messageView(m, who),
       text: textOf(env),
       ...(env.meta.ack ? { ack: env.meta.ack } : {}),
     };
@@ -210,6 +213,71 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     const before = ctx.config.handle;
     ctx.config = loadConfig(ctx.paths);
     return { handle: ctx.config.handle, changed: before !== ctx.config.handle };
+  });
+
+  route("GET", "/v1/overview", (req) => {
+    const count = (sql: string) => ctx.store.get<{ n: number }>(sql)?.n ?? 0;
+    const tally = (states: string[]) => {
+      const out = { busy: 0, idle: 0, offline: 0 };
+      for (const st of states) out[st === "busy" || st === "idle" ? st : "offline"] += 1;
+      return out;
+    };
+    const team = s.team.status().team as
+      | { name: string; relay: string; connected: boolean }
+      | null
+      | undefined;
+    const members = s.team.client?.members() ?? [];
+    const page = (pragma: string) =>
+      Number(Object.values(ctx.store.get(`PRAGMA ${pragma}`) ?? {})[0] ?? 0);
+    return {
+      version: VERSION,
+      pid: process.pid,
+      handle: selfHandle(),
+      host: hostname(),
+      paused: mailbox.paused,
+      team: team
+        ? {
+            name: team.name,
+            relay: team.relay,
+            connected: team.connected,
+            members: new Set(members.map((m) => m.handle)).size,
+            membersOnline: new Set(members.filter((m) => m.online).map((m) => m.handle)).size,
+          }
+        : null,
+      agents: {
+        local: tally(registry.list({ includeOffline: true }).map((a) => a.state)),
+        remote: tally((s.team.client?.remoteAgents() ?? []).map((a) => String(a.state))),
+      },
+      ...mailbox.counts(viewer(req)),
+      ...(req.agent
+        ? {}
+        : { held: count("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'held'") }),
+      outbox: count("SELECT COUNT(*) AS n FROM outbox"),
+      db: {
+        messages: count("SELECT COUNT(*) AS n FROM messages"),
+        bytes: page("page_count") * page("page_size"),
+      },
+    };
+  });
+
+  route("POST", "/v1/prune", (req) => {
+    requireHuman(req);
+    const body = z
+      .object({
+        olderThanMs: z
+          .number()
+          .int()
+          .min(3_600_000)
+          .max(100 * 365 * 86_400_000),
+        dryRun: z.boolean().default(false),
+      })
+      .parse(req.body);
+    return mailbox.prune(body.olderThanMs, body.dryRun);
+  });
+
+  route("POST", "/v1/notify/test", (req) => {
+    requireHuman(req, false);
+    return s.notifier.test();
   });
 
   route("POST", "/v1/shutdown", (req) => {
@@ -460,7 +528,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         req.signal,
       );
       if (outcome.replies.length) {
-        replies = outcome.replies.map(replyView);
+        replies = outcome.replies.map((m) => replyView(m, viewer(req)));
         reply = replies[0];
       }
       if (outcome.failed.length && !outcome.replies.length) {
@@ -501,7 +569,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
 
   route("GET", "/v1/todo", (req) => {
     const target = req.agent ? { agent: req.agent } : ({ human: true } as const);
-    return { items: mailbox.todo(target).map(itemView) };
+    return { items: mailbox.todo(target).map((i) => itemView(i, target)) };
   });
 
   route("GET", "/v1/inbox", async (req) => {
@@ -542,19 +610,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         text: mailbox.render(items, req.agent?.name ?? `@${ctx.config.handle}`),
       };
     }
-    return { items: items.map(itemView) };
+    return { items: items.map((i) => itemView(i, target)) };
   });
 
-  // Agents see only messages they sent or received; you (the human) see everything.
+  // Agents see only messages they sent or received (not held or refused); you see everything.
   const takesPart = (agent: AgentRow, message: MessageRow): boolean =>
-    message.from_agent_id === agent.id ||
-    mailbox.deliveriesOf(message.id).some((d) => d.to_agent_id === agent.id);
+    mailbox.visibleTo({ agent }, message);
 
   route("GET", "/v1/messages/:id", (req) => {
-    const message = mailbox.resolveMessage(req.params.id as string);
-    if (req.agent && !takesPart(req.agent, message)) {
-      throw forbidden(`${message.id} was not sent to or by ${req.agent.name}`);
-    }
+    const message = mailbox.resolveMessage(req.params.id as string, viewer(req));
     const envelope = mailbox.envelopeOf(message);
     const deliveries = mailbox.deliveriesOf(message.id);
     const mine = deliveries.filter((d) =>
@@ -573,10 +637,10 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       const index = Number(part) - 1;
       const p = envelope.parts[index];
       if (!p) throw invalid(`message has ${envelope.parts.length} part(s)`);
-      return { message: mailbox.messageView(message), part: p };
+      return { message: mailbox.messageView(message, viewer(req)), part: p };
     }
     return {
-      message: mailbox.messageView(message),
+      message: mailbox.messageView(message, viewer(req)),
       text: textOf(envelope),
       attachments: mailbox.renderItem({
         delivery: deliveries[0] ?? (mine[0] as never),
@@ -603,16 +667,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
   });
 
   route("GET", "/v1/threads/:id", (req) => {
-    const all = mailbox.thread(req.params.id as string);
+    const thread = mailbox.resolveThread(req.params.id as string, viewer(req));
+    const all = mailbox.thread(thread);
     const visible = req.agent
       ? all.filter(({ message }) => takesPart(req.agent as AgentRow, message))
       : all;
-    if (req.agent && visible.length === 0)
-      throw forbidden(`${req.agent.name} is not part of that conversation`);
     return {
-      thread: mailbox.resolveThread(req.params.id as string),
+      thread,
       messages: visible.map(({ message, deliveries }) => ({
-        message: mailbox.messageView(message),
+        message: mailbox.messageView(message, viewer(req)),
         text: textOf(mailbox.envelopeOf(message)),
         deliveries: deliveries.map((d) => mailbox.deliveryView(d)),
       })),
@@ -626,26 +689,99 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     return { ok: true };
   });
 
+  // History filters (log, search). Times: ISO (2026-01-31, 2026-01-31T12:00:00Z) or an age (2h).
+  const AGE_MS = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 } as const;
+  const When = z.string().transform((s, c) => {
+    const age = /^(\d{1,6})([mhdw])$/.exec(s.trim());
+    const ms = age
+      ? ctx.now().getTime() - Number(age[1]) * AGE_MS[age[2] as keyof typeof AGE_MS]
+      : /^\d{4}-\d{2}-\d{2}/.test(s)
+        ? Date.parse(s)
+        : Number.NaN;
+    const at = new Date(ms);
+    if (Number.isNaN(at.getTime())) {
+      c.addIssue({
+        code: "custom",
+        message: "use an ISO time (2026-01-31 or 2026-01-31T12:00:00Z) or an age (30m, 2h, 7d, 1w)",
+      });
+      return z.NEVER;
+    }
+    return at.toISOString();
+  });
+  const FilterSchema = z.object({
+    from: z.string().trim().min(1).max(200).optional(),
+    to: z.string().trim().min(1).max(200).optional(),
+    kind: z
+      .string()
+      .transform((s) =>
+        s
+          .split(",")
+          .map((k) => k.trim())
+          .filter(Boolean),
+      )
+      .pipe(z.array(KindSchema).min(1))
+      .optional(),
+    since: When.optional(),
+    until: When.optional(),
+    thread: z.string().trim().min(1).max(100).optional(),
+    repo: z.string().trim().min(1).max(300).optional(),
+  });
+  const filterOf = (req: Req): MessageFilter => {
+    const { kind, thread, ...rest } = FilterSchema.parse(Object.fromEntries(req.query));
+    return {
+      ...rest,
+      ...(kind ? { kinds: kind } : {}),
+      ...(thread ? { thread: mailbox.resolveThread(thread, viewer(req)) } : {}),
+    };
+  };
+  const Paging = (max: number, def: number) =>
+    z.object({
+      limit: z.coerce.number().int().min(1).max(max).default(def),
+      offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+    });
+
+  route("GET", "/v1/search", (req) => {
+    const { q, limit, offset } = Paging(100, 20)
+      .extend({ q: z.string().max(500).optional() })
+      .parse(Object.fromEntries(req.query));
+    return {
+      results: mailbox.search(viewer(req), filterOf(req), q, limit, offset),
+      fts: mailbox.fts,
+    };
+  });
+
+  route("GET", "/v1/threads", (req) => {
+    const q = Paging(100, 20)
+      .extend({
+        with: z.string().trim().min(1).max(200).optional(),
+        open: z.enum(["0", "1", "true", "false"]).optional(),
+      })
+      .parse(Object.fromEntries(req.query));
+    return {
+      threads: mailbox.threads(viewer(req), {
+        limit: q.limit,
+        offset: q.offset,
+        ...(q.with ? { with: q.with } : {}),
+        open: q.open === "1" || q.open === "true",
+      }),
+    };
+  });
+
   route("GET", "/v1/log", (req) => {
     const limit = Math.min(Number(req.query.get("limit") ?? 30) || 30, 500);
-    const mine = req.query.get("mine") === "1";
-    const from = !mine
-      ? undefined
-      : req.agent
-        ? { agentId: req.agent.id }
-        : ({ human: true } as const);
     // In a team, local names are shown as full addresses so a pasted log means the same anywhere.
     const full = (name: string) =>
       mailbox.remote && !name.includes("/") && !name.startsWith("@")
         ? `${mailbox.handle}/${name}`
         : name;
-    const rows = mailbox.recent(req.agent ? Math.max(limit * 5, 100) : limit, from);
-    const visible = req.agent
-      ? rows.filter((m) => takesPart(req.agent as AgentRow, m)).slice(-limit)
-      : rows;
+    const visible = mailbox.history(
+      viewer(req),
+      { ...filterOf(req), mine: req.query.get("mine") === "1" },
+      limit,
+    );
     return {
       messages: visible.map((m) => {
-        const view = mailbox.messageView(m);
+        const view = mailbox.messageView(m, viewer(req));
         return {
           message: { ...view, from: full(String(view.from)) },
           deliveries: mailbox.deliveriesOf(m.id).map((d) => {
@@ -775,7 +911,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
 
   route("GET", "/v1/approvals", (req) => {
     requireHuman(req, false);
-    return { items: mailbox.held().map(itemView) };
+    return { items: mailbox.held().map((i) => itemView(i, viewer(req))) };
   });
 
   route("POST", "/v1/approvals/:id", (req) => {
@@ -798,7 +934,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     }
     const item = mailbox.decide(deliveryId, body.decision, ctx.config.handle);
     if (body.decision === "approve") engine.onQueued([item]);
-    return { item: itemView(item) };
+    return { item: itemView(item, viewer(req)) };
   });
 
   route("POST", "/v1/control", (req) => {

@@ -391,7 +391,7 @@ describe("usability fixes, round 2", () => {
       { ack: "accept" },
       { as: "bystander" },
     );
-    expect(stranger.status).toBe(403);
+    expect(stranger.status).toBe(404); // a message the bystander can't see doesn't exist for it
     const ok = await t.raw(
       "POST",
       `/v1/messages/${handoff.message.id}/ack`,
@@ -568,10 +568,10 @@ describe("usability fixes, round 3", () => {
     expect(follow.data.deliveries.map((d) => d.to)).toEqual(["rc"]);
     expect(
       (await t.raw("GET", `/v1/messages/${ask.message.id}`, undefined, { as: "nosy" })).status,
-    ).toBe(403);
+    ).toBe(404); // a message nosy can't see doesn't exist for it
     expect(
       (await t.raw("GET", `/v1/threads/${ask.message.id}`, undefined, { as: "nosy" })).status,
-    ).toBe(403);
+    ).toBe(404);
     expect((await t.raw("GET", `/v1/messages/${ask.message.id}?peek=1`)).status).toBe(200); // you see everything
   });
 
