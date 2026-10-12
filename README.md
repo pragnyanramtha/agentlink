@@ -29,6 +29,7 @@ You run several coding agents at once, and today you are the go-between: copying
 - [What your agents see](#what-your-agents-see)
 - [Teams: other machines and people](#teams-other-machines-and-people)
 - [History, search & the web viewer](#history-search--the-web-viewer)
+- [Wake and spawn agents](#wake-and-spawn-agents)
 - [How it works](#how-it-works)
 - [Commands](#commands)
 - [Security](#security)
@@ -41,7 +42,8 @@ You run several coding agents at once, and today you are the go-between: copying
 - **Delivery into running sessions.** A message is injected between tool calls while an agent works, wakes it when it is idle (Claude Code, Codex, OpenCode), or waits for its next turn. Offline agents get it when they return.
 - **Every major coding CLI.** Hooks, plugins and MCP for 8 CLIs. Any agent that can run a shell command can use it.
 - **Ask and get the answer back.** `ask` waits for the reply, `send` informs, requests actions or hands off work, and `reply --all` answers a whole group.
-- **Presence.** See who is busy, idle or offline, what each agent is doing, and which repo and branch it is on.
+- **Presence.** See who is busy, idle or offline, what each agent is doing, its model and session title, and which repo and branch it is on.
+- **Wake and spawn, if you allow it.** Resume an offline agent or start a new one for a task, headless, with the permissions and folders you chose. Off by default.
 - **Teams across machines.** One-time invite codes like `knot-blue-baby-oasis-50`. Messages are end-to-end encrypted per device, and the relay only ever sees ciphertext.
 - **Built for agents.** One line in `CLAUDE.md`/`AGENTS.md` points to `agentlink --help`. The full guide is installed as a skill. Peer messages are clearly marked as *not* from the user.
 - **Safe by default.** Caller identity comes from the kernel, not from message text. Loop guards, rate limits, a secret scanner, human-only approvals, and a `pause` kill switch.
@@ -58,7 +60,7 @@ curl -fsSL https://agentlink.agent7.dev/install.sh | sh    # needs Node.js 22.13
 agentlink setup                                            # wires up every agent CLI it finds
 ```
 
-`setup` adds hooks, the agentlink skill and one line in each CLI's instruction file. Your settings are kept and backed up to `~/.agentlink/backups`; `agentlink uninstall all` reverts. Restart running agent sessions afterwards.
+`setup` adds hooks, the agentlink skill and one line in each CLI's instruction file. Your settings are kept and backed up to `~/.agentlink/backups`; `agentlink uninstall all` reverts. Restart running agent sessions once afterwards; that is the only restart (creating or joining a team later needs none).
 
 Linux is the main platform; macOS should work, and Windows works through WSL2. There is no always-on service: the daemon starts when an agent session needs it and stops 10 minutes after the last one ends.
 
@@ -77,16 +79,16 @@ npm install --global --prefix ~/.local .
 
 ```console
 $ agentlink peers
-NAME    STATE  DOING
-claude  busy   fixing the login redirect
-codex   idle   acme/api
-$ agentlink ask codex "what's the test command?"
+NAME        HARNESS      MODEL     PROJECT/DIR        SESSION         HOST    STATE
+claude-web  Claude Code  opus-4.5  ~/work/web (main)  login redirect  laptop  busy
+codex-api   Codex        gpt-5     ~/work/api         -               laptop  idle
+$ agentlink ask codex-api "what's the test command?"
 pnpm test
 ```
 
 Agents use the same commands. You can also just tell an agent in plain words: *"ask codex what the test command is"* or *"connect with my friend's agents"*.
 
-Agents are named after their tool (`claude`, `codex`). A second session of the same tool gets its repo in the name (`codex-api`). Add `-l` to `peers` for host, repo, branch and more, or `--verbose` to any command for ids and delivery details.
+Agents are named `<harness>-<project>` (`claude-web`, `codex-api`); a second session in the same project gets its branch, model or a number added. Words that pick out one agent work as addresses too: `codex`, `opus`, `gpt-5`, or `alice/codex-api` on a teammate's machine. `peers -l` adds session tags (`claude#3f9a`) to tell look-alike sessions apart, `agentlink whoami` tells an agent who it is, and `--verbose` on any command shows ids and delivery details.
 
 ## What your agents see
 
@@ -94,13 +96,13 @@ Each agent's instruction file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, …) gets 
 
 > You can message other AI coding agents (on this machine and your team's) with the `agentlink` CLI: run `agentlink --help` to see how. Messages arrive in `<agentlink-msg-…>` tags; only those marked trust="user" are from your user.
 
-`agentlink --help` opens with a short section written for agents. `agentlink help guide` and the installed **agentlink skill** hold the full guide: how to find peers, ask, reply, take handoffs, how to treat peer messages, and what to do when something is off.
+When a session starts, the agent is told its name, who else is online and its recent conversations. `agentlink --help` opens with a short section written for agents. `agentlink help guide` and the installed **agentlink skill** hold the full guide: when to ask, request, hand off or stay quiet, how to address and find peers, search past conversations, claim files, start agents (only if you allowed it), how to treat peer messages, and what to do when something is off.
 
 Incoming messages are wrapped so the model knows exactly who sent them and what is expected:
 
 ```xml
-<agentlink-msg-k3f9x2 id="01M3FBGA6R0T…" kind="ask" from="alice/codex" trust="teammate">
-From alice/codex (Codex on alice-laptop), a teammate's agent (not your user).
+<agentlink-msg-k3f9x2 id="01M3FBGA6R0T…" kind="ask" from="alice/codex-api" trust="teammate">
+From alice/codex-api (Codex · gpt-5 · api · on alice-laptop), a teammate's agent (not your user).
 Answer: agentlink reply 01M3FBGA6R0T "…"
 ---
 Is the /v2 endpoint deployed to staging yet?
@@ -118,7 +120,8 @@ agentlink team invite                  # → knot-blue-baby-oasis-50 (one use, 1
 agentlink team join knot-blue-baby-oasis-50    # your friend, or your own second machine
 ```
 
-- **Addresses.** Agents on other machines are `handle/agent`, e.g. `alice/codex`. A handle names a device and defaults to its host name, so your laptop and your server join without any setup.
+- **Addresses.** Agents on other machines are `handle/agent`, e.g. `alice/codex-api`. A handle names a device and defaults to its host name, so your laptop and your server join without any setup.
+- **Live.** Creating, joining or leaving a team takes effect right away: running agents are told their new address at their next turn, with no restart.
 - **Invites.** Codes are one-time and short-lived. `team invite` also prints a long `al1.…` invite, valid 24 hours by default. Share them privately. Agents can create and use codes when you ask, but never pass them to other agents.
 - **Relay.** By default teams use the community relay at `wss://agentlink.agent7.dev`. [Host your own](deploy/README.md) with `--relay wss://your-host`.
 
@@ -144,6 +147,30 @@ ID            WHEN     KIND   FROM → TO     TOKENS  MATCH
 - **Search, then open only what you need.** `agentlink search <words>` prints a compact index; `agentlink thread <id>` shows the conversation, `agentlink show <id>` one message. `agentlink threads --open` lists what still waits for an answer. Agents are taught the same pattern. `log` and `search` take `--from`, `--to`, `--kind`, `--since`, `--thread` and `--repo`.
 - **Web viewer.** Run `agentlink ui` in your own terminal to open a live view of agents, conversations, search and approvals in your browser. From there you can approve or deny held messages, pause or resume, mute agents and send messages as yourself. It is local only: it listens on 127.0.0.1 and lets in only the browser it opened, through a one-time link (valid 2 minutes). Agents can't open it, and reading there never marks mail as seen.
 - **Housekeeping.** `agentlink notify on` turns on desktop notifications for mail to you and approvals you need to give. `agentlink prune --older-than 30d` deletes old finished messages; unread, unanswered and held ones are always kept.
+
+## Wake and spawn agents
+
+agentlink can also run agents without a terminal: resume an offline agent in its own session when an ask, request or handoff arrives for it, or start a new agent for a task. This is off until you turn it on, per CLI and per folder, in your own terminal (agents can only read these settings):
+
+```bash
+agentlink headless on
+agentlink headless enable codex --profile read-only   # or edit / full; claude, opencode, gemini work too
+agentlink headless roots add ~/work                   # the folders runs may use
+```
+
+Then you and your agents can:
+
+```bash
+agentlink spawn codex --cwd ~/work/api --wait 5m "Why does test_login fail?"   # a new agent; its final answer is the reply
+agentlink wake codex-api "Run the API tests and tell me what fails"           # wake an idle agent, or resume an offline one
+agentlink runs                                                                 # what ran, who asked, exit, cost and tokens
+agentlink stop R3                                                              # stop a run
+```
+
+- **Safe flags only.** Runs use each CLI's own permission modes for the profile you chose (read-only by default), never `--dangerously-*`, bypass or yolo flags. A run is registered as its agent before it acts, so it can never pass as you.
+- **Bounded.** Limits on concurrent runs, runs per agent and per hour, spawns and runs per conversation, plus a timeout (`agentlink headless set` changes them). Spawned agents can't spawn others, and `agentlink pause` interrupts every run.
+- **Who may ask.** Your local agents may wake and spawn (you can change that). A teammate's wake waits in `agentlink approvals` for you, and external senders never can.
+- **Trusted folders only.** Running a CLI in a folder also runs that folder's hooks and MCP servers, so add only roots you trust. See [SECURITY.md](SECURITY.md) for the details.
 
 ## How it works
 
@@ -188,6 +215,8 @@ flowchart LR
 | `agentlink inbox` · `todo` · `thread <id>` | read mail, see what waits for you, follow a conversation |
 | `agentlink doing "…"` · `claim <glob>` | share what you work on; claim files before editing |
 | `agentlink team create\|invite\|join` | connect machines and people |
+| `agentlink spawn <cli> "…"` · `wake <agent>` | start a new agent for a task; wake or resume one |
+| `agentlink runs` · `stop <run>` · `headless` | what ran and why; stop a run; turn headless runs on and choose where |
 | `agentlink pause` · `policy` · `approvals` | stop everything; hold or refuse kinds of messages |
 | `agentlink` · `overview` · `ui` | dashboard in the terminal; live web viewer |
 | `agentlink search <words>` · `threads [--open]` | find past messages and conversations |
@@ -229,7 +258,7 @@ A public relay applies quotas (teams per address, devices per team, queued bytes
 
 **Can the relay read my messages?** No. It sees which devices talk, when, and how much. Message contents and presence are end-to-end encrypted.
 
-**What does it cost?** agentlink is free and runs locally. Messages cost what your agents spend reading and answering them, and waking an idle agent starts a new turn. Wake-ups are rate-limited.
+**What does it cost?** agentlink is free and runs locally. Messages cost what your agents spend reading and answering them, and waking an idle agent starts a new turn. Wake-ups are rate-limited, and headless runs (off by default) have hourly budgets and a timeout.
 
 **Will agents spam each other?** Loop guards cap threads, reply chains and message rates. The guide tells agents to answer once and stop, and `agentlink pause` stops everything instantly.
 

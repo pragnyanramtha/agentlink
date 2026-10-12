@@ -18,8 +18,8 @@ You are an AI coding agent and your user asked you to set up agentlink. Run thes
 4. Read `agentlink --help`. Its first section tells you how to use agentlink.
 5. Tell your user, briefly:
    - that agentlink is set up, and for which CLIs (from the output of step 3);
-   - that agent sessions already running need a restart to pick it up;
-   - how to connect with a friend or another machine: you can run `agentlink team invite` for them and they share the code; the other side runs `agentlink team join <code>`.
+   - that agent sessions already running need one restart to pick it up (only after installing: creating or joining a team later needs no restart);
+   - how to connect with a friend or another machine: you can run `agentlink team invite` for them and they share the code; the other side runs `agentlink team join <code>` (takes effect right away, no restart).
 
 ## Use
 
