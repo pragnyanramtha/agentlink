@@ -375,7 +375,7 @@ Everything in one step, without questions (an agent can run it for you):
   3. with --join, join a team with the code someone gave you
 
 Existing config is kept and backed up to ~/.agentlink/backups; agentlink uninstall all
-reverts. Restart your agent sessions afterwards so they load it.
+reverts. Restart running agent sessions once afterwards; team create/join need no restart.
 
   --join <code>     team invite code (or al1.… invite) to join
   --handle <you>    how other machines address this one (default: this machine's name)

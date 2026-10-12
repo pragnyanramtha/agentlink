@@ -82,6 +82,10 @@ export function printStatus(s: TeamStatus): string {
   return lines.join("\n");
 }
 
+/** Team changes reach running agents right away (they are told at their next turn). */
+const liveNote = (s: TeamStatus) =>
+  `Your agents are reachable as ${c.bold(`${s.team?.handle ?? "<you>"}/<agent>`)} now - no restart needed.`;
+
 export const team: Command = async (ctx) => {
   const [sub = "status", ...rest] = ctx.argv;
   const sub2 = { ...ctx, argv: rest };
@@ -123,6 +127,7 @@ export const team: Command = async (ctx) => {
           `${c.green("✓")} created team ${c.bold(s.team?.name ?? name)}`,
           printStatus(s),
           "",
+          liveNote(s),
           `Invite someone: ${c.bold("agentlink team invite")}`,
         ].join("\n"),
       );
@@ -200,7 +205,12 @@ export const team: Command = async (ctx) => {
         { timeoutMs: 20_000 },
       );
       out(ctx, s, () =>
-        [`${c.green("✓")} joined ${c.bold(s.team?.name ?? "the team")}`, printStatus(s)].join("\n"),
+        [
+          `${c.green("✓")} joined ${c.bold(s.team?.name ?? "the team")}`,
+          printStatus(s),
+          "",
+          liveNote(s),
+        ].join("\n"),
       );
       return 0;
     }

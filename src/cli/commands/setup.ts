@@ -70,7 +70,11 @@ function resolveTools(names: string[], install: boolean): InstallTool[] {
   return names as InstallTool[];
 }
 
-async function run(ctx: CliContext, install: boolean): Promise<number> {
+async function run(
+  ctx: CliContext,
+  install: boolean,
+  report?: { changed: boolean },
+): Promise<number> {
   const { values, positionals } = parse(ctx.argv, {
     project: { type: "string", short: "p" },
     "dry-run": { type: "boolean", short: "n" },
@@ -147,6 +151,7 @@ async function run(ctx: CliContext, install: boolean): Promise<number> {
   }
   if (install) await ctx.client.ensureDaemon().catch(() => undefined);
   const backedUp = existsSync(backupDir);
+  if (report) report.changed = applied.length > 0;
   out(ctx, { tools, applied, steps, failed, notes, ...(backedUp ? { backupDir } : {}) }, () =>
     [
       `${c.green("✓")} ${install ? "installed" : "removed"} agentlink ${install ? "for" : "from"} ${tools.join(", ") || "(no tools found)"}${ictx.scope === "project" ? ` in ${ictx.projectDir}` : ""}`,
@@ -159,7 +164,7 @@ async function run(ctx: CliContext, install: boolean): Promise<number> {
       backedUp ? c.dim(`  backups: ${backupDir}`) : "",
       ...notes.map((n) => `  ${c.yellow("note")} ${n}`),
       install && applied.length
-        ? "\nStart (or restart) your agent sessions, then check: agentlink peers"
+        ? "\nStart your agent sessions (restart running ones once so they load agentlink), then check: agentlink peers"
         : "",
     ]
       .filter(Boolean)
@@ -429,6 +434,7 @@ export const setup: Command = async (ctx) => {
     );
   }
   const lines: string[] = [];
+  const report = { changed: false };
   const capture = async (fn: () => Promise<number>) => {
     const write = process.stdout.write.bind(process.stdout);
     let text = "";
@@ -472,6 +478,7 @@ export const setup: Command = async (ctx) => {
       run(
         { ...quiet, argv: ["all", ...(values.project ? ["--project", values.project] : [])] },
         true,
+        report,
       ),
     );
     if (installed.code !== 0) {
@@ -483,6 +490,8 @@ export const setup: Command = async (ctx) => {
     );
     lines.push(c.dim("  backups: ~/.agentlink/backups · undo: agentlink uninstall all"));
   }
+  // Shown before joining, so a failed join doesn't hide what was installed.
+  if (values.join && !ctx.json) process.stdout.write(`${lines.splice(0).join("\n")}\n`);
   if (values.join) {
     await ctx.client.ensureDaemon();
     const joined = await ctx.client.request<{
@@ -507,7 +516,11 @@ export const setup: Command = async (ctx) => {
   lines.push(
     "",
     "Next:",
-    "  restart your agent sessions so they load agentlink",
+    ...(report.changed
+      ? [
+          "  restart running agent sessions once so they load agentlink (team changes need no restart)",
+        ]
+      : []),
     "  agentlink peers                  who is online",
     "  agentlink team invite            connect a friend or another machine (share the code)",
   );

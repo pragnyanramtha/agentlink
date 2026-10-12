@@ -23,10 +23,19 @@ export const init: Command = async (ctx) => {
   }
   saveConfig(ctx.paths, config);
   const health = await ctx.client.ensureDaemon();
-  await ctx.client.request("POST", "/v1/config/reload", {}).catch(() => undefined);
-  out(ctx, { config, health }, () =>
+  // Only a person may reload the running daemon's config (an agent's call is refused).
+  const reloaded = await ctx.client
+    .request("POST", "/v1/config/reload", {})
+    .then(() => true)
+    .catch((e: unknown) => !(e instanceof ApiError && e.status === 403));
+  const warning =
+    !reloaded && health.handle !== config.handle
+      ? `saved @${config.handle}, but the running daemon still uses @${health.handle}: ask your user to run \`agentlink init --handle ${config.handle}\` in a terminal (or \`agentlink daemon restart\`)`
+      : undefined;
+  out(ctx, { config, health, ...(warning ? { warning } : {}) }, () =>
     [
       `${c.green("✓")} agentlink is ready. You are ${c.bold(`@${config.handle}`)} (home: ${ctx.paths.home}).`,
+      ...(warning ? [c.yellow(`! ${warning}`)] : []),
       "",
       "Next:",
       `  agentlink install all      ${c.dim("# wire up Claude Code, Codex, OpenCode, Gemini, …")}`,

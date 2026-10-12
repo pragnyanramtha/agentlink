@@ -144,7 +144,7 @@ export function overviewText(
 
   const hints: string[] = [];
   if (busy + idle + offline === 0)
-    hints.push("no agents yet: run agentlink setup, then restart your agent sessions");
+    hints.push("no agents yet: run agentlink setup, then restart your agent sessions once");
   if (ov.held) hints.push("held messages wait for you: agentlink approvals");
   if (ov.paused) hints.push("deliver again: agentlink resume");
   if (ov.todo) hints.push("answer what waits for you: agentlink todo");

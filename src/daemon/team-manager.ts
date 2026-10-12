@@ -11,6 +11,7 @@ import {
   openInvite,
   sealInvite,
 } from "../core/invite-code.ts";
+import { safeField } from "../core/sanitize.ts";
 import { decodeInvite, encodeInvite } from "../relay/protocol.ts";
 import type { DaemonContext } from "./context.ts";
 import type { DeliveryEngine } from "./delivery.ts";
@@ -146,7 +147,73 @@ export class TeamManager {
       void client.start().catch(() => undefined);
       return;
     }
-    await client.start();
+    try {
+      await client.start();
+    } catch (error) {
+      // A refused create/join leaves no trace: agents keep their local addresses.
+      client.stop();
+      if (this.#client === client) {
+        this.#client = undefined;
+        this.#mailbox.remote = undefined;
+        clearInterval(this.#heartbeat);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Tells running agents about this machine's team change at their next hook (an `info` notice
+   * never wakes anyone). Teammates' agents are listed once their presence arrives (≤1.5s).
+   */
+  #announce(change: "created" | "joined" | "left" | "relay", team: TeamState): void {
+    this.#notice(change, team).catch((error) =>
+      this.#ctx.log.warn("team notice failed", { error: String(error) }),
+    );
+  }
+
+  async #notice(change: "created" | "joined" | "left" | "relay", team: TeamState) {
+    const client = this.#client;
+    // Agents that start later learn their address at session start.
+    const ids = this.#registry
+      .list()
+      .filter(isLive)
+      .map((a) => a.id);
+    if (ids.length === 0) return;
+    if (change === "joined" && client) {
+      const deadline = Date.now() + 1_500;
+      const others = () => client.members().filter((m) => !m.self);
+      while (
+        others().some((m) => m.online) &&
+        client.remoteAgents().length === 0 &&
+        Date.now() < deadline
+      )
+        await new Promise((r) => setTimeout(r, 50));
+      if (this.#client !== client) return;
+    }
+    const name = (s: unknown) => safeField(s, 64) ?? "?";
+    const teamName = name(team.teamName);
+    const remote = (client?.remoteAgents() ?? []).map((a) => `${name(a.member)}/${name(a.name)}`);
+    const mates = [
+      ...new Set((client?.members() ?? []).filter((m) => !m.self).map((m) => m.handle)),
+    ];
+    const teammates = remote.length
+      ? ` Teammates' agents: ${remote.slice(0, 6).join(", ")}${remote.length > 6 ? ", …" : ""} (all: agentlink peers).`
+      : mates.length
+        ? ` Teammates: ${mates
+            .slice(0, 6)
+            .map((h) => `@${name(h)}`)
+            .join(", ")} (their agents: agentlink peers).`
+        : "";
+    for (const agent of ids.map((id) => this.#registry.byId(id)).filter((a) => !!a)) {
+      const me = `${team.handle}/${agent.name}`;
+      const text =
+        change === "left"
+          ? `agentlink: this machine left team ${teamName}; agents on other machines can no longer reach you (you are still ${agent.name} here).`
+          : change === "relay"
+            ? `agentlink: this machine now reaches team ${teamName} through ${safeField(team.relay, 200)}; you are still ${me}.`
+            : `agentlink: this machine ${change} team ${teamName} as @${team.handle}; agents on other machines ${change === "joined" ? "now reach" : "will reach"} you as ${me}.${teammates} No restart needed.`;
+      this.#mailbox.notify(agent, text);
+    }
   }
 
   #inbound(msg: Parameters<NonNullable<RelayClient["onInbound"]>>[0]): void {
@@ -199,7 +266,7 @@ export class TeamManager {
       "SELECT d.*, m.trust AS m_trust, m.from_addr AS m_from FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.id = ?",
       deliveryId,
     );
-    if (!d || d.m_trust !== "teammate") return;
+    if (d?.m_trust !== "teammate") return;
     // A message released from hold (approved) is reported as delivered.
     const state = d.state === "queued" && d.decided_by ? "delivered" : d.state;
     const last = this.#sentReceipts.get(deliveryId);
@@ -247,7 +314,7 @@ export class TeamManager {
     handle?: string,
     createToken?: string,
   ): Promise<Record<string, unknown>> {
-    if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
+    alreadyInTeam(loadTeam(this.#ctx.paths));
     const team: TeamState = {
       relay: normalizeRelay(relay ?? defaultRelay(this.#ctx.config)),
       teamId: `${slugify(name, 24)}-${randomToken(6)
@@ -261,6 +328,7 @@ export class TeamManager {
     };
     await this.#attach(team, { kind: "create", ...(createToken ? { createToken } : {}) });
     saveTeam(this.#ctx.paths, team);
+    this.#announce("created", team);
     return this.status();
   }
 
@@ -316,7 +384,7 @@ export class TeamManager {
     handle?: string,
     relay?: string,
   ): Promise<Record<string, unknown>> {
-    if (loadTeam(this.#ctx.paths)) throw invalid("already in a team (agentlink team leave first)");
+    alreadyInTeam(loadTeam(this.#ctx.paths));
     // A short code is redeemed at the relay (once) for the full invite.
     if (INVITE_CODE_RE.test(normalizeCode(inviteText))) {
       const code = normalizeCode(inviteText);
@@ -350,6 +418,7 @@ export class TeamManager {
     };
     await this.#attach(team, { kind: "join", token: invite.token });
     saveTeam(this.#ctx.paths, team);
+    this.#announce("joined", team);
     return { ...this.status(), invitedBy: invite.by };
   }
 
@@ -363,10 +432,12 @@ export class TeamManager {
     const deadline = Date.now() + 8_000;
     while (!this.#client?.connected && Date.now() < deadline)
       await new Promise((r) => setTimeout(r, 100));
+    this.#announce("relay", next);
     return this.status();
   }
 
   leave(): void {
+    const team = loadTeam(this.#ctx.paths);
     // Stop this client even if a new one is attached before the timer fires.
     const old = this.#client;
     old?.removeSelf();
@@ -377,6 +448,7 @@ export class TeamManager {
     clearTeam(this.#ctx.paths);
     this.#ctx.store.run("DELETE FROM members");
     this.#ctx.store.run("DELETE FROM outbox");
+    if (team) this.#announce("left", team);
   }
 
   stop(): void {
@@ -388,6 +460,14 @@ export class TeamManager {
   originOf(message: MessageRow): string | undefined {
     return message.trust === "teammate" ? remoteHandleOf(message.from_addr) : undefined;
   }
+}
+
+/** Leaving is for people only, so an agent is told to ask for it. */
+function alreadyInTeam(team: TeamState | undefined): void {
+  if (team)
+    throw invalid(
+      `this machine is already in team ${safeField(team.teamName, 64)}; to switch, ask your user to run \`agentlink team leave\` in a terminal (agents cannot), then try again`,
+    );
 }
 
 function normalizeRelay(url: string): string {
