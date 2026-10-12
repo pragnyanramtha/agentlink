@@ -331,6 +331,83 @@ describe("held mail", () => {
   });
 });
 
+describe("thread state", () => {
+  it("says who still owes an answer, whoever looks", async () => {
+    t = await startTestDaemon();
+    await register("alpha");
+    await register("beta");
+    await register("gamma");
+    type Status = { state: string; awaiting: string[]; held: number };
+    const status = async (thread: string, as?: string): Promise<Status | undefined> => {
+      const caller = as ? { as } : {};
+      const list = await t.raw<{ threads: (ThreadRow & Status)[] }>(
+        "GET",
+        "/v1/threads",
+        undefined,
+        caller,
+      );
+      const row = list.data.threads.find((r) => r.thread === thread);
+      const one = await t.raw<Status>("GET", `/v1/threads/${thread}`, undefined, caller);
+      if (row) {
+        expect(one.status).toBe(200);
+        expect({ state: one.data.state, awaiting: one.data.awaiting, held: one.data.held }).toEqual(
+          { state: row.state, awaiting: row.awaiting, held: row.held },
+        );
+      }
+      return row && { state: row.state, awaiting: row.awaiting, held: row.held };
+    };
+    const awaiting = (...who: string[]) => ({ state: "awaiting", awaiting: who, held: 0 });
+
+    // An ask between two agents: open for the person too, not only for those two.
+    const ask = await send("alpha", { to: ["beta", "gamma"], kind: "ask", text: "which port?" });
+    expect(await status(ask.thread)).toEqual(awaiting("beta", "gamma"));
+    expect(await status(ask.thread, "alpha")).toEqual(awaiting("beta", "gamma"));
+    expect(await status(ask.thread, "beta")).toEqual({
+      state: "waiting_on_you",
+      awaiting: ["beta", "gamma"],
+      held: 0,
+    });
+    await send("beta", { kind: "reply", replyTo: ask.id, text: "8080" });
+    expect(await status(ask.thread)).toEqual(awaiting("gamma"));
+    expect(await status(ask.thread, "beta")).toEqual(awaiting("gamma"));
+    const acked = await t.raw("POST", `/v1/messages/${ask.id}/ack`, {}, { as: "gamma" });
+    expect(acked.status, JSON.stringify(acked.data)).toBe(200);
+    expect(await status(ask.thread)).toEqual({ state: "answered", awaiting: [], held: 0 });
+
+    // Asks to the person wait on them; plain info never waits on anyone.
+    const mine = await send("alpha", { to: ["@tester"], kind: "ask", text: "may I deploy?" });
+    expect(await status(mine.thread)).toEqual({
+      state: "waiting_on_you",
+      awaiting: ["@tester"],
+      held: 0,
+    });
+    expect(await status(mine.thread, "alpha")).toEqual(awaiting("@tester"));
+    const info = await send("alpha", { to: ["beta"], text: "fyi" });
+    expect(await status(info.thread)).toEqual({ state: "answered", awaiting: [], held: 0 });
+
+    // A held request is held (for the sender and the person; the recipient cannot see it).
+    await t.raw(
+      "POST",
+      "/v1/policy",
+      { scope: "local", kind: "request", action: "hold" },
+      { tty: true },
+    );
+    const held = await send("alpha", { to: ["beta"], kind: "request", text: "rotate keys" });
+    expect(await status(held.thread)).toEqual({ state: "held", awaiting: [], held: 1 });
+    expect(await status(held.thread, "alpha")).toEqual({ state: "held", awaiting: [], held: 1 });
+    expect(await status(held.thread, "beta")).toBeUndefined();
+    await t.raw("POST", `/v1/approvals/${held.id}`, { decision: "approve" }, { tty: true });
+    expect(await status(held.thread)).toEqual(awaiting("beta"));
+    expect((await status(held.thread, "beta"))?.state).toBe("waiting_on_you");
+    const refused = await send("alpha", { to: ["beta"], kind: "request", text: "drop the db" });
+    await t.raw("POST", `/v1/approvals/${refused.id}`, { decision: "deny" }, { tty: true });
+    expect(await status(refused.thread)).toEqual({ state: "answered", awaiting: [], held: 0 });
+
+    // Agents only count what they can see: gamma is not in alpha→beta threads.
+    expect(await status(held.thread, "gamma")).toBeUndefined();
+  });
+});
+
 describe("upgrade", () => {
   it("builds the search index from existing messages", async () => {
     t = await startTestDaemon();

@@ -211,9 +211,11 @@ async function sendCommon(
   },
 ): Promise<number> {
   if (!opts.text.trim()) throw new UsageError("message text is empty");
-  const offered = ["info", "ask", "request", "handoff", "reply", "ack"];
+  const offered = ["info", "ask", "request", "handoff", "review_request", "reply", "ack"];
   if (!offered.includes(opts.kind)) {
-    throw new UsageError(`unknown --kind "${opts.kind}" (use: info, request, handoff, or ask)`);
+    throw new UsageError(
+      `unknown --kind "${opts.kind}" (use: info, request, handoff, review_request, or ask)`,
+    );
   }
   const ttlMs = opts.ttl ? parseDuration(opts.ttl, 0, "m") : 0;
   await ctx.client.ensureDaemon();
@@ -262,7 +264,7 @@ export const send: Command = async (ctx) => {
   const [to, ...rest] = positionals;
   if (!to)
     throw new UsageError(
-      'usage: agentlink send <agent>[,<agent>…] "<message>" [--kind ask|request|handoff]',
+      'usage: agentlink send <agent>[,<agent>…] "<message>" [--kind ask|request|handoff|review_request]',
     );
   const kind = String(values.kind);
   // --wait [d] and --timeout <d> both wait for an answer (same as ask).

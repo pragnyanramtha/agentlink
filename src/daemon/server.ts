@@ -797,6 +797,7 @@ export function createDaemonServer(
       : all;
     return {
       thread,
+      ...mailbox.threadStatus(thread, viewer(req)),
       messages: visible.map(({ message, deliveries }) => ({
         message: mailbox.messageView(message, viewer(req)),
         text: textOf(mailbox.envelopeOf(message)),

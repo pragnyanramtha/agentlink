@@ -137,3 +137,26 @@ describe("cli history commands", () => {
     expect(p.stderr).toContain("interactive terminal");
   });
 });
+
+describe("cli send", () => {
+  it("sends a review request; it waits on the reviewer until they reply", async () => {
+    t = await startTestDaemon();
+    await register("alpha");
+    const res = await cli("send", "alpha", "--kind", "review_request", "--json", "check the diff");
+    expect(res.code, res.stderr).toBe(0);
+    const msg = (JSON.parse(res.stdout) as { message: { id: string; kind: string } }).message;
+    expect(msg.kind).toBe("review_request");
+    const todo = await t.raw<{ items: { message: { id: string } }[] }>(
+      "GET",
+      "/v1/todo",
+      undefined,
+      {
+        as: "alpha",
+      },
+    );
+    expect(todo.data.items.map((i) => i.message.id)).toEqual([msg.id]);
+    expect((await cli("send", "alpha", "--kind", "review", "x")).stderr).toContain(
+      "review_request",
+    );
+  });
+});

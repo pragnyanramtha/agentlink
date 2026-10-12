@@ -145,6 +145,9 @@ describe("threads index performance", () => {
       needsAnswer: true,
       waiting: false,
       unread: 1,
+      state: "waiting_on_you",
+      awaiting: ["alpha", "bob/x"],
+      held: 0,
     });
     expect(rows[1]).toMatchObject({
       thread: `THR${pad(198, 23)}`,

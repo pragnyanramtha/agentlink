@@ -241,15 +241,15 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
     {
       title: "Send to an agent",
       description:
-        "Send a message to other agents. kind: info (FYI, default), request (ask them to do something), handoff (give them a task), ask (question; prefer the ask tool to wait for the answer).",
+        "Send a message to other agents. kind: info (FYI, default), request (ask them to do something), handoff (give them a task), review_request (ask for a critical review), ask (question; prefer the ask tool to wait for the answer).",
       inputSchema: {
         to: recipients,
         message: z.string().describe("What to tell them; short and concrete"),
         kind: z
-          .enum(["info", "ask", "request", "handoff"])
+          .enum(["info", "ask", "request", "handoff", "review_request"])
           .optional()
           .describe(
-            "info = FYI (default), request = do something, handoff = transfer ownership of a task",
+            "info = FYI (default), request = do something, handoff = transfer ownership of a task, review_request = review this",
           ),
         thread: z.string().optional().describe("Thread id to continue a conversation"),
       },

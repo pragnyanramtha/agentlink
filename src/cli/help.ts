@@ -133,13 +133,14 @@ Examples:
   git diff | agentlink ask claude-web --stdin "Anything wrong with this diff?"
   agentlink ask alice/claude-api "Is the /v2 endpoint deployed?"`,
 
-  send: `agentlink send <agent>[,<agent>…] "<message>" [--kind info|ask|request|handoff] [--wait [d]]
+  send: `agentlink send <agent>[,<agent>…] "<message>" [--kind info|ask|request|handoff|review_request] [--wait [d]]
 
 Send a message. Kinds:
-  info      FYI, no answer expected (default; never wakes an idle agent)
-  ask       a question (prefer: agentlink ask)
-  request   asks the recipient to do something
-  handoff   hands work over (recipient accepts/declines with agentlink ack)
+  info            FYI, no answer expected (default; never wakes an idle agent)
+  ask             a question (prefer: agentlink ask)
+  request         asks the recipient to do something
+  handoff         hands work over (recipient accepts/declines with agentlink ack)
+  review_request  asks for a critical review (answered with reply "approve|changes: …")
 
   -k, --kind      message kind
   -w, --wait [d]  wait for an answer (default 110s); --timeout <d> does the same

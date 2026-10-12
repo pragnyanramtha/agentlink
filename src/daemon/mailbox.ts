@@ -118,6 +118,16 @@ export interface ThreadSummary {
   unread: number;
 }
 
+/** Where a conversation stands, the same for every viewer who sees the same messages. */
+export interface ThreadStatus {
+  /** held (mail waits for a person's approval) > waiting_on_you > awaiting > answered. */
+  state: "held" | "waiting_on_you" | "awaiting" | "answered";
+  /** Who still owes an answer to an ask/request/handoff/review (not replied, acked or refused). */
+  awaiting: string[];
+  /** Held deliveries. */
+  held: number;
+}
+
 const EXPECTING = "('ask','request','handoff','review_request')";
 
 export type WaitOutcome =
@@ -1821,7 +1831,7 @@ export class Mailbox {
   threads(
     viewer: InboxTarget,
     opts: { limit: number; offset: number; with?: string; open?: boolean },
-  ): ThreadSummary[] {
+  ): (ThreadSummary & ThreadStatus)[] {
     const { store } = this.#ctx;
     const agentId = "agent" in viewer ? viewer.agent.id : null;
     // Unary + keeps SQLite on the per-thread/per-message indexes instead of scanning every
@@ -1916,8 +1926,42 @@ export class Mailbox {
         needsAnswer: r.yours === 1,
         waiting: r.theirs === 1,
         unread: r.unread,
+        ...this.threadStatus(r.thread, viewer),
       };
     });
+  }
+
+  /** Who still owes answers in a thread and what is held, from the messages `viewer` sees. */
+  threadStatus(threadId: string, viewer: InboxTarget): ThreadStatus {
+    const [vis, visParams] = this.#visibleSql(viewer);
+    const rows = this.#ctx.store.all<{
+      to_addr: string;
+      to_agent_id: string | null;
+      state: string;
+    }>(
+      `SELECT d.to_addr, d.to_agent_id, d.state FROM messages m JOIN deliveries d ON d.message_id = m.id
+       WHERE m.thread_id = ? AND ${vis} AND (d.state = 'held'
+         OR (m.kind IN ${EXPECTING} AND d.state IN ('queued','sent','delivered','seen')))
+       ORDER BY m.created_at, m.id, d.id`,
+      threadId,
+      ...visParams,
+    );
+    const held = rows.filter((d) => d.state === "held").length;
+    const owing = rows.filter((d) => d.state !== "held");
+    const awaiting = [...new Set(owing.map((d) => d.to_addr))];
+    const you = owing.some((d) =>
+      "agent" in viewer
+        ? d.to_agent_id === viewer.agent.id
+        : d.to_agent_id === null && d.to_addr === `@${this.handle}`,
+    );
+    const state = held
+      ? "held"
+      : you
+        ? "waiting_on_you"
+        : awaiting.length
+          ? "awaiting"
+          : "answered";
+    return { state, awaiting, held };
   }
 
   /** Unread mail and unanswered asks/requests/handoffs for `target` (as in inbox and todo). */
