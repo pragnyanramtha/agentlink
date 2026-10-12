@@ -688,7 +688,7 @@ function onEvent(ev) {
     if (r) fan("onDelivery", r.e, d, r.prev);
     // Spoken: only what needs you. Everything else is on the board and in the log.
     if (r && (!r.prev || r.prev.state !== d.state)) {
-      if (d.state === "held") announce("Held for approval: " + klabel(r.e.m.kind) + " from " + nameOf(r.e.m.from) + " to " + nameOf(d.to));
+      if (heldHere(d)) announce("Held for approval: " + klabel(r.e.m.kind) + " from " + nameOf(r.e.m.from) + " to " + nameOf(d.to));
       else if (!r.prev && isYou(d.to) && ANSWERED.has(r.e.m.kind)) announce(klabel(r.e.m.kind) + " for you from " + nameOf(r.e.m.from) + ": " + r.e.m.preview);
     }
     if (ev.delivery.state === "held" || (r && r.prev && r.prev.state === "held")) soonHeld();

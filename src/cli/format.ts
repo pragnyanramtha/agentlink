@@ -60,6 +60,10 @@ export function span(ms: number): string {
   return `${Math.round(s / 86_400)}d`;
 }
 
+/** What an agent's reads show while agentlink is paused (they come back empty). */
+export const PAUSED =
+  "agentlink is paused: no messages are delivered until your user runs `agentlink resume`.";
+
 /** Ack values as words: accept → accepted, decline → declined. */
 export const ackWord = (ack: string): string =>
   ack === "accept" ? "accepted" : ack === "decline" ? "declined" : ack;

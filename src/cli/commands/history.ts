@@ -12,7 +12,7 @@ import {
   UsageError,
 } from "../args.ts";
 import { ApiError } from "../client.ts";
-import { ago, c, clip, indent, mark, short, table, when } from "../format.ts";
+import { ago, c, clip, indent, mark, PAUSED, short, table, when } from "../format.ts";
 
 type Tally = { busy: number; idle: number; offline: number };
 export interface Overview {
@@ -258,11 +258,11 @@ export const search: Command = async (ctx) => {
   if (words) q.set("q", words);
   q.set("limit", String(limit));
   await ctx.client.ensureDaemon();
-  const res = await ctx.client.request<{ results: SearchRow[]; fts: boolean }>(
+  const res = await ctx.client.request<{ results: SearchRow[]; fts: boolean; paused?: boolean }>(
     "GET",
     `/v1/search?${q}`,
   );
-  out(ctx, res, () => searchText(res, words, limit));
+  out(ctx, res, () => (res.paused ? c.yellow(PAUSED) : searchText(res, words, limit)));
   return 0;
 };
 
@@ -280,8 +280,13 @@ export const threads: Command = async (ctx) => {
   if (values.with) q.set("with", values.with);
   if (values.open) q.set("open", "1");
   await ctx.client.ensureDaemon();
-  const res = await ctx.client.request<{ threads: ThreadRow[] }>("GET", `/v1/threads?${q}`);
-  out(ctx, res, () => threadsText(res.threads, Date.now(), Boolean(values.open)));
+  const res = await ctx.client.request<{ threads: ThreadRow[]; paused?: boolean }>(
+    "GET",
+    `/v1/threads?${q}`,
+  );
+  out(ctx, res, () =>
+    res.paused ? c.yellow(PAUSED) : threadsText(res.threads, Date.now(), Boolean(values.open)),
+  );
   return 0;
 };
 

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { ApiError, Client } from "../cli/client.ts";
+import { PAUSED } from "../cli/format.ts";
 import { KindSchema } from "../core/envelope.ts";
 import { LIMITS } from "../core/limits.ts";
 import type { Paths } from "../core/paths.ts";
@@ -145,6 +146,8 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
       try {
         return await fn(args);
       } catch (error) {
+        // 423: paused, so this read shows nothing until the user resumes (not a failed call).
+        if (error instanceof ApiError && error.status === 423) return ok(error.message);
         return fail(
           error instanceof ApiError
             ? `agentlink: ${forMcp(error.message)}`
@@ -334,7 +337,7 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
       const q = new URLSearchParams({ format: "inject" });
       if (include_read) q.set("all", "1");
       if (wait_seconds) q.set("waitMs", String(wait_seconds * 1000));
-      const res = await call<{ count: number; text: string }>(
+      const res = await call<{ count: number; text: string; paused?: boolean }>(
         "GET",
         `/v1/inbox?${q}`,
         undefined,
@@ -343,7 +346,9 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
       return ok(
         res.count
           ? `${res.text}\n\n(You are using MCP: answer with the reply/ack tools instead of the agentlink commands shown above.)`
-          : "No new messages.",
+          : res.paused
+            ? res.text
+            : "No new messages.",
       );
     }),
   );
@@ -387,7 +392,9 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
           message: { id: string; kind: string; from: string; createdAt: string };
           text: string;
         }[];
+        paused?: boolean;
       }>("GET", "/v1/todo");
+      if (res.paused) return ok(PAUSED);
       if (res.items.length === 0) return ok("Nothing is waiting for your answer.");
       return ok(
         res.items
@@ -453,7 +460,8 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
       for (const [k, v] of Object.entries({ q: words, from, to, since, thread }))
         if (v?.trim()) q.set(k, v.trim());
       if (kind?.length) q.set("kind", [kind].flat().join(","));
-      const res = await call<{ results: SearchRow[] }>("GET", `/v1/search?${q}`);
+      const res = await call<{ results: SearchRow[]; paused?: boolean }>("GET", `/v1/search?${q}`);
+      if (res.paused) return ok(PAUSED);
       if (res.results.length === 0)
         return ok("No messages match (only conversations you are part of are searched).");
       return ok(
@@ -497,9 +505,10 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
       if (open) q.set("open", "1");
       if (peer?.trim()) q.set("with", peer.trim());
       const [res, who] = await Promise.all([
-        call<{ threads: ThreadRow[] }>("GET", `/v1/threads?${q}`),
+        call<{ threads: ThreadRow[]; paused?: boolean }>("GET", `/v1/threads?${q}`),
         call<{ agent: { name: string } | null }>("GET", "/v1/whoami"),
       ]);
+      if (res.paused) return ok(PAUSED);
       if (res.threads.length === 0)
         return ok(open ? "No open conversations." : "No conversations yet.");
       return ok(

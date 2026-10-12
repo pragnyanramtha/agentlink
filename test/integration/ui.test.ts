@@ -248,7 +248,7 @@ function uiCore(): any {
     views: new Map(),
   });
   new Script(
-    `${squeeze(CORE)}\nglobalThis.ui = { convState, threadState, S, views };`,
+    `${squeeze(CORE)}\nglobalThis.ui = { convState, threadState, flight, S, views };`,
   ).runInContext(ctx);
   return (ctx as { ui: unknown }).ui;
 }
@@ -291,6 +291,16 @@ describe("web UI conversation state", () => {
     ).toBe("held");
     expect(ui.convState({}, rows(row("ask", ["beta", "replied"]))).label).toBe("answered");
     expect(ui.convState({}, rows(row("info", ["beta", "seen"]))).label).toBe("answered");
+    // A hold on a teammate's machine is theirs to decide: here it is awaited, with nothing to review.
+    const there = row("ask", ["bob/codex", "held"]);
+    (there.deliveries[0] as { method?: string }).method = "relay";
+    expect(ui.convState({}, rows(there)).label).toBe("awaiting bob/codex");
+    const e = (x: ReturnType<typeof row>) => ({
+      m: { ...x.message, createdAt: new Date().toISOString() },
+      d: new Map(x.deliveries.map((d) => [d.id, d])),
+    });
+    expect(ui.flight(e(there)).held).toBe(false);
+    expect(ui.flight(e(row("ask", ["beta", "held"]))).held).toBe(true);
     // Without messages, the summary's flags still give one of the four.
     expect(ui.convState({ needsAnswer: true }).st).toBe("waiting_on_you");
     expect(ui.convState({ open: true }).label).toBe("awaiting a reply");

@@ -19,6 +19,7 @@ import {
   clock,
   deliveryColor,
   indent,
+  PAUSED,
   reLine,
   short,
   span,
@@ -410,11 +411,7 @@ export const inbox: Command = async (ctx) => {
     undefined,
     { timeoutMs: waitMs + 10_000 },
   );
-  out(ctx, res, () =>
-    res.paused
-      ? c.yellow("agentlink is paused: nothing is delivered until you run agentlink resume.")
-      : printItems(res.items, Boolean(values.all)),
-  );
+  out(ctx, res, () => (res.paused ? c.yellow(PAUSED) : printItems(res.items, Boolean(values.all))));
   return 0;
 };
 
@@ -586,22 +583,25 @@ export const status: Command = async (ctx) => {
   const me = who.agent?.name ?? `@${who.handle}`;
   const log = await ctx.client.request<{
     messages: { message: MessageView; deliveries: DeliveryView[] }[];
+    paused?: boolean;
   }>("GET", "/v1/log?limit=10&mine=1");
   const mine = log.messages;
-  out(ctx, { me, messages: mine }, () =>
-    mine.length === 0
-      ? c.dim(`No messages sent by ${me} yet.`)
-      : mine
-          .map(
-            ({ message: m, deliveries }) =>
-              `${c.bold(m.kind)} ${c.dim(short(m.id))} "${m.preview}"\n${deliveries
-                .map(
-                  (d) =>
-                    `  → ${d.to}: ${deliveryColor(stateLabel(d))}${d.method ? c.dim(` via ${d.method}`) : ""}`,
-                )
-                .join("\n")}`,
-          )
-          .join("\n"),
+  out(ctx, { me, messages: mine, ...(log.paused ? { paused: true } : {}) }, () =>
+    log.paused
+      ? c.yellow(PAUSED)
+      : mine.length === 0
+        ? c.dim(`No messages sent by ${me} yet.`)
+        : mine
+            .map(
+              ({ message: m, deliveries }) =>
+                `${c.bold(m.kind)} ${c.dim(short(m.id))} "${m.preview}"\n${deliveries
+                  .map(
+                    (d) =>
+                      `  → ${d.to}: ${deliveryColor(stateLabel(d))}${d.method ? c.dim(` via ${d.method}`) : ""}`,
+                  )
+                  .join("\n")}`,
+            )
+            .join("\n"),
   );
   return 0;
 };
@@ -638,11 +638,14 @@ export const log: Command = async (ctx) => {
   await ctx.client.ensureDaemon();
   const res = await ctx.client.request<{
     messages: { message: MessageView; deliveries: DeliveryView[] }[];
+    paused?: boolean;
   }>("GET", `/v1/log?${q}`);
   out(ctx, res, () =>
-    filtered && !res.messages.length
-      ? c.dim("No messages match those filters.")
-      : logText(res.messages),
+    res.paused
+      ? c.yellow(PAUSED)
+      : filtered && !res.messages.length
+        ? c.dim("No messages match those filters.")
+        : logText(res.messages),
   );
   return 0;
 };
@@ -708,20 +711,25 @@ export const watch: Command = async (ctx) => {
 export const todo: Command = async (ctx) => {
   parse(ctx.argv, {});
   await ctx.client.ensureDaemon();
-  const res = await ctx.client.request<{ items: InboxItemView[] }>("GET", "/v1/todo");
+  const res = await ctx.client.request<{ items: InboxItemView[]; paused?: boolean }>(
+    "GET",
+    "/v1/todo",
+  );
   out(ctx, res, () =>
-    res.items.length === 0
-      ? c.dim("Nothing waiting for an answer from you.")
-      : [
-          c.bold(`${res.items.length} waiting for your answer:`),
-          ...res.items.map(
-            (i) =>
-              `  ${c.dim(i.message.id.slice(0, 12))} ${c.bold(i.message.kind.padEnd(8))} from ${c.cyan(i.message.from)} ${c.dim(ago(i.message.createdAt))}  "${i.text.replace(/\s+/g, " ").slice(0, 80)}"`,
-          ),
-          c.dim(
-            '  answer: agentlink reply <id> "…"   ·   handoffs: agentlink ack <id> --accept|--decline',
-          ),
-        ].join("\n"),
+    res.paused
+      ? c.yellow(PAUSED)
+      : res.items.length === 0
+        ? c.dim("Nothing waiting for an answer from you.")
+        : [
+            c.bold(`${res.items.length} waiting for your answer:`),
+            ...res.items.map(
+              (i) =>
+                `  ${c.dim(i.message.id.slice(0, 12))} ${c.bold(i.message.kind.padEnd(8))} from ${c.cyan(i.message.from)} ${c.dim(ago(i.message.createdAt))}  "${i.text.replace(/\s+/g, " ").slice(0, 80)}"`,
+            ),
+            c.dim(
+              '  answer: agentlink reply <id> "…"   ·   handoffs: agentlink ack <id> --accept|--decline',
+            ),
+          ].join("\n"),
   );
   return 0;
 };

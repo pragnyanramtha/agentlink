@@ -245,6 +245,8 @@ const titleOf = (thread) => S.titles.get(thread) || (S.threads.find((t) => t.thr
 // one, else the same rules over the messages at hand. Every label and class comes from here, so
 // a list row, the note and the explorer cannot disagree.
 const OPEN_D = new Set(["queued", "sent", "delivered", "seen"]);
+// A hold on a teammate's machine (via relay) is theirs to decide: here it is still awaited.
+const heldHere = (d) => d.state === "held" && d.method !== "relay";
 const rowsOf = (list) => list.map((x) => (x.message ? { m: x.message, ds: x.deliveries } : { m: x.m, ds: [...x.d.values()] }));
 function convState(t, rows) {
   t = t || {};
@@ -252,9 +254,9 @@ function convState(t, rows) {
   if (!st && rows && rows.length) {
     let you = false;
     for (const r of rows) {
-      held += r.ds.filter((d) => d.state === "held").length;
+      held += r.ds.filter(heldHere).length;
       if (!ANSWERED.has(r.m.kind) || r.ds.some((d) => d.state === "replied" || d.state === "acked")) continue;
-      for (const d of r.ds) if (OPEN_D.has(d.state)) { if (isYou(d.to)) you = true; else aw.push(d.to); }
+      for (const d of r.ds) if (OPEN_D.has(d.state) || (d.state === "held" && !heldHere(d))) { if (isYou(d.to)) you = true; else aw.push(d.to); }
     }
     aw = uniq(aw);
     st = held ? "held" : you ? "waiting_on_you" : aw.length ? "awaiting" : "answered";
@@ -281,9 +283,9 @@ function flight(e) {
   const ds = [...e.d.values()];
   const live = ds.filter((d) => !BAD.has(d.state));
   const bad = ds.filter((d) => BAD.has(d.state));
-  const held = ds.some((d) => d.state === "held");
+  const held = ds.some(heldHere);
   const answers = ANSWERED.has(e.m.kind);
-  const min = live.length ? Math.min(...live.map((d) => RANK[d.state] ?? 0)) : -1;
+  const min = live.length ? Math.min(...live.map((d) => (d.state === "held" && !heldHere(d) ? 1 : RANK[d.state] ?? 0))) : -1;
   const latest = (pick) => { let best = 0; for (const d of live) { const t = ts(pick(d)); if (!t) return 0; best = Math.max(best, t); } return best; };
   const acked = live.length > 0 && live.every((d) => d.state === "acked");
   const steps = [

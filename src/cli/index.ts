@@ -100,7 +100,7 @@ function fail(code: string, message: string, hint?: string): void {
   process.stderr.write(
     errOut.json
       ? `${JSON.stringify({ error: { code, message } })}\n`
-      : `agentlink: ${message}\n${hint ? `${hint}\n` : ""}`,
+      : `${code === "paused" ? "" : "agentlink: "}${message}\n${hint ? `${hint}\n` : ""}`,
   );
 }
 
