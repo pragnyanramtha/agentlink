@@ -73,27 +73,30 @@ export function isDeniedAttachment(path: string): boolean {
   return DENIED_NAMES.some((re) => re.test(name));
 }
 
+export interface ScannablePart {
+  kind: string;
+  text?: string;
+  file?: { name?: string; bytes?: string };
+  data?: unknown;
+}
+
+/** The content a part carries: its text, its data as JSON, or its decoded file contents. */
+export function partTexts(part: ScannablePart): string[] {
+  const texts: string[] = [];
+  if (part.kind === "text" && part.text) texts.push(part.text);
+  if (part.kind === "data") texts.push(JSON.stringify(part.data ?? {}));
+  if (part.kind === "file" && part.file?.bytes)
+    texts.push(Buffer.from(part.file.bytes, "base64").toString("utf8").slice(0, 2_000_000));
+  return texts;
+}
+
 /** Every place a message part can carry a secret: text, file names and contents, and data. */
-export function scanParts(
-  parts: readonly {
-    kind: string;
-    text?: string;
-    file?: { name?: string; bytes?: string };
-    data?: unknown;
-  }[],
-): string[] {
+export function scanParts(parts: readonly ScannablePart[]): string[] {
   const found = new Set<string>();
   for (const part of parts) {
-    const texts: string[] = [];
-    if (part.kind === "text" && part.text) texts.push(part.text);
-    if (part.kind === "data") texts.push(JSON.stringify(part.data ?? {}));
-    if (part.kind === "file" && part.file) {
-      if (part.file.name && isDeniedAttachment(part.file.name))
-        found.add(`sensitive file (${part.file.name})`);
-      if (part.file.bytes)
-        texts.push(Buffer.from(part.file.bytes, "base64").toString("utf8").slice(0, 2_000_000));
-    }
-    for (const t of texts) for (const f of scanSecrets(t)) found.add(f.type);
+    if (part.kind === "file" && part.file?.name && isDeniedAttachment(part.file.name))
+      found.add(`sensitive file (${part.file.name})`);
+    for (const t of partTexts(part)) for (const f of scanSecrets(t)) found.add(f.type);
   }
   return [...found];
 }

@@ -1,5 +1,6 @@
 import { randomInt, scryptSync } from "node:crypto";
 import { teamDecrypt, teamEncrypt } from "./crypto.ts";
+import { partTexts, type ScannablePart } from "./redact.ts";
 
 /**
  * Short invite codes ("tiger-lamp-orbit-sun-42", ~38 bits). The relay only stores a lookup id and
@@ -65,9 +66,32 @@ const WORD_SET = new Set(WORDS);
 
 /** Invite codes and al1 invites are for people to pass on, never for agents to relay. */
 export function containsInvite(text: string): boolean {
-  if (/\bal1\.[A-Za-z0-9_-]{40,}/.test(text)) return true;
-  for (const m of text.toLowerCase().matchAll(/\b([a-z]+)-([a-z]+)-([a-z]+)-([a-z]+)-\d{2}\b/g)) {
+  if (/\bal1\.\s*[A-Za-z0-9_-]{40,}/.test(text)) return true;
+  // Hyphens or spaces between the words, as people type codes (normalizeCode accepts both).
+  const re = /\b([a-z]+)[\s-]+([a-z]+)[\s-]+([a-z]+)[\s-]+([a-z]+)[\s-]+\d{2}\b/g;
+  for (const m of text.toLowerCase().matchAll(re)) {
     if ([m[1], m[2], m[3], m[4]].every((w) => WORD_SET.has(w as string))) return true;
   }
   return false;
+}
+
+function stringsIn(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") out.push(value);
+  else if (value && typeof value === "object") {
+    for (const [k, v] of Object.entries(value)) {
+      out.push(k);
+      stringsIn(v, out);
+    }
+  }
+  return out;
+}
+
+/**
+ * Looks everywhere in a message: text, decoded file contents, and every string field and key, all
+ * joined so that a code split across parts or fields still counts.
+ */
+export function partsHaveInvite(parts: readonly ScannablePart[]): boolean {
+  return containsInvite(
+    [...parts.flatMap(partTexts), ...parts.flatMap((p) => stringsIn(p))].join("\n"),
+  );
 }
