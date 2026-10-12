@@ -3,6 +3,7 @@ import { hostname } from "node:os";
 import { z } from "zod";
 import { CANONICAL_EVENTS, type CanonicalEvent, getRuntime } from "../adapters/runtime.ts";
 import { detectTool, findToolProcess } from "../core/proc.ts";
+import { renderConversationIndex } from "../core/render.ts";
 import type { DaemonContext } from "./context.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import type { Mailbox } from "./mailbox.ts";
@@ -147,6 +148,7 @@ export class HookHandler {
         const text = [
           this.#identityNote(agent),
           items.length ? this.#mailbox.render(items, agent.name) : "",
+          this.#conversations(agent),
         ]
           .filter(Boolean)
           .join("\n\n");
@@ -191,6 +193,24 @@ export class HookHandler {
 
   #context(stdout: string | undefined): HookResponse {
     return stdout ? { stdout } : {};
+  }
+
+  /** Index of the agent's own recent conversations; never fails the hook (mail is already drained). */
+  #conversations(agent: AgentRow): string {
+    try {
+      const rows = this.#mailbox.threads({ agent }, { limit: 8, offset: 0 });
+      return renderConversationIndex(
+        rows.map((r) => ({
+          thread: r.thread,
+          with: r.participants.filter((p) => p !== agent.name),
+          state: r.needsAnswer ? "needs your answer" : r.waiting ? "waiting on them" : "done",
+          lastPreview: r.lastPreview,
+        })),
+      );
+    } catch (error) {
+      this.#ctx.log.warn("conversation index failed", { error: String(error) });
+      return "";
+    }
   }
 
   #identityNote(agent: AgentRow): string {

@@ -149,6 +149,46 @@ export function renderInjection(
   return parts.join("\n\n");
 }
 
+export interface ConversationRow {
+  thread: string;
+  /** The other participants. */
+  with: string[];
+  state: "needs your answer" | "waiting on them" | "done";
+  lastPreview: string;
+}
+
+/** Index fields stay on their line, inside their quotes, and can't fake a field separator. */
+const indexField = (text: string, max: number) =>
+  preview(
+    neutralize(safeField(text, 300) ?? "")
+      .replace(/"/g, "'")
+      .replace(/·/g, "-"),
+    max,
+  );
+
+/** Compact "Recent conversations" index for session start, newest first, within a char budget. */
+export function renderConversationIndex(
+  rows: ConversationRow[],
+  opts: { maxRows?: number; maxChars?: number } = {},
+): string {
+  if (rows.length === 0) return "";
+  const head = "Recent conversations (newest first):";
+  const foot =
+    "Details: agentlink thread <id> (or the `thread` MCP tool); search: agentlink search <words>";
+  let budget = (opts.maxChars ?? 1200) - head.length - foot.length - 2;
+  const lines: string[] = [];
+  for (const r of rows.slice(0, opts.maxRows ?? 8)) {
+    const who = r.with.slice(0, 4).map((p) => indexField(p, 40));
+    if (r.with.length > 4) who.push(`+${r.with.length - 4}`);
+    const id = shortId((safeField(r.thread, 100) ?? "").replace(/[^0-9A-Za-z]/g, "").toUpperCase());
+    const line = `#${id} · with ${who.join(", ") || "nobody else"} · ${r.state} · "${indexField(r.lastPreview, 60)}"`;
+    if (line.length + 1 > budget) break;
+    budget -= line.length + 1;
+    lines.push(line);
+  }
+  return lines.length ? [head, ...lines, foot].join("\n") : "";
+}
+
 /** One-line notice used when waking an agent through a terminal (tmux). */
 export function renderWakeNotice(items: Pick<RenderItem, "kind" | "from" | "text">[]): string {
   const first = items[0];
