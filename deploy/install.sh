@@ -11,6 +11,22 @@ PREFIX="${AGENTLINK_PREFIX:-$HOME/.local}"
 say() { printf '%s\n' "$*"; }
 fail() { printf 'agentlink install: %s\n' "$*" >&2; exit 1; }
 
+# WSL: 1 or 2 (WSL 1 reports "Microsoft" in its kernel release; WSL 2 registers WSLInterop).
+wsl=""
+if grep -qiE 'microsoft-standard|wsl2' /proc/sys/kernel/osrelease 2>/dev/null || [ -e /proc/sys/fs/binfmt_misc/WSLInterop ]; then
+  wsl=2
+elif grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+  wsl=1
+fi
+if [ -n "$wsl" ]; then
+  # WSL puts Windows' PATH after Linux's: a Windows Node.js can't run agentlink for WSL agents.
+  for tool in node npm; do
+    found="$(command -v "$tool" 2>/dev/null || command -v "$tool.exe" 2>/dev/null || true)"
+    case "$found" in
+      /mnt/*) fail "$tool is the Windows install ($found); agentlink inside WSL needs Node.js installed inside WSL, e.g. with nvm (https://github.com/nvm-sh/nvm): nvm install 24" ;;
+    esac
+  done
+fi
 command -v node >/dev/null 2>&1 || fail "Node.js 22.13 or newer is required (https://nodejs.org, or: nvm install 24)"
 command -v npm >/dev/null 2>&1 || fail "npm is required (it comes with Node.js)"
 node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a===22&&b>=13)?0:1)' \
@@ -56,6 +72,11 @@ if [ "$(uname -s)" = "Linux" ] && ! command -v ss >/dev/null 2>&1; then
   say ""
   say "! 'ss' is missing (package iproute2). Without it agentlink cannot check which agent is"
   say "  calling and trusts what callers claim. Install it, e.g.: sudo apt install iproute2"
+fi
+if [ "$wsl" = 1 ]; then
+  say ""
+  say "! This is WSL 1: agentlink cannot check which agent is calling there. Switch the distro to"
+  say "  WSL 2 (in Windows PowerShell: wsl --set-version <distro> 2)."
 fi
 say ""
 say "Next:"

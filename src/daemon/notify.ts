@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { safeField } from "../core/sanitize.ts";
+import { hasInterop } from "../core/wsl.ts";
 import type { DaemonContext } from "./context.ts";
 import type { DaemonEvent } from "./events.ts";
 import type { Mailbox } from "./mailbox.ts";
@@ -27,6 +28,39 @@ function which(bin: string): string | null {
 
 /** AppleScript string literal. */
 const appleString = (s: string) => `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+
+const POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+// PowerShell's own app id: Windows shows toasts only for registered apps.
+const PS_APP = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+
+/** A Windows toast (WinRT) showing `text`, which arrives base64-encoded: never parsed as code. */
+export function toastScript(text: string): string {
+  const b64 = Buffer.from(text, "utf8").toString("base64");
+  const N = "Windows.UI.Notifications";
+  return [
+    `$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))`,
+    `$null = [${N}.ToastNotificationManager, ${N}, ContentType = WindowsRuntime]`,
+    `$x = [${N}.ToastNotificationManager]::GetTemplateContent([${N}.ToastTemplateType]::ToastText02)`,
+    "$n = $x.GetElementsByTagName('text')",
+    "$null = $n.Item(0).AppendChild($x.CreateTextNode('agentlink'))",
+    "$null = $n.Item(1).AppendChild($x.CreateTextNode($t))",
+    `[${N}.ToastNotificationManager]::CreateToastNotifier('${PS_APP}').Show([${N}.ToastNotification]::new($x))`,
+  ].join("\n");
+}
+
+/** argv for the notifier binary: osascript, powershell.exe (WSL), or notify-send style. */
+export function notifierArgs(bin: string, body: string): string[] {
+  if (bin.endsWith("/osascript"))
+    return [
+      "-e",
+      `display notification ${appleString(body)} with title ${appleString("agentlink")}`,
+    ];
+  if (/powershell\.exe$/i.test(bin)) {
+    const encoded = Buffer.from(toastScript(body), "utf16le").toString("base64");
+    return ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded];
+  }
+  return ["--", "agentlink", body];
+}
 
 /**
  * Opt-in desktop notifications for the person at this machine (config notify.desktop): mail for
@@ -60,8 +94,11 @@ export class DesktopNotifier {
     return this.#ctx.config.notify?.desktop === true;
   }
 
-  /** The notifier binary (AGENTLINK_NOTIFY_BIN, else notify-send on Linux, osascript on macOS). */
+  /** The notifier binary (AGENTLINK_NOTIFY_BIN, else notify-send on Linux, Windows toasts via
+   * powershell.exe under WSL, osascript on macOS). */
   notifier(): string | null {
+    if (!this.#bin && !process.env.AGENTLINK_NOTIFY_BIN && hasInterop())
+      return which(POWERSHELL) ?? which("powershell.exe");
     const bin =
       this.#bin ??
       process.env.AGENTLINK_NOTIFY_BIN ??
@@ -88,10 +125,15 @@ export class DesktopNotifier {
     };
   }
 
-  /** Sends a test notification now (even when disabled). */
-  test(): { found: boolean; sent: boolean; notifier: string | null; enabled: boolean } {
+  /** Sends a test notification now (even when disabled); sent only if the notifier succeeded. */
+  async test(): Promise<{
+    found: boolean;
+    sent: boolean;
+    notifier: string | null;
+    enabled: boolean;
+  }> {
     const notifier = this.notifier();
-    const sent = !!notifier && this.#send("Desktop notifications from agentlink work.");
+    const sent = !!notifier && (await this.#send("Desktop notifications from agentlink work."));
     return { found: !!notifier, sent, notifier, enabled: this.enabled };
   }
 
@@ -132,7 +174,7 @@ export class DesktopNotifier {
     const now = Date.now();
     if (now - slot.last >= this.#windowMs && !slot.timer) {
       slot.last = now;
-      this.#send(text);
+      void this.#send(text);
       return;
     }
     slot.pending.push(text);
@@ -143,7 +185,7 @@ export class DesktopNotifier {
         if (!pending.length || !this.enabled) return;
         slot.last = Date.now();
         const noun = category === "held" ? "approvals needed" : `new ${category}s`;
-        this.#send(
+        void this.#send(
           pending.length === 1
             ? (pending[0] as string)
             : `${pending.length} ${noun} (latest: ${pending[pending.length - 1]})`,
@@ -154,20 +196,17 @@ export class DesktopNotifier {
     slot.timer.unref?.();
   }
 
-  #send(text: string): boolean {
+  /** True once the notifier exited cleanly (failures are otherwise ignored: best effort). */
+  #send(text: string): Promise<boolean> {
     const bin = this.notifier();
-    if (!bin) return false;
-    const body = safeField(text, 240) ?? "";
-    const args = bin.endsWith("/osascript")
-      ? ["-e", `display notification ${appleString(body)} with title ${appleString("agentlink")}`]
-      : ["--", "agentlink", body];
-    try {
-      execFile(bin, args, { timeout: 10_000, windowsHide: true }, () => {
-        // failures are ignored: notifications are best effort
-      });
-      return true;
-    } catch {
-      return false;
-    }
+    if (!bin) return Promise.resolve(false);
+    const args = notifierArgs(bin, safeField(text, 240) ?? "");
+    return new Promise((resolve) => {
+      try {
+        execFile(bin, args, { timeout: 10_000, windowsHide: true }, (error) => resolve(!error));
+      } catch {
+        resolve(false);
+      }
+    });
   }
 }

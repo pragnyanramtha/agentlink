@@ -1,12 +1,12 @@
-import { execFile } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import { z } from "zod";
 import { KindSchema } from "../core/envelope.ts";
 import { invalid } from "../core/errors.ts";
-import { ssPids } from "../core/peer.ts";
+import { runSs, ssPids } from "../core/peer.ts";
 import { ancestry } from "../core/proc.ts";
+import { wslVersion } from "../core/wsl.ts";
 import { ASSETS } from "../ui/assets.ts";
 import type { DaemonContext } from "./context.ts";
 import type { Registry } from "./registry.ts";
@@ -83,16 +83,21 @@ const RULES: Rule[] = [
 let ssMissing = process.platform !== "linux";
 /** PIDs holding the client end of a loopback TCP connection, from the kernel (`ss`). Every pid in
  * the row is kept (a forged one only adds a process to check), so a crafted name cannot hide one. */
-async function loopbackPeerPids(socket: Socket): Promise<number[] | undefined> {
+async function loopbackPeerPids(socket: Socket): Promise<PeerPids | undefined> {
   if (ssMissing) return undefined;
   const args = ["-tnpH", "src", `127.0.0.1:${socket.remotePort}`];
   args.push("dst", `127.0.0.1:${socket.localPort}`);
-  return new Promise((resolve) => {
-    execFile("ss", args, { timeout: 3_000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
-      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") ssMissing = true;
-      resolve(ssMissing ? undefined : error ? [] : ssPids(stdout).map((p) => p.pid));
-    });
-  });
+  const { stdout, error } = await runSs(args, 1024 * 1024);
+  if (error?.code === "ENOENT") ssMissing = true;
+  if (ssMissing) return undefined;
+  return error ? { pids: [], failed: true } : { pids: ssPids(stdout ?? "").map((p) => p.pid) };
+}
+type PeerPids = { pids: number[]; failed?: boolean };
+
+export interface UiOptions {
+  /** WSL version (0 off WSL); a Windows browser reaches the UI through a process Linux can't see. */
+  wsl?: number;
+  peerPids?: (socket: Socket) => Promise<PeerPids | undefined>;
 }
 
 interface Secret {
@@ -121,11 +126,14 @@ export class UiServer {
   #open = 0;
   #peers = new WeakMap<Socket, Promise<string | null>>();
   #warned = false;
+  #warnedWsl = false;
+  readonly #opts: UiOptions;
 
-  constructor(dispatch: Dispatch, ctx: DaemonContext, registry: Registry) {
+  constructor(dispatch: Dispatch, ctx: DaemonContext, registry: Registry, opts?: UiOptions) {
     this.#dispatch = dispatch;
     this.#ctx = ctx;
     this.#registry = registry;
+    this.#opts = { wsl: wslVersion(), ...opts };
   }
 
   /** Open browser connections (they keep an idle daemon running). */
@@ -199,11 +207,23 @@ export class UiServer {
   #checkPeer(socket: Socket): Promise<string | null> {
     let verdict = this.#peers.get(socket);
     if (!verdict) {
-      verdict = loopbackPeerPids(socket).then((pids) => {
-        if (!pids) {
+      verdict = (this.#opts.peerPids ?? loopbackPeerPids)(socket).then((peer) => {
+        if (!peer) {
           if (!this.#warned) {
             this.#warned = true;
             this.#ctx.log.warn("web UI cannot identify connecting processes on this system");
+          }
+          return null;
+        }
+        const { pids } = peer;
+        if (pids.length === 0 && !peer.failed && this.#opts.wsl === 2) {
+          // A Windows browser reaches the UI through WSL's localhost forwarding (a root process, or
+          // none in mirrored mode): Linux shows no process. It still needs the one-time login link.
+          if (!this.#warnedWsl) {
+            this.#warnedWsl = true;
+            this.#ctx.log.warn(
+              "web UI: allowing connections from no visible process (a Windows browser under WSL 2)",
+            );
           }
           return null;
         }

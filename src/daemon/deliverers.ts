@@ -4,6 +4,7 @@ import { connect } from "node:net";
 import { delimiter, join } from "node:path";
 import { promisify } from "node:util";
 import { ulid } from "../core/ids.ts";
+import { isWsl, onWindowsDrive } from "../core/wsl.ts";
 import type { DaemonContext } from "./context.ts";
 import type { Deliverer, WakePayload } from "./delivery.ts";
 import { type AgentRow, parseJson } from "./types.ts";
@@ -12,8 +13,9 @@ const execFileAsync = promisify(execFile);
 
 export function findBinary(name: string, envOverride?: string): string | undefined {
   if (envOverride) return envOverride;
+  const wsl = isWsl();
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
+    if (!dir || (wsl && onWindowsDrive(dir))) continue; // Windows programs can't reach WSL agents
     const candidate = join(dir, name);
     try {
       accessSync(candidate, constants.X_OK);

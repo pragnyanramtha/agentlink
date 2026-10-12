@@ -1,6 +1,15 @@
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import {
   INSTALL_TOOLS,
@@ -14,9 +23,13 @@ import {
   skillPath,
   TOOL_BINARIES,
   VirtualFs,
+  windowsInstalls,
 } from "../../adapters/install/targets.ts";
 import { applyChanges, renderDiff } from "../../adapters/install/util.ts";
+import { probePeerLookup, ssBinary } from "../../core/peer.ts";
+import { hasInterop, socketlessFs, wslVersion } from "../../core/wsl.ts";
 import { type CliContext, type Command, out, parse, UsageError } from "../args.ts";
+import { lastStartError, startHint } from "../client.ts";
 import { c } from "../format.ts";
 
 function launcher(): { node: string; entry: string } {
@@ -195,6 +208,31 @@ function launcherHome(path: string): string | undefined {
   }
 }
 
+const WINDOWS_AGENTS =
+  'Windows installs. agentlink inside WSL only sees agents running inside WSL: install the CLI inside WSL, or use VS Code/Cursor Remote-WSL or Codex\'s "run in WSL"';
+
+/** Agent CLIs found only as Windows installs (PATH entries on /mnt/<drive>). */
+function windowsOnly(): string[] {
+  return INSTALL_TOOLS.filter((t) => !onPath(TOOL_BINARIES[t])).flatMap((t) =>
+    windowsInstalls(TOOL_BINARIES[t]),
+  );
+}
+
+function wslRow(version: number): { ok: boolean | null; label: string; detail: string } {
+  if (version === 1)
+    return {
+      ok: false,
+      label: "WSL",
+      detail:
+        "WSL 1: agentlink cannot verify which agent is calling here; switch this distro to WSL 2 (in Windows PowerShell: wsl --set-version <distro> 2)",
+    };
+  return {
+    ok: null,
+    label: "WSL",
+    detail: `WSL 2${hasInterop() ? "" : " (Windows interop is off: the web UI and notifications can't reach Windows)"}; agents running on Windows can't reach this agentlink`,
+  };
+}
+
 export const doctor: Command = async (ctx) => {
   const { values } = parse(ctx.argv, { project: { type: "string", short: "p" } });
   const project = values.project ?? wiredProject(ctx, process.cwd());
@@ -207,29 +245,66 @@ export const doctor: Command = async (ctx) => {
       detail: `${project} (found from the current directory)`,
     });
   }
-  const health = await ctx.client.health();
+  let refused: string | undefined;
+  const health = await ctx.client.health().catch((error: Error) => {
+    refused = error.message;
+    return undefined;
+  });
+  const startError = health || refused ? undefined : lastStartError(ctx.paths);
+  const hint = startError && startHint(startError, ctx.paths);
   rows.push({
     ok: !!health,
     label: "daemon",
     detail: health
       ? `running (pid ${health.pid}, ${health.agents} agent(s) online)`
-      : "not running (agentlink daemon start)",
+      : refused
+        ? `running, but refuses this terminal: ${refused}`
+        : startError
+          ? `last start failed: ${startError}${hint ? `; ${hint}` : ""} (log: ${ctx.paths.log})`
+          : "not running (agentlink daemon start)",
   });
+  for (const dir of new Set([ctx.paths.home, dirname(ctx.paths.socket)])) {
+    const fs = socketlessFs(dir);
+    if (fs)
+      rows.push({
+        ok: false,
+        label: "home",
+        detail: `${dir} is on a ${fs} filesystem (a Windows drive?): Unix sockets don't work there; use a Linux path, e.g. export AGENTLINK_HOME=~/.agentlink`,
+      });
+  }
   rows.push({
     ok: executable(ictx.shim),
     label: "launcher",
     detail: executable(ictx.shim) ? ictx.shim : `missing ${ictx.shim} (agentlink install <tool>)`,
   });
+  const wsl = wslVersion();
+  if (wsl) rows.push(wslRow(wsl));
   if (process.platform === "linux") {
-    const ss = onPath(["ss"]);
+    // The same self-test the daemon runs at start: can the kernel name who holds a socket?
+    const dir = mkdtempSync(join(tmpdir(), "agentlink-probe-"));
+    const probe = await probePeerLookup(dir).finally(() =>
+      rmSync(dir, { recursive: true, force: true }),
+    );
     rows.push({
-      ok: !!ss,
+      ok: probe.state === "ok" ? true : probe.state === "inconclusive" ? null : false,
       label: "caller check",
-      detail: ss
-        ? "verifies which agent is calling (kernel socket table via ss)"
-        : "'ss' is missing (install iproute2): agents' identities are not verified",
+      detail:
+        probe.state === "ok"
+          ? "verifies which agent is calling (kernel socket table via ss)"
+          : probe.state === "missing"
+            ? "'ss' is missing (install iproute2): agents' identities are not verified"
+            : probe.state === "broken"
+              ? `${probe.reason}: agents' identities are not verified. Fix: ${probe.remedy}`
+              : `self-test inconclusive (${probe.reason})`,
     });
   }
+  const windows = wsl ? windowsOnly() : [];
+  if (windows.length)
+    rows.push({
+      ok: false,
+      label: "windows CLIs",
+      detail: `${windows.join(", ")}: ${WINDOWS_AGENTS}`,
+    });
   if (process.platform === "linux" && health) {
     const unregistered = await unregisteredSessions(ctx);
     if (unregistered.length) {
@@ -375,13 +450,17 @@ export const setup: Command = async (ctx) => {
     return started.code;
   }
   lines.push(`${c.green("✓")} agentlink is running (${ctx.paths.home})`);
-  if (process.platform === "linux" && !onPath(["ss"])) {
+  if (process.platform === "linux" && !ssBinary()) {
     lines.push(
       c.yellow(
         "! 'ss' (package iproute2) is missing: agentlink cannot verify which agent is calling. Install it.",
       ),
     );
   }
+  const wsl = wslVersion();
+  if (wsl === 1) lines.push(c.yellow(`! ${wslRow(1).detail}`));
+  const windows = wsl ? windowsOnly() : [];
+  if (windows.length) lines.push(c.yellow(`! ${windows.join(", ")}: ${WINDOWS_AGENTS}`));
   if (found.length === 0) {
     lines.push(
       c.yellow(

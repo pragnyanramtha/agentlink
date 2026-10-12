@@ -1,6 +1,11 @@
 import { execFile, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { connect, createServer, type Server, type Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { peerPid, runSs, type SsResult, type SsRunner, ssBinary } from "../../src/core/peer.ts";
 import { startTestDaemon, type TestDaemon } from "../helpers.ts";
 
 // Production mode: the daemon identifies callers from the kernel (peer PID + ancestry),
@@ -210,3 +215,64 @@ describe.skipIf(!linux)("caller identity comes from the kernel", () => {
     expect(victimMail.map((i) => i.envelope.parts)).toHaveLength(1);
   });
 });
+
+describe.runIf(linux && ssBinary())(
+  "caller lookups (one ss run for a burst, cached per connection)",
+  () => {
+    let dir: string;
+    let server: Server;
+    const open: Socket[] = [];
+    beforeAll(async () => {
+      dir = mkdtempSync(join(tmpdir(), "agentlink-peer-"));
+      server = createServer();
+      await new Promise<void>((r) => server.listen(join(dir, "s.sock"), r));
+    });
+    afterAll(() => {
+      for (const s of open) s.destroy();
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const accept = () =>
+      new Promise<Socket>((resolve) => {
+        server.once("connection", (s) => {
+          open.push(s);
+          resolve(s);
+        });
+        open.push(connect(join(dir, "s.sock")));
+      });
+    const counting = (first?: SsResult) => {
+      const calls = { n: 0 };
+      const run: SsRunner = (args, max) =>
+        calls.n++ === 0 && first ? Promise.resolve(first) : runSs(args, max);
+      return { calls, run };
+    };
+
+    it("shares one ss run between concurrent lookups and reuses it per connection", async () => {
+      const { calls, run } = counting();
+      const sockets: Socket[] = [];
+      for (let i = 0; i < 4; i++) sockets.push(await accept());
+      expect(await Promise.all(sockets.map((s) => peerPid(s, run)))).toEqual(
+        sockets.map(() => process.pid),
+      );
+      expect(calls.n).toBe(1);
+      expect(await peerPid(sockets[0] as Socket, run)).toBe(process.pid);
+      expect(calls.n).toBe(1);
+    });
+
+    it("looks again when the shared table predates the connection", async () => {
+      const first = await accept();
+      const { calls, run } = counting(await runSs(["-xpnH"], 32 * 1024 * 1024));
+      const pending = peerPid(first, run);
+      const late = await accept();
+      expect(await Promise.all([pending, peerPid(late, run)])).toEqual([process.pid, process.pid]);
+      expect(calls.n).toBe(2);
+    });
+
+    it("stays fail-closed: a table without the connection names nobody", async () => {
+      const run: SsRunner = async () => ({
+        stdout: 'u_str ESTAB 0 0 * 1 * 2 users:(("x",pid=1,fd=1))\n',
+      });
+      expect(await peerPid(await accept(), run)).toBeUndefined();
+    });
+  },
+);

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, openSync } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import { request } from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Paths } from "../core/paths.ts";
@@ -115,10 +115,11 @@ export class Client {
                   ),
                 );
               }
+              const unnamed = /cannot tell which process is calling/.test(err?.message ?? "");
               return reject(
                 new ApiError(
                   err?.code ?? "error",
-                  err?.message ?? `HTTP ${res.statusCode}`,
+                  `${err?.message ?? `HTTP ${res.statusCode}`}${unnamed ? " (check this system: agentlink doctor)" : ""}`,
                   res.statusCode ?? 500,
                 ),
               );
@@ -187,14 +188,20 @@ export class Client {
         503,
       );
     }
-    spawnDaemon(this.paths);
+    const offset = fileSize(this.paths.log);
+    const child = spawnDaemon(this.paths);
     const deadline = Date.now() + (opts.waitMs ?? 6_000);
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
       const h = await this.health(500);
       if (h) return h;
+      if (child.exitCode) break; // it gave up (0 means another daemon won the race: keep waiting)
     }
-    throw new ApiError("daemon_down", `daemon did not start; see ${this.paths.log}`, 503);
+    throw new ApiError(
+      "daemon_down",
+      startFailure(this.paths, readFrom(this.paths.log, offset), child.exitCode),
+      503,
+    );
   }
 
   /** Streams daemon events (SSE) until the signal aborts. */
@@ -243,7 +250,8 @@ export function daemonEntry(): string {
   return fileURLToPath(new URL(`../daemon/run${ext}`, import.meta.url));
 }
 
-export function spawnDaemon(paths: Paths): void {
+/** Starts the daemon in the background; its stdout and stderr (startup errors too) go to its log. */
+export function spawnDaemon(paths: Paths): { readonly exitCode: number | null } {
   mkdirSync(paths.home, { recursive: true, mode: 0o700 });
   const out = openSync(paths.log, "a", 0o600);
   const child = spawn(
@@ -255,7 +263,93 @@ export function spawnDaemon(paths: Paths): void {
       env: { ...process.env, AGENTLINK_HOME: paths.home },
     },
   );
+  closeSync(out);
+  child.on("error", () => {});
   child.unref();
+  return child;
+}
+
+const fileSize = (path: string) => {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+};
+
+/** Up to the last 64 KiB written to `path` after `offset`. */
+function readFrom(path: string, offset: number): string {
+  try {
+    const fd = openSync(path, "r");
+    try {
+      const size = fstatSync(fd).size;
+      const start = Math.max(offset, size - 65_536);
+      const buf = Buffer.alloc(Math.max(0, size - start));
+      return buf.subarray(0, readSync(fd, buf, 0, buf.length, start)).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+/** The error a daemon start logged ("agentlink daemon: …", or Node's own error), if any. */
+export function startError(log: string): string | undefined {
+  const lines = log.split("\n").map((l) => l.trim());
+  const ours = lines.filter((l) => l.startsWith("agentlink daemon: ")).pop();
+  if (ours) return ours.slice("agentlink daemon: ".length);
+  return lines.filter((l) => /^(\w*Error\b|.*\bERR_[A-Z_]+)/.test(l)).pop();
+}
+
+/** A concrete next step for a known daemon start error. */
+export function startHint(
+  reason: string,
+  paths: Paths,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (/AGENTLINK_HOME to a Linux path/.test(reason)) return undefined; // already says what to do
+  if (/EOPNOTSUPP|ENOTSUP|operation not supported|\b9p\b|drvfs/i.test(reason))
+    return `Unix sockets don't work on Windows drives (/mnt/c, …) under WSL: use a Linux path, e.g. export AGENTLINK_HOME=~/.agentlink (now ${paths.home})`;
+  if (/not a directory owned by you/.test(reason))
+    return `the socket directory belongs to someone else${env.XDG_RUNTIME_DIR ? ` (XDG_RUNTIME_DIR=${env.XDG_RUNTIME_DIR}, e.g. WSLg's shared one)` : ""}: unset XDG_RUNTIME_DIR or use a shorter AGENTLINK_HOME`;
+  if (/ENAMETOOLONG/.test(reason))
+    return `the socket path is too long (${paths.socket}): use a shorter AGENTLINK_HOME`;
+  if (/EACCES|EPERM|permission denied/i.test(reason))
+    return `agentlink cannot create its files: check the owner and permissions of ${paths.home} (ls -ld ${paths.home})`;
+  if (
+    /ERR_UNKNOWN_FILE_EXTENSION|Unknown file extension|node:sqlite|ERR_UNKNOWN_BUILTIN_MODULE|SyntaxError/.test(
+      reason,
+    )
+  )
+    return `agentlink needs Node.js 22.13 or newer (the daemon ran ${process.execPath}, ${process.version}); e.g. nvm install 24`;
+  if (/database is locked|SQLITE_BUSY|SQLITE_IOERR|disk I\/O error/i.test(reason))
+    return "the database cannot be locked: keep AGENTLINK_HOME on a local Linux disk (not a network or Windows drive)";
+  if (/EADDRINUSE/.test(reason)) return `something else holds ${paths.socket}`;
+  if (/ENOSPC/.test(reason)) return "the disk is full";
+  return undefined;
+}
+
+/** What to tell a person when the daemon did not come up. */
+export function startFailure(paths: Paths, log: string, exitCode?: number | null): string {
+  const reason = startError(log);
+  const hint = reason ? startHint(reason, paths) : undefined;
+  return [
+    `the daemon did not start: ${
+      reason ??
+      (exitCode ? `it exited with code ${exitCode}` : "it did not answer within a few seconds")
+    }`,
+    ...(hint ? [`  ${hint}`] : []),
+    `  (log: ${paths.log})`,
+  ].join("\n");
+}
+
+/** The error from the most recent failed daemon start in its log (none once a start succeeded). */
+export function lastStartError(paths: Paths): string | undefined {
+  const tail = readFrom(paths.log, 0).split("\n");
+  const started = tail.findLastIndex((l) => / daemon (started|stopped)\b/.test(l));
+  const reason = startError(tail.slice(started + 1).join("\n"));
+  return reason && !/already running/.test(reason) ? reason : undefined;
 }
 
 function cleanStrings(value: unknown): unknown {

@@ -1,5 +1,6 @@
 import { existsSync, readlinkSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import { isWsl, onWindowsDrive } from "../../core/wsl.ts";
 import type { CanonicalEvent } from "../runtime.ts";
 import { openCodePluginSource } from "./opencode-plugin.ts";
 import { ONE_LINE, SKILL_MD } from "./skill.ts";
@@ -219,9 +220,12 @@ type Planner = (
 const dirOf = (ctx: InstallContext) =>
   ctx.scope === "project" ? (ctx.projectDir as string) : ctx.home;
 const mcpServer = (ctx: InstallContext): Obj => ({ command: ctx.shim, args: ["mcp"] });
+// User-level config dirs, moved by the tools' own env vars.
+const claudeDir = (ctx: InstallContext) => ctx.env?.CLAUDE_CONFIG_DIR || join(ctx.home, ".claude");
+const codexDir = (ctx: InstallContext) => ctx.env?.CODEX_HOME || join(ctx.home, ".codex");
 
 const claude: Planner = (ctx, fs, install) => {
-  const base = ctx.scope === "project" ? join(dirOf(ctx), ".claude") : join(ctx.home, ".claude");
+  const base = ctx.scope === "project" ? join(dirOf(ctx), ".claude") : claudeDir(ctx);
   const h = (event: CanonicalEvent, fast = false) =>
     hookCommand(ctx, { tool: "claude", event, fast });
   editJson(fs, join(base, "settings.json"), (json) => {
@@ -257,9 +261,11 @@ const claude: Planner = (ctx, fs, install) => {
       if (install)
         notes.push("Claude Code asks once to approve the project MCP server (.mcp.json).");
     } else {
+      const global = ctx.env?.CLAUDE_CONFIG_DIR
+        ? join(ctx.env.CLAUDE_CONFIG_DIR, ".claude.json")
+        : join(ctx.home, ".claude.json");
       const registered = asObj(
-        asObj(parseJsonConfig("~/.claude.json", readText(join(ctx.home, ".claude.json"))))
-          .mcpServers,
+        asObj(parseJsonConfig(global, readText(global))).mcpServers,
       ).agentlink;
       if (install && !registered) {
         steps.push({
@@ -278,7 +284,7 @@ const claude: Planner = (ctx, fs, install) => {
 };
 
 const codex: Planner = (ctx, fs, install) => {
-  const base = ctx.scope === "project" ? join(dirOf(ctx), ".codex") : join(ctx.home, ".codex");
+  const base = ctx.scope === "project" ? join(dirOf(ctx), ".codex") : codexDir(ctx);
   const h = (event: CanonicalEvent, fast = false) =>
     hookCommand(ctx, { tool: "codex", event, fast });
   editJson(fs, join(base, "hooks.json"), (json) => {
@@ -554,9 +560,9 @@ export function instructionPath(tool: InstallTool, ctx: InstallContext): string 
   const dir = dirOf(ctx);
   switch (tool) {
     case "claude":
-      return project ? join(dir, "CLAUDE.md") : join(ctx.home, ".claude", "CLAUDE.md");
+      return project ? join(dir, "CLAUDE.md") : join(claudeDir(ctx), "CLAUDE.md");
     case "codex":
-      return project ? join(dir, "AGENTS.md") : join(ctx.home, ".codex", "AGENTS.md");
+      return project ? join(dir, "AGENTS.md") : join(codexDir(ctx), "AGENTS.md");
     case "opencode":
       return project ? join(dir, "AGENTS.md") : join(ctx.home, ".config", "opencode", "AGENTS.md");
     case "cursor":
@@ -580,9 +586,9 @@ export function skillPath(tool: InstallTool, ctx: InstallContext): string | unde
   const at = (base: string) => join(base, "agentlink", "SKILL.md");
   switch (tool) {
     case "claude":
-      return at(project ? join(dir, ".claude", "skills") : join(ctx.home, ".claude", "skills"));
+      return at(project ? join(dir, ".claude", "skills") : join(claudeDir(ctx), "skills"));
     case "codex":
-      return at(project ? join(dir, ".agents", "skills") : join(ctx.home, ".codex", "skills"));
+      return at(project ? join(dir, ".agents", "skills") : join(codexDir(ctx), "skills"));
     case "opencode":
       return at(
         project
@@ -641,13 +647,29 @@ function linkTarget(path: string): string | undefined {
   }
 }
 
-export function onPath(names: string[], env: NodeJS.ProcessEnv = process.env): string | undefined {
+/** First of `names` on PATH. Under WSL, Windows drives don't count: agents there run on Windows. */
+export function onPath(
+  names: string[],
+  env: NodeJS.ProcessEnv = process.env,
+  wsl = isWsl(),
+): string | undefined {
   for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (wsl && onWindowsDrive(dir)) continue;
     for (const name of names) {
       if (dir && existsSync(join(dir, name))) return join(dir, name);
     }
   }
   return undefined;
+}
+
+/** Windows installs of `names` on PATH (WSL appends Windows' PATH): `claude`, `claude.exe`, … */
+export function windowsInstalls(names: string[], env: NodeJS.ProcessEnv = process.env): string[] {
+  const found = (env.PATH ?? "")
+    .split(delimiter)
+    .filter(onWindowsDrive)
+    .flatMap((dir) => names.flatMap((n) => [join(dir, n), join(dir, `${n}.exe`)]))
+    .filter((p) => existsSync(p));
+  return [...new Set(found)];
 }
 
 /** The launcher every hook and MCP config points at, plus a PATH link so agents can run `agentlink`. */

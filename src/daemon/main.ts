@@ -16,7 +16,9 @@ import { dirname, join } from "node:path";
 import { loadConfig } from "../core/config.ts";
 import { createLogger, type Logger } from "../core/log.ts";
 import { type Paths, resolvePaths } from "../core/paths.ts";
+import { applyPeerLookupStatus, probePeerLookup } from "../core/peer.ts";
 import { isAlive, procInfo } from "../core/proc.ts";
+import { socketlessFs } from "../core/wsl.ts";
 import { Claims } from "./claims.ts";
 import type { DaemonContext } from "./context.ts";
 import {
@@ -34,7 +36,7 @@ import { isLive, Registry } from "./registry.ts";
 import { createDaemonServer, type Services } from "./server.ts";
 import { Store } from "./store/db.ts";
 import { TeamManager } from "./team-manager.ts";
-import { UiServer } from "./ui-server.ts";
+import { type UiOptions, UiServer } from "./ui-server.ts";
 
 export interface RunningDaemon {
   services: Services;
@@ -107,11 +109,21 @@ export async function startDaemon(
      */
     idleExitMs?: number;
     onIdleExit?: () => void;
+    /** Tests only: what the web UI knows about the system. */
+    ui?: UiOptions;
   } = {},
 ): Promise<RunningDaemon> {
   const paths = opts.paths ?? resolvePaths();
-  mkdirSync(paths.runDir, { recursive: true, mode: 0o700 });
   const socketDir = dirname(paths.socket);
+  for (const dir of new Set([paths.home, socketDir])) {
+    const fs = socketlessFs(dir);
+    if (fs) {
+      throw new Error(
+        `${dir} is on a ${fs} filesystem (a Windows drive under WSL?), where Unix sockets and database locks don't work; set AGENTLINK_HOME to a Linux path, e.g. export AGENTLINK_HOME=~/.agentlink`,
+      );
+    }
+  }
+  mkdirSync(paths.runDir, { recursive: true, mode: 0o700 });
   if (socketDir !== paths.runDir) {
     mkdirSync(socketDir, { recursive: true, mode: 0o700 });
     const st = lstatSync(socketDir);
@@ -203,8 +215,20 @@ export async function startDaemon(
   };
 
   const server = createDaemonServer(services, () => void close());
-  const ui = new UiServer(server.dispatch, ctx, registry);
+  const ui = new UiServer(server.dispatch, ctx, registry, opts.ui);
   services.ui = ui;
+  if (!opts.trustClientCaller && process.platform === "linux") {
+    // Where the kernel can never name callers (WSL 1, no unix_diag), fall back to claims loudly
+    // instead of refusing every request; elsewhere an unnamed caller stays refused.
+    const peer = await probePeerLookup(socketDir);
+    applyPeerLookupStatus(peer);
+    if (peer.state === "missing" || peer.state === "broken")
+      log.warn(`cannot verify which agent is calling: ${peer.reason}; trusting client claims`, {
+        remedy: peer.remedy,
+      });
+    else if (peer.state === "inconclusive")
+      log.warn("caller check self-test inconclusive", { reason: peer.reason });
+  }
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);

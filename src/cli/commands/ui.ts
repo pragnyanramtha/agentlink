@@ -1,18 +1,47 @@
 import { spawn } from "node:child_process";
+import { executable, hasInterop } from "../../core/wsl.ts";
 import { type Command, out, parse, UsageError } from "../args.ts";
 import { c } from "../format.ts";
 
-/** Opens a URL in the default browser: no shell, detached, output ignored. */
+/** How to open a URL here. Under WSL the Windows browser (interop), which reaches 127.0.0.1. */
+export function browserOpener(
+  url: string,
+  sys: { platform: string; interop: boolean; exe: (path: string) => string | undefined } = {
+    platform: process.platform,
+    interop: hasInterop(),
+    exe: executable,
+  },
+): { bin: string; args: string[]; okCodes: number[] } {
+  if (sys.platform === "darwin") return { bin: "open", args: [url], okCodes: [0] };
+  if (sys.interop) {
+    const rundll = sys.exe("/mnt/c/Windows/System32/rundll32.exe");
+    if (rundll) return { bin: rundll, args: ["url.dll,FileProtocolHandler", url], okCodes: [0] };
+    // explorer.exe exits 1 even when it opened the page.
+    const explorer = sys.exe("/mnt/c/Windows/explorer.exe") ?? "explorer.exe";
+    return { bin: explorer, args: [url], okCodes: [0, 1] };
+  }
+  return { bin: "xdg-open", args: [url], okCodes: [0] };
+}
+
+/**
+ * Opens a URL in the default browser: no shell, detached, output ignored. Opened only if the
+ * opener exits successfully (xdg-open fails without a handler), or is still running after 5s.
+ */
 function openBrowser(url: string): Promise<boolean> {
-  const bin = process.platform === "darwin" ? "open" : "xdg-open";
+  const { bin, args, okCodes } = browserOpener(url);
   return new Promise((resolve) => {
     try {
-      const child = spawn(bin, [url], { detached: true, stdio: "ignore" });
-      child.once("error", () => resolve(false));
-      child.once("spawn", () => {
+      const child = spawn(bin, args, { detached: true, stdio: "ignore" });
+      const timer = setTimeout(() => {
         child.unref();
         resolve(true);
-      });
+      }, 5_000);
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      child.once("error", () => done(false));
+      child.once("exit", (code) => done(code !== null && okCodes.includes(code)));
     } catch {
       resolve(false);
     }

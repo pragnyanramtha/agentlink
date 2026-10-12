@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
+import { socketlessFs } from "./wsl.ts";
 
 export interface Paths {
   home: string;
@@ -19,6 +21,16 @@ export interface Paths {
 // Unix socket paths are limited to ~104 bytes on macOS; fall back to a short tmp path.
 const MAX_SOCKET_PATH = 100;
 
+/** A directory of ours that can hold sockets (WSLg's shared runtime dir belongs to uid 1000). */
+function ownDir(dir: string): boolean {
+  try {
+    const st = statSync(dir);
+    return st.isDirectory() && st.uid === process.getuid?.() && !socketlessFs(dir);
+  } catch {
+    return false;
+  }
+}
+
 export function resolvePaths(env: NodeJS.ProcessEnv = process.env): Paths {
   const home = env.AGENTLINK_HOME || join(env.HOME || homedir(), ".agentlink");
   const runDir = join(home, "run");
@@ -27,7 +39,9 @@ export function resolvePaths(env: NodeJS.ProcessEnv = process.env): Paths {
     // Too long for a Unix socket: use the per-user runtime dir, or a private dir under /tmp
     // (the daemon creates it 0700 and refuses it if someone else owns it).
     const tag = createHash("sha256").update(home).digest("hex").slice(0, 12);
-    const base = env.XDG_RUNTIME_DIR || join(tmpdir(), `agentlink-${userInfo().uid}`);
+    const runtime = env.XDG_RUNTIME_DIR;
+    const base =
+      runtime && ownDir(runtime) ? runtime : join(tmpdir(), `agentlink-${userInfo().uid}`);
     socket = join(base, `agentlink-${tag}.sock`);
   }
   return {
