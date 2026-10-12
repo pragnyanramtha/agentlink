@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { NAME_RE } from "./addr.ts";
 import { ulid } from "./ids.ts";
 import { LIMITS } from "./limits.ts";
 
@@ -100,6 +101,27 @@ export const EnvelopeSchema = z.object({
   sig: z.string().optional(),
 });
 export type Envelope = z.infer<typeof EnvelopeSchema>;
+
+// Envelopes from teammates: every field that is shown to an agent has a strict shape, so none
+// can carry line breaks, quotes or commands into the rendered wrapper.
+const Ulid = z.string().regex(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+const Name = z.string().regex(NAME_RE);
+const IsoTime = z.string().regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/);
+const RemoteAddrSchema = AddrSchema.extend({
+  member: Name,
+  agent: Name.optional(),
+  team: Name.optional(),
+  device: Name.optional(),
+});
+export const RemoteEnvelopeSchema = EnvelopeSchema.extend({
+  messageId: Ulid,
+  contextId: Ulid,
+  replyTo: Ulid.optional(),
+  from: RemoteAddrSchema,
+  to: z.array(RemoteAddrSchema).min(1).max(100),
+  meta: MetaSchema.extend({ expiresAt: IsoTime }),
+  createdAt: IsoTime,
+});
 
 export interface NewEnvelopeInput {
   kind: Kind;

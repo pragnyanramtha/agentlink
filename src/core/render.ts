@@ -2,7 +2,7 @@ import { type AckValue, type Kind, preview } from "./envelope.ts";
 import { boundaryToken } from "./ids.ts";
 import { LIMITS } from "./limits.ts";
 import type { Trust } from "./policy.ts";
-import { safeInject } from "./sanitize.ts";
+import { safeField, safeInject } from "./sanitize.ts";
 
 export interface RenderItem {
   id: string;
@@ -93,7 +93,23 @@ function neutralize(text: string): string {
   return text.replace(/<(\s*\/?\s*)agent[\W_]{0,3}link[\W_]{0,3}msg/gi, "‹$1agentlink_quoted_msg");
 }
 
-function renderOne(item: RenderItem, maxBodyChars: number): string {
+/** Header values stay on their line and inside their quotes. */
+const headerField = (text: string) => (safeField(text, 300) ?? "").replace(/"/g, "'");
+
+function renderOne(raw: RenderItem, maxBodyChars: number): string {
+  const item: RenderItem = {
+    ...raw,
+    id: headerField(raw.id),
+    thread: headerField(raw.thread),
+    from: headerField(raw.from),
+    fromLabel: headerField(raw.fromLabel),
+    sentAt: headerField(raw.sentAt),
+    ...(raw.replyTo ? { replyTo: headerField(raw.replyTo) } : {}),
+    ...(raw.replyToPreview ? { replyToPreview: headerField(raw.replyToPreview) } : {}),
+    ...(raw.replyToAuthor ? { replyToAuthor: headerField(raw.replyToAuthor) } : {}),
+    ...(raw.takenBy ? { takenBy: headerField(raw.takenBy) } : {}),
+    ...(raw.others ? { others: raw.others.map(headerField) } : {}),
+  };
   const token = boundaryToken();
   const open = `<${TAG}-${token} id="${item.id}" thread="${item.thread}" kind="${item.kind}" from="${item.from}" trust="${item.trust}" sent="${item.sentAt}">`;
   let body = neutralize(safeInject(item.text));
@@ -138,5 +154,8 @@ export function renderWakeNotice(items: Pick<RenderItem, "kind" | "from" | "text
   const first = items[0];
   if (!first) return "";
   const more = items.length > 1 ? ` (+${items.length - 1} more)` : "";
-  return `[agentlink] ${first.kind} from ${first.from}: "${preview(first.text, 90)}"${more}. Run: agentlink inbox`;
+  // Typed into a terminal as keystrokes: no control characters may reach it.
+  const from = safeField(first.from, 100) ?? "?";
+  const text = preview(safeField(first.text, 1_000) ?? "", 90);
+  return `[agentlink] ${first.kind} from ${from}: "${text}"${more}. Run: agentlink inbox`;
 }

@@ -10,6 +10,7 @@ import {
   newEnvelope,
   type Part,
   preview,
+  RemoteEnvelopeSchema,
   textOf,
 } from "../core/envelope.ts";
 import { AgentLinkError, invalid, limited, notFound } from "../core/errors.ts";
@@ -23,6 +24,7 @@ import {
 } from "../core/policy.ts";
 import { scanParts } from "../core/redact.ts";
 import { type RenderItem, renderInjection } from "../core/render.ts";
+import { safeField } from "../core/sanitize.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import { isLive, type Registry } from "./registry.ts";
@@ -763,7 +765,7 @@ export class Mailbox {
     messageId?: string;
   } {
     const { store } = this.#ctx;
-    const envelope = EnvelopeSchema.parse(raw);
+    const envelope = RemoteEnvelopeSchema.parse(raw);
     if (envelope.from.member !== fromHandle || envelope.from.role === "system") {
       throw invalid(
         `envelope claims to be from ${envelope.from.member}, but ${fromHandle} sent it`,
@@ -994,9 +996,11 @@ export class Mailbox {
         ? this.#registry.byId(message.from_agent_id)
         : undefined;
       if (author && message) {
+        // The note is the teammate's text inside an agentlink notice: one quoted, attributed line.
+        const note = safeField(receipt.note, 200)?.replace(/"/g, "'");
         this.notify(
           author,
-          `Your ${message.kind} ${message.id.slice(0, 12)} to ${receipt.to} was not delivered: ${receipt.state}${receipt.note ? ` (${receipt.note})` : ""}.`,
+          `Your ${message.kind} ${message.id.slice(0, 12)} to ${receipt.to} was not delivered: ${receipt.state}${note ? ` (${fromHandle}'s machine says: "${note}")` : ""}.`,
         );
       }
     }
