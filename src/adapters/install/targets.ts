@@ -4,6 +4,7 @@ import type { CanonicalEvent } from "../runtime.ts";
 import { openCodePluginSource } from "./opencode-plugin.ts";
 import { ONE_LINE, SKILL_MD } from "./skill.ts";
 import {
+  assertInside,
   type FileChange,
   isAgentlinkCommand,
   isSymlinkTo,
@@ -50,13 +51,17 @@ export class VirtualFs {
     string,
     { before: string | null; after: string | null; mode?: number; symlink?: boolean }
   >();
+  /** Project dir: files under it must resolve inside it (set by planTool for project scope). */
+  root?: string;
 
   read(path: string): string | null {
+    if (this.root) assertInside(path, this.root);
     const f = this.#files.get(path);
     return f ? f.after : readText(path);
   }
 
   write(path: string, after: string | null, mode?: number): void {
+    if (this.root) assertInside(path, this.root);
     const existing = this.#files.get(path);
     const before = existing ? existing.before : readText(path);
     this.#files.set(path, { before, after, ...(mode !== undefined ? { mode } : {}) });
@@ -685,6 +690,7 @@ export function planTool(
   fs: VirtualFs,
   install: boolean,
 ): Omit<Plan, "changes"> {
+  if (ctx.scope === "project") fs.root = dirOf(ctx);
   const result = PLANNERS[tool](ctx, fs, install);
   const skill = skillPath(tool, ctx);
   if (skill) {

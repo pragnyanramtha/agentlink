@@ -6,13 +6,14 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   renameSync,
   rmdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { invalid } from "../../core/errors.ts";
 
 /** One file edit. `after: null` deletes the file. */
@@ -49,6 +50,29 @@ export function readText(path: string): string | null {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+}
+
+const within = (root: string, path: string) => {
+  const rel = relative(root, path);
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+};
+
+/**
+ * Refuses a path under `root` (a project) that resolves outside it through a symlinked
+ * directory or file, e.g. a cloned repo whose `.claude` links to ~/.claude.
+ */
+export function assertInside(path: string, root: string, leaf = true): void {
+  if (!within(root, path)) return;
+  let probe = leaf ? path : dirname(path);
+  while (!lstatSync(probe, { throwIfNoEntry: false }) && probe !== dirname(probe)) {
+    probe = dirname(probe);
+  }
+  let real = "a missing link target";
+  try {
+    real = join(realpathSync(probe), relative(probe, path));
+    if (within(realpathSync(root), real)) return;
+  } catch {}
+  throw invalid(`refusing to touch ${path}: it resolves to ${real}, outside ${root}`);
 }
 
 export type JsonObject = Record<string, unknown>;
@@ -174,7 +198,8 @@ export interface Applied {
 
 /**
  * Applies file changes, backing up every existing file under `backupDir` first. Directories
- * left empty by a removal are removed too, up to (not including) any of `stopDirs`.
+ * left empty by a removal are removed too, up to (not including) any of `stopDirs`. Paths under
+ * a `stopDirs` entry (the project) must resolve inside it; otherwise nothing is changed.
  */
 export function applyChanges(
   changes: FileChange[],
@@ -182,6 +207,8 @@ export function applyChanges(
   home: string,
   stopDirs: string[] = [],
 ): Applied[] {
+  for (const change of changes)
+    for (const root of stopDirs) assertInside(change.path, root, !change.symlink);
   const done: Applied[] = [];
   for (const change of changes) {
     if (change.symlink) {
@@ -213,6 +240,7 @@ export function applyChanges(
     } else {
       mkdirSync(dirname(change.path), { recursive: true });
       const tmp = `${change.path}.agentlink-tmp`;
+      rmSync(tmp, { force: true });
       writeFileSync(tmp, change.after, { mode: change.mode ?? 0o644 });
       renameSync(tmp, change.path);
       done.push({ path: change.path, action: existed ? "wrote" : "created" });

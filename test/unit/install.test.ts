@@ -1,5 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -15,6 +24,7 @@ import {
 } from "../../src/adapters/install/targets.ts";
 import { applyChanges, removeBlock, upsertBlock } from "../../src/adapters/install/util.ts";
 import { optionalValue } from "../../src/cli/args.ts";
+import { envExports } from "../../src/cli/hook.ts";
 
 let home: string;
 let ctx: InstallContext;
@@ -173,6 +183,56 @@ describe("install planning", () => {
       ]),
     );
   });
+
+  it("project scope refuses config dirs that are symlinks out of the project", () => {
+    const project = join(home, "proj");
+    const outside = mkdtempSync(join(tmpdir(), "agentlink-outside-"));
+    try {
+      mkdirSync(project);
+      writeFileSync(join(outside, "settings.json"), '{"theme":"light"}\n');
+      symlinkSync(outside, join(project, ".claude"));
+      const pctx: InstallContext = { ...ctx, scope: "project", projectDir: project };
+      expect(() => planTool("claude", pctx, new VirtualFs(), true)).toThrow(
+        /\.claude\/settings\.json.*outside/,
+      );
+      // applying a change planned elsewhere is refused before anything is written
+      const changes = [
+        { path: join(project, "AGENTS.md"), before: null, after: "x\n" },
+        { path: join(project, ".claude", "settings.json"), before: null, after: "{}\n" },
+      ];
+      expect(() => applyChanges(changes, join(home, "b"), home, [project])).toThrow(/outside/);
+      expect(readdirSync(outside)).toEqual(["settings.json"]);
+      expect(readFileSync(join(outside, "settings.json"), "utf8")).toBe('{"theme":"light"}\n');
+      expect(existsSync(join(project, "AGENTS.md"))).toBe(false);
+      // a symlinked file out of the project is refused too
+      rmSync(join(project, ".claude"));
+      symlinkSync(join(outside, "settings.json"), join(project, "CLAUDE.md"));
+      expect(() => planTool("claude", pctx, new VirtualFs(), true)).toThrow(/CLAUDE\.md.*outside/);
+      // a planted temp-file link is replaced, not written through
+      symlinkSync(join(outside, "settings.json"), join(project, "AGENTS.md.agentlink-tmp"));
+      const fs = new VirtualFs();
+      planTool("codex", pctx, fs, true);
+      applyChanges(fs.changes(), join(home, "b"), home, [project]);
+      expect(readFileSync(join(outside, "settings.json"), "utf8")).toBe('{"theme":"light"}\n');
+      expect(readFileSync(join(project, "AGENTS.md"), "utf8")).toContain("agentlink:start");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("project scope installs normally, including through links inside the project", () => {
+    const project = join(home, "proj");
+    mkdirSync(join(project, "shared"), { recursive: true });
+    symlinkSync(join(project, "shared"), join(project, ".claude"));
+    const pctx: InstallContext = { ...ctx, scope: "project", projectDir: project };
+    const fs = new VirtualFs();
+    planCore(pctx, fs, true, { node: "/usr/bin/node", entry: "/x/index.js" });
+    planTool("claude", pctx, fs, true);
+    applyChanges(fs.changes(), join(home, "b"), home, [project]);
+    expect(readFileSync(join(project, "shared", "settings.json"), "utf8")).toContain("hook claude");
+    expect(readFileSync(join(project, "CLAUDE.md"), "utf8")).toContain("agentlink:start");
+    expect(existsSync(ctx.shim)).toBe(true);
+  });
 });
 
 describe("markdown blocks", () => {
@@ -220,6 +280,23 @@ describe("hook fast path", () => {
       { tool: "claude", event: "stop" },
     );
     expect(execFileSync("sh", ["-c", gone], { encoding: "utf8" }).trim()).toBe("");
+  });
+
+  it("writes CLAUDE_ENV_FILE lines that a shell sources inertly", () => {
+    const marker = join(home, "pwned");
+    const lines = envExports({
+      AGENTLINK_AGENT_ID: "01J0ABCDEF",
+      A: `$(touch ${marker})\`touch ${marker}\`'"`,
+      "B;touch": "x",
+      "1C": "x",
+    });
+    expect(lines).not.toContain("B;touch");
+    expect(lines).not.toContain("1C");
+    const out = execFileSync("sh", ["-c", `${lines}printf '%s|%s' "$AGENTLINK_AGENT_ID" "$A"`], {
+      encoding: "utf8",
+    });
+    expect(out).toBe(`01J0ABCDEF|$(touch ${marker})\`touch ${marker}\`'"`);
+    expect(existsSync(marker)).toBe(false);
   });
 });
 

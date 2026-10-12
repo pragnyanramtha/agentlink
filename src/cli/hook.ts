@@ -1,5 +1,6 @@
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { join } from "node:path";
+import { shq } from "../adapters/install/util.ts";
 import type { Paths } from "../core/paths.ts";
 import { ancestry } from "../core/proc.ts";
 import { Client } from "./client.ts";
@@ -38,6 +39,14 @@ function logHookError(paths: Paths, tool: string, event: string, error: unknown)
 interface HookResponse {
   stdout?: string;
   env?: Record<string, string>;
+}
+
+/** `export` lines for a file the agent's shell sources: valid names only, values single-quoted. */
+export function envExports(env: Record<string, string>): string {
+  return Object.entries(env)
+    .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
+    .map(([k, v]) => `export ${k}=${shq(String(v))}\n`)
+    .join("");
 }
 
 /** CLIs whose hook contract expects a JSON object on stdout even when there is nothing to say. */
@@ -85,12 +94,7 @@ export async function runHook(
     });
     if (!res.stdout && JSON_STDOUT_TOOLS.has(tool)) res.stdout = "{}";
     const envFile = process.env.CLAUDE_ENV_FILE;
-    if (res.env && envFile) {
-      const lines = Object.entries(res.env)
-        .map(([k, v]) => `export ${k}=${JSON.stringify(v)}\n`)
-        .join("");
-      appendFileSync(envFile, lines);
-    }
+    if (res.env && envFile) appendFileSync(envFile, envExports(res.env));
     if (res.stdout) process.stdout.write(res.stdout);
   } catch (error) {
     logHookError(paths, tool, event, error);
