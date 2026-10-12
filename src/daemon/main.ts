@@ -29,6 +29,7 @@ import {
 } from "./deliverers.ts";
 import { DeliveryEngine } from "./delivery.ts";
 import { EventBus } from "./events.ts";
+import { Headless } from "./headless.ts";
 import { HookHandler } from "./hooks.ts";
 import { Mailbox } from "./mailbox.ts";
 import { DesktopNotifier } from "./notify.ts";
@@ -172,6 +173,9 @@ export async function startDaemon(
   engine.use(codexQueueDeliverer());
   engine.use(claudeInboxDeliverer());
   engine.use(tmuxDeliverer(ctx));
+  const headless = new Headless(ctx, registry, mailbox);
+  headless.engine = engine;
+  engine.headless = headless;
   const hooks = new HookHandler(ctx, registry, mailbox, engine);
   const claims = new Claims(ctx);
   const team = new TeamManager(ctx, registry, mailbox, engine);
@@ -187,6 +191,7 @@ export async function startDaemon(
     opencode,
     team,
     notifier,
+    headless,
     ...(opts.trustClientCaller ? { trustClientCaller: true } : {}),
   };
 
@@ -196,6 +201,7 @@ export async function startDaemon(
       clearInterval(sweep);
       clearInterval(expiry);
       stopNotifier();
+      const runsEnded = headless.close();
       team.stop();
       void ui.close();
       server.close(() => {
@@ -206,7 +212,7 @@ export async function startDaemon(
           store.close();
           releaseLock();
           log.info("daemon stopped");
-          resolve();
+          void runsEnded.then(resolve);
         }, 50);
       });
       server.closeAllConnections();
@@ -268,7 +274,7 @@ export async function startDaemon(
       }
     }
     if (!opts.idleExitMs) return;
-    if (registry.list().some(isLive) || ui.connections > 0) {
+    if (registry.list().some(isLive) || ui.connections > 0 || headless.running > 0) {
       lastActivity = Date.now();
       return;
     }

@@ -693,7 +693,17 @@ export class Mailbox {
     const thread =
       original?.thread_id ?? (input.thread ? this.resolveThread(input.thread, self) : undefined);
     const key = echoKey(`${input.kind}:${text}`);
-    this.#checkGuards(sender, recipients, thread, original, key, input.hops ?? 0);
+    // What an agent sends during a headless run counts one hop further than what started it,
+    // so runs that wake other runs stop at the hop limit.
+    const runHops =
+      sender.kind === "agent"
+        ? store.get<{ h: number | null }>(
+            "SELECT MAX(hops) AS h FROM runs WHERE agent_id = ? AND state = 'running'",
+            sender.agent.id,
+          )?.h
+        : null;
+    const hops = Math.max(input.hops ?? 0, runHops == null ? 0 : runHops + 1);
+    this.#checkGuards(sender, recipients, thread, original, key, hops);
     if (sender.kind === "agent" && partsHaveInvite(parts)) {
       throw invalid(
         "that looks like a team invite code; invites are for people: show it to your user and let them share it",
@@ -724,7 +734,7 @@ export class Mailbox {
       ...(input.taskId ? { taskId: input.taskId } : {}),
       ...(senderAgent?.repo_remote ? { repo: senderAgent.repo_remote } : {}),
       ...(senderAgent?.branch ? { branch: senderAgent.branch } : {}),
-      hops: input.hops ?? 0,
+      hops,
       ...(input.wait ? { wait: true } : {}),
       ...(input.ack ? { ack: input.ack } : {}),
       ...(input.ttlMs ? { ttlMs: input.ttlMs } : {}),
@@ -1258,6 +1268,20 @@ export class Mailbox {
     });
     for (const id of deliveryIds) {
       const d = this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", id);
+      if (d) this.#publishDelivery(d);
+    }
+  }
+
+  /** Puts handed-over deliveries back in the queue (a headless run ended before reading them). */
+  requeue(deliveryIds: number[]): void {
+    for (const id of deliveryIds) {
+      const res = this.#ctx.store.run(
+        "UPDATE deliveries SET state = 'queued', method = NULL, delivered_at = NULL WHERE id = ? AND state = 'delivered'",
+        id,
+      );
+      const d = res.changes
+        ? this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", id)
+        : undefined;
       if (d) this.#publishDelivery(d);
     }
   }

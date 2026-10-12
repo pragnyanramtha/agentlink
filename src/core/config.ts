@@ -6,6 +6,56 @@ import { slugify } from "./addr.ts";
 import { invalid } from "./errors.ts";
 import type { Paths } from "./paths.ts";
 
+/** Agent CLIs agentlink can run headlessly (spawn a new session, or resume an offline one). */
+export const HARNESSES = ["claude", "codex", "opencode", "gemini"] as const;
+export type Harness = (typeof HARNESSES)[number];
+/** read-only: no edits, no shell; edit: file edits, sandboxed/denied shell; full: set by a person only. */
+export const PROFILES = ["read-only", "edit", "full"] as const;
+export type Profile = (typeof PROFILES)[number];
+/** Model names go on a command line: no leading "-", no spaces or shell characters. */
+export const MODEL_RE = /^(?!-)[\w.:/[\],=-]{1,100}$/;
+const Decision = z.enum(["allow", "hold", "refuse"]);
+const Count = (max: number, def: number) => z.number().int().min(0).max(max).default(def);
+
+export const HeadlessSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    runners: z
+      .partialRecord(
+        z.enum(HARNESSES),
+        z.object({
+          enabled: z.boolean().default(false),
+          profile: z.enum(PROFILES).default("read-only"),
+          model: z.string().regex(MODEL_RE).optional(),
+          /** Absolute path found when the runner was enabled (AGENTLINK_<HARNESS>_BIN wins). */
+          bin: z.string().optional(),
+        }),
+      )
+      .default({}),
+    /** Runs may only start in these directories (or below them). */
+    roots: z.array(z.string()).default([]),
+    from: z
+      .object({
+        local: z
+          .object({ wake: Decision.default("allow"), spawn: Decision.default("allow") })
+          .prefault({}),
+        teammate: z.object({ wake: Decision.default("hold") }).prefault({}),
+        external: z.literal("refuse").default("refuse"),
+      })
+      .prefault({}),
+    maxConcurrent: z.number().int().min(1).max(16).default(2),
+    perAgentPerHour: Count(100, 4),
+    globalPerHour: Count(500, 20),
+    spawnPerHour: Count(100, 5),
+    perThreadRuns: Count(100, 3),
+    timeoutSec: z.number().int().min(10).max(86_400).default(600),
+    maxBudgetUsd: z.number().positive().max(1_000).optional(),
+    /** 1: agents started by spawn cannot spawn others. */
+    maxSpawnDepth: z.number().int().min(1).max(3).default(1),
+  })
+  .prefault({});
+export type HeadlessConfig = z.infer<typeof HeadlessSchema>;
+
 export const ConfigSchema = z.object({
   /** This machine's owner handle, e.g. "pragnyan". Used in team addresses (handle/agent). */
   handle: z.string().min(1),
@@ -24,6 +74,8 @@ export const ConfigSchema = z.object({
   retention: z.object({ days: z.number().positive().max(36_500).optional() }).optional(),
   /** Desktop notifications for you: new mail, approvals needed (notify-send / osascript). */
   notify: z.object({ desktop: z.boolean().default(false) }).prefault({}),
+  /** Headless runs: wake offline agents and spawn new ones (off until a person enables it). */
+  headless: HeadlessSchema,
 });
 export type Config = z.infer<typeof ConfigSchema>;
 

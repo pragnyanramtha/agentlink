@@ -29,6 +29,25 @@ export function decidePolicy(trust: Trust, kind: Kind, overrides?: PolicyOverrid
   return overrides?.[kind] ?? DEFAULT_POLICY[trust][kind];
 }
 
+export type HeadlessDecision = "allow" | "hold" | "refuse";
+
+/**
+ * Who may start a headless run (resume an offline agent, or spawn one). Your own requests may;
+ * teammates can only wake (spawn is a local request), external senders never.
+ */
+export function headlessDecision(
+  trust: Trust,
+  what: "wake" | "spawn",
+  from: {
+    local: Record<"wake" | "spawn", HeadlessDecision>;
+    teammate: { wake: HeadlessDecision };
+  },
+): HeadlessDecision {
+  if (trust === "user") return "allow";
+  if (trust === "local") return from.local[what];
+  return trust === "teammate" && what === "wake" ? from.teammate.wake : "refuse";
+}
+
 /**
  * Whether a message of this kind may wake an idle recipient. Replies wake only when the
  * original message expected an answer (the asker is waiting for it).

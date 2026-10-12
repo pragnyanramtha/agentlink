@@ -119,6 +119,7 @@ export class Registry {
     const result = store.tx(() => {
       let existing = input.sessionId ? this.bySession(input.tool, input.sessionId) : undefined;
       if (!existing && input.pid) existing = this.byLivePid(input.tool, input.pid);
+      if (!existing && input.pid) existing = this.#runAncestor(input.tool, input.pid);
       const repo = input.cwd ? repoInfo(input.cwd) : undefined;
       const project = input.cwd
         ? (safeField(projectName(repo ?? {}, input.cwd), LIMITS.project) ?? undefined)
@@ -243,6 +244,78 @@ export class Registry {
       now,
       row.id,
     );
+  }
+
+  /**
+   * A process started by a headless run (a CLI that re-executes its native binary) belongs to
+   * that run's agent, so its hooks don't register a second agent.
+   */
+  #runAncestor(tool: string, pid: number): AgentRow | undefined {
+    const rows = this.#ctx.store.all<AgentRow>(
+      `SELECT * FROM agents WHERE tool = ? AND state IN ('busy','idle') AND adapter LIKE '%"headlessRun"%'`,
+      tool,
+    );
+    if (rows.length === 0) return undefined;
+    const chain = ancestry(pid);
+    return rows.find((r) =>
+      chain.some((p) => p.pid === r.pid && (!r.pid_start || !p.start || p.start === r.pid_start)),
+    );
+  }
+
+  /**
+   * A headless run's process is this agent from now on: its hooks and CLI calls resolve to it
+   * (never to the human). The old session's adapter data (tmux pane, inbox socket) is dropped.
+   */
+  attachRun(
+    agentId: string,
+    run: { id: number; pid: number; pidStart?: string; sessionId?: string },
+  ): AgentRow {
+    const now = iso(this.#ctx.now());
+    this.#ctx.store.run(
+      `UPDATE agents SET pid = ?, pid_start = ?, session_id = COALESCE(?, session_id), state = 'busy',
+         state_at = ?, last_seen_at = ?, adapter = ?, stop_blocks = 0 WHERE id = ?`,
+      run.pid,
+      run.pidStart ?? null,
+      run.sessionId ?? null,
+      now,
+      now,
+      JSON.stringify({ headlessRun: run.id }),
+      agentId,
+    );
+    const agent = this.byId(agentId) as AgentRow;
+    this.#emit(agent);
+    return agent;
+  }
+
+  setSession(agentId: string, sessionId: string): void {
+    this.#ctx.store.run("UPDATE agents SET session_id = ? WHERE id = ?", sessionId, agentId);
+  }
+
+  /** Records who spawned an agent (spawn depth limits who may spawn further). */
+  markSpawned(agentId: string, by: string, depth: number): void {
+    this.#ctx.store.run(
+      "UPDATE agents SET spawned_by = ?, spawn_depth = ? WHERE id = ?",
+      by,
+      depth,
+      agentId,
+    );
+  }
+
+  spawnDepth(agentId: string): { by: string | null; depth: number } {
+    const row = this.#ctx.store.get<{ spawned_by: string | null; spawn_depth: number }>(
+      "SELECT spawned_by, spawn_depth FROM agents WHERE id = ?",
+      agentId,
+    );
+    return { by: row?.spawned_by ?? null, depth: row?.spawn_depth ?? 0 };
+  }
+
+  /** A free name for a spawned agent: `<tool>-<folder>`, numbered when taken (never a takeover). */
+  freeName(tool: string, cwd: string): string {
+    const base = clipName(`${slugify(tool, 16)}-${slugify(basename(cwd) || "agent", 40)}`);
+    for (const name of [base, ...Array.from({ length: 98 }, (_, i) => `${base}-${i + 2}`)]) {
+      if (!this.resolveName(name)) return name;
+    }
+    return `${base}-${ulid().slice(-6).toLowerCase()}`;
   }
 
   /** Model and session title can change mid-session; they never rename the agent. */

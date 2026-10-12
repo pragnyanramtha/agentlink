@@ -39,6 +39,11 @@ Coordinate
   whoami                             which agent this shell is (or: you, the human)
   register · unregister              add/remove an agent that has no hooks
 
+Run agents (headless; off until you turn it on: agentlink headless)
+  spawn <cli> "<task>" [--wait]      start a new claude/codex/opencode agent for a task
+  wake <agent> ["<message>"]         wake an idle agent here, or resume an offline one
+  runs [<id>] · stop <run|agent>     what ran and why (audit) · stop a run
+
 Teams (other machines, other people)
   team [create|invite|join|leave]    end-to-end encrypted team over a relay
   relay serve                        run a relay (self-hosted)
@@ -50,6 +55,7 @@ Setup & control
   daemon start|stop|restart|status|logs
   pause · resume · mute <agent> · unmute <agent>
   policy · approvals · approve <id> · deny <id>
+  headless [on|off|enable <cli>|roots add <dir>|set k=v]   who may run agents, and where
   notify on|off|test · prune --older-than 30d
 
 Run "agentlink <command> --help" for details. Global flags: --json, --verbose (ids, delivery
@@ -408,7 +414,8 @@ on a private Unix socket (~/.agentlink/run/agentlink.sock).`,
 
   pause: `agentlink pause
 
-Stop delivering messages to every agent (they are queued). Any agent may pause.`,
+Stop delivering messages to every agent (they are queued). Headless runs are interrupted
+and no new ones start. Any agent may pause.`,
 
   resume: `agentlink resume
 
@@ -437,13 +444,15 @@ Example: agentlink policy set teammate request=hold handoff=hold`,
 
   approvals: `agentlink approvals
 
-Messages held by policy, waiting for you. Approve or deny each one by its number
-(#12) or message id:
+Messages held by policy, and headless runs held for you (R3: e.g. a teammate's message
+that would resume one of your agents), waiting for you. Approve or deny each one by its
+number (#12, R3) or message id:
   agentlink approve <id> · agentlink deny <id>   (interactive terminal only)`,
 
-  approve: `agentlink approve <delivery-id> [-y]
+  approve: `agentlink approve <delivery-id|run-id> [-y]
 
-Deliver a held message. Only a human in an interactive terminal can approve.`,
+Deliver a held message, or start a held headless run (R3). Only a human in an
+interactive terminal can approve.`,
 
   deny: `agentlink deny <delivery-id> [-y]
 
@@ -452,7 +461,8 @@ Drop a held message.`,
   mcp: `agentlink mcp
 
 Run the MCP server on stdio (tools: peers, whoami, ask, send, reply, ack, inbox, todo,
-thread, show, doing, claim, release). agentlink install registers it with your CLIs.
+thread, threads, search, show, doing, claim, release, spawn_agent, wake_agent, stop_run).
+agentlink install registers it with your CLIs.
 
 The server acts as the agent whose process started it (its process tree). For an app
 without agentlink hooks, register the app's process first:
@@ -462,6 +472,75 @@ without agentlink hooks, register the app's process first:
   hook: `agentlink hook <tool> <event> [json]
 
 Internal: called by agent CLI hooks. Always exits 0 so your agent never breaks.`,
+
+  headless: `agentlink headless [show]
+agentlink headless on|off
+agentlink headless enable <claude|codex|opencode|gemini> [--profile read-only|edit|full] [--model m] [--bin path]
+agentlink headless disable <cli>
+agentlink headless roots [add|remove <dir>]
+agentlink headless set <key>=<value>…
+
+Let agentlink run agent CLIs without a terminal: resume an offline agent's own session
+when an ask, request, handoff or review request arrives (claude -p --resume, codex exec
+resume, opencode run --session), and start new agents (agentlink spawn). Off by default.
+Changing it needs you, in an interactive terminal; agents can only read it.
+
+  enable      allow one CLI (its path on your PATH is remembered). Profiles:
+                read-only  read files only: claude dontAsk, codex -s read-only,
+                           opencode --agent plan with edit/bash denied (default)
+                edit       file edits: claude acceptEdits, codex -s workspace-write,
+                           opencode edits allowed, shell asks refused
+                full       also shell (claude) / network (codex): only if you mean it
+              gemini is experimental. Never used: --dangerously-*, bypassPermissions,
+              --yolo, --auto.
+  roots       folders runs may use (and everything below them); none = nothing runs
+  set         maxConcurrent (2) perAgentPerHour (4) globalPerHour (20) spawnPerHour (5)
+              perThreadRuns (3) timeoutSec (600) maxBudgetUsd (none; claude only)
+              maxSpawnDepth (1: spawned agents can't spawn), and who may ask:
+              local.wake=allow local.spawn=allow teammate.wake=hold (allow|hold|refuse;
+              held runs wait in agentlink approvals). External senders never can.
+
+A run is the agent itself: its hooks run, it can use agentlink, its final answer is
+posted as its reply. Running a CLI in a repo runs that repo's hooks and MCP servers too:
+add only folders you trust. --verbose shows each CLI's exact command line.
+
+Example: agentlink headless on && agentlink headless enable codex && agentlink headless roots add ~/work`,
+
+  spawn: `agentlink spawn <claude|codex|opencode|gemini> [--cwd dir] [--name x] [--model m] [--wait [d]] "<task>"
+
+Start a new agent headlessly for a task (needs agentlink headless on, the CLI enabled and
+the folder under a root). The task is sent to it as an ask from you; its final answer is
+the reply, so --wait works like ask. It shows up in peers and can be woken later with
+agentlink wake. Agents it was started for cannot spawn others.
+
+  --cwd <dir>     folder to work in (default: the current one)
+  --name <name>   its name (default: <cli>-<folder>)
+  --model <m>     model for this agent
+  -w, --wait [d]  wait for the answer (default 110s)
+  --stdin         read the task from stdin
+
+Example: agentlink spawn codex --cwd ~/work/api --wait 5m "Why does test_login fail?"`,
+
+  wake: `agentlink wake <agent> ["<message>"] [--wait [d]]
+
+With a message: send it as an ask; an idle agent is woken the usual way (tmux, push…), an
+offline one is resumed headlessly when that is enabled. Without one: wake it for the mail
+already waiting. The answer comes back like an answer to ask. Only this machine's agents:
+for a teammate's agent, send it an ask (their machine decides whether to wake it).
+
+Example: agentlink wake codex-api "Run the API tests and tell me what fails"`,
+
+  runs: `agentlink runs [<run-id>] [-n 20] [--agent X] [--state running|held|done|failed|stopped]
+
+Headless runs, newest first: who asked, which agent and CLI, profile, state. With an id:
+the exact command line (the prompt goes on stdin), timings, exit, cost and tokens when the
+CLI reports them, permission denials, the answer and the full output log. Agents see
+only runs they asked for or ran in.`,
+
+  stop: `agentlink stop <run-id|agent>
+
+Stop a headless run: interrupt (SIGINT), terminate after 10s, kill after 20s. Held runs
+are dropped. The asker, the agent itself, or you can stop it.`,
 
   version: `agentlink version`,
   help: `agentlink help [command]`,

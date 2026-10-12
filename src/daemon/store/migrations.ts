@@ -148,4 +148,42 @@ export const MIGRATIONS: string[] = [
   ALTER TABLE agents ADD COLUMN title TEXT;              -- the session's custom title (/rename)
   ALTER TABLE agents ADD COLUMN project TEXT;            -- git remote's repo name, else folder name
   `,
+  // 7: headless runs (resume offline agents, spawn new ones) and their audit trail
+  `
+  ALTER TABLE agents ADD COLUMN spawned_by TEXT;         -- who started it with agentlink spawn
+  ALTER TABLE agents ADD COLUMN spawn_depth INTEGER NOT NULL DEFAULT 0;
+  CREATE TABLE runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,                -- shown as R<id>
+    agent_id TEXT NOT NULL,
+    harness TEXT NOT NULL,                               -- claude | codex | opencode | gemini
+    kind TEXT NOT NULL,                                  -- wake | spawn
+    profile TEXT NOT NULL,                               -- read-only | edit | full
+    model TEXT,
+    state TEXT NOT NULL,                                 -- held | queued | running | done | failed | stopped | denied
+    requester TEXT NOT NULL,                             -- verified sender address
+    requester_agent_id TEXT,
+    trust TEXT NOT NULL,
+    trigger_id TEXT,                                     -- message that asked for the run
+    thread_id TEXT,
+    hops INTEGER NOT NULL DEFAULT 0,                     -- messages the run sends get hops + 1
+    cwd TEXT NOT NULL,
+    session_id TEXT,
+    argv TEXT,                                           -- JSON; the prompt goes on stdin, never here
+    pid INTEGER,
+    deliveries TEXT,                                     -- JSON ids handed to the run
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    ended_at TEXT,
+    exit_code INTEGER,
+    signal TEXT,
+    cost_usd REAL,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    denials INTEGER,                                     -- permission denials the CLI reported
+    result_id TEXT,                                      -- reply posted from the run's final text
+    note TEXT
+  );
+  CREATE INDEX runs_agent ON runs(agent_id, created_at);
+  CREATE INDEX runs_state ON runs(state);
+  `,
 ];

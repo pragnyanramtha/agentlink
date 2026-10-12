@@ -1,10 +1,21 @@
+import { realpathSync, statSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { hostname } from "node:os";
+import { isAbsolute } from "node:path";
 import { z } from "zod";
-import { loadConfig } from "../core/config.ts";
-import { identityLine, modelShort } from "../core/identity.ts";
+import {
+  HARNESSES,
+  type HeadlessConfig,
+  HeadlessSchema,
+  loadConfig,
+  MODEL_RE,
+  PROFILES,
+  saveConfig,
+} from "../core/config.ts";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
 import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
+import { identityLine, modelShort } from "../core/identity.ts";
+import { LIMITS } from "../core/limits.ts";
 import { peerLookupAvailable, peerPid, stdinIsTty } from "../core/peer.ts";
 import { DEFAULT_POLICY, POLICY_ACTIONS, TRUSTS } from "../core/policy.ts";
 import { ancestry, isAlive, procCwd, procInfo } from "../core/proc.ts";
@@ -16,10 +27,12 @@ import type { DaemonContext } from "./context.ts";
 import type { OpenCodeBridge } from "./deliverers.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import type { DaemonEvent } from "./events.ts";
+import { type Headless, parseRunRef, type RunRow } from "./headless.ts";
 import { type HookHandler, HookRequestSchema } from "./hooks.ts";
 import type { InboxTarget, Mailbox, MessageFilter } from "./mailbox.ts";
 import type { DesktopNotifier } from "./notify.ts";
 import { agentView, isLive, type Registry } from "./registry.ts";
+import { BIN_NAMES, checkBin, executable, findBin, RUNNERS } from "./runners/index.ts";
 import type { TeamManager } from "./team-manager.ts";
 import {
   type AgentRow,
@@ -52,6 +65,7 @@ export interface Services {
   opencode: OpenCodeBridge;
   team: TeamManager;
   notifier: DesktopNotifier;
+  headless: Headless;
   ui?: UiServer;
   /** Tests only: take the caller's claimed process tree/TTY at face value. */
   trustClientCaller?: boolean;
@@ -176,6 +190,56 @@ const RegisterSchema = z.object({
   title: z.string().max(400).optional(),
 });
 
+const Decision = z.enum(["allow", "hold", "refuse"]);
+const Path = z.string().min(1).max(4096);
+const HeadlessPatchSchema = z.strictObject({
+  enabled: z.boolean().optional(),
+  runner: z
+    .strictObject({
+      harness: z.enum(HARNESSES),
+      enabled: z.boolean().optional(),
+      profile: z.enum(PROFILES).optional(),
+      model: z.string().regex(MODEL_RE).nullable().optional(),
+      bin: Path.optional(),
+    })
+    .optional(),
+  addRoot: Path.optional(),
+  removeRoot: Path.optional(),
+  set: z.record(z.string(), z.union([z.number(), Decision, z.null()])).optional(),
+});
+const LIMIT_KEYS = [
+  "maxConcurrent",
+  "perAgentPerHour",
+  "globalPerHour",
+  "spawnPerHour",
+  "perThreadRuns",
+  "timeoutSec",
+  "maxBudgetUsd",
+  "maxSpawnDepth",
+] as const;
+const FROM_KEYS = ["local.wake", "local.spawn", "teammate.wake"] as const;
+const WaitMs = z
+  .number()
+  .int()
+  .min(0)
+  .max(30 * 60_000)
+  .optional();
+// strict: a request can never carry a profile, a binary or flags of its own.
+const SpawnSchema = z.strictObject({
+  harness: z.enum(HARNESSES),
+  task: z.string().min(1).max(LIMITS.maxTextBytes),
+  cwd: Path.optional(),
+  name: z.string().min(1).max(63).optional(),
+  model: z.string().regex(MODEL_RE).optional(),
+  waitMs: WaitMs,
+});
+const WakeSchema = z.strictObject({
+  agent: z.string().min(1).max(200),
+  text: z.string().max(LIMITS.maxTextBytes).optional(),
+  waitMs: WaitMs,
+});
+const ENDED = ["done", "failed", "stopped", "denied"];
+
 export function createDaemonServer(
   s: Services,
   shutdown: () => void,
@@ -277,7 +341,11 @@ export function createDaemonServer(
       ...mailbox.counts(viewer(req)),
       ...(req.agent
         ? {}
-        : { held: count("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'held'") }),
+        : {
+            held:
+              count("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'held'") +
+              count("SELECT COUNT(*) AS n FROM runs WHERE state = 'held'"),
+          }),
       outbox: count("SELECT COUNT(*) AS n FROM outbox"),
       db: {
         messages: count("SELECT COUNT(*) AS n FROM messages"),
@@ -560,7 +628,9 @@ export function createDaemonServer(
             : !mailbox.remote.online(handle);
         }
         const agent = registry.byName(to);
-        return !!agent && !isLive(agent);
+        // An offline agent being woken headlessly can still answer.
+        const run = agent ? s.headless.activeFor(agent.id) : undefined;
+        return !!agent && !isLive(agent) && (!run || run.state === "held");
       });
     let offlineNote: string | undefined;
     if (input.waitMs && reachable && mailbox.paused) {
@@ -964,13 +1034,20 @@ export function createDaemonServer(
 
   route("GET", "/v1/approvals", (req) => {
     requireHuman(req, false);
-    return { items: mailbox.held().map((i) => itemView(i, viewer(req))) };
+    return {
+      items: [...mailbox.held().map((i) => itemView(i, viewer(req))), ...s.headless.approvals()],
+    };
   });
 
   route("POST", "/v1/approvals/:id", (req) => {
     requireHuman(req);
     const body = z.object({ decision: z.enum(["approve", "deny"]) }).parse(req.body);
     const raw = String(req.params.id).replace(/^#/, "");
+    // Held headless runs are R<n> (agentlink approve R12).
+    if (/^r\d+$/i.test(raw)) {
+      const run = s.headless.decide(parseRunRef(raw) as number, body.decision, ctx.config.handle);
+      return { run: s.headless.view(run) };
+    }
     let deliveryId = Number(raw);
     if (!/^\d+$/.test(raw)) {
       const held = mailbox
@@ -1000,6 +1077,8 @@ export function createDaemonServer(
     if (body.action !== "pause") requireHuman(req);
     if (body.action === "pause" || body.action === "resume") {
       ctx.store.setMeta("paused", body.action === "pause" ? "1" : undefined);
+      if (body.action === "pause") s.headless.pauseAll();
+      else s.headless.resume();
       engine.refreshAll();
       if (body.action === "resume") for (const a of registry.list()) engine.maybeWake(a);
       ctx.events.publish({ type: "notice", level: "info", text: `agentlink ${body.action}d` });
@@ -1010,6 +1089,241 @@ export function createDaemonServer(
     registry.setMuted(agent.id, body.action === "mute");
     if (body.action === "unmute") engine.maybeWake(registry.byId(agent.id) as AgentRow);
     return { agent: agentView(registry.byId(agent.id) as AgentRow) };
+  });
+
+  // ------------------------------------------------------------------ headless runs
+  const headlessView = () => {
+    const h = ctx.config.headless;
+    return {
+      ...h,
+      runners: HARNESSES.map((harness) => {
+        const r = h.runners[harness];
+        const profile = r?.profile ?? "read-only";
+        const sample = (resume: boolean) =>
+          RUNNERS[harness].argv({
+            resume,
+            sessionId: "<session>",
+            cwd: "<dir>",
+            profile,
+            ...(r?.model ? { model: r.model } : {}),
+            ...(h.maxBudgetUsd ? { maxBudgetUsd: h.maxBudgetUsd } : {}),
+          });
+        return {
+          harness,
+          enabled: !!r?.enabled,
+          profile,
+          model: r?.model ?? null,
+          bin: s.headless.bin(harness) ?? null,
+          experimental: !!RUNNERS[harness].experimental,
+          argv: { new: sample(false).argv, resume: sample(true).argv },
+          env: sample(false).env ?? null,
+        };
+      }),
+      running: s.headless.running,
+    };
+  };
+
+  // Agents may read the settings; only a person at a terminal changes them.
+  route("GET", "/v1/headless", () => headlessView());
+
+  route("POST", "/v1/headless", (req) => {
+    requireHuman(req);
+    const patch = HeadlessPatchSchema.parse(req.body);
+    const config = loadConfig(ctx.paths);
+    const h: HeadlessConfig = structuredClone(config.headless);
+    if (patch.enabled !== undefined) h.enabled = patch.enabled;
+    if (patch.runner) {
+      const { harness, bin, model, ...rest } = patch.runner;
+      const current = h.runners[harness] ?? { enabled: false, profile: "read-only" as const };
+      const found = bin
+        ? checkBin(bin)
+        : current.bin && executable(current.bin)
+          ? current.bin
+          : findBin(BIN_NAMES[harness]);
+      const { model: _, ...kept } = current;
+      h.runners[harness] = {
+        ...kept,
+        ...rest,
+        ...(model
+          ? { model }
+          : model === undefined && current.model
+            ? { model: current.model }
+            : {}),
+        ...(found ? { bin: found } : {}),
+      };
+      if (rest.enabled && !found && !s.headless.bin(harness))
+        throw invalid(`${harness} was not found on the daemon's PATH; pass its absolute path`);
+    }
+    if (patch.addRoot) {
+      if (!isAbsolute(patch.addRoot)) throw invalid("a root must be an absolute path");
+      let real: string;
+      try {
+        real = realpathSync(patch.addRoot);
+        if (!statSync(real).isDirectory()) throw new Error("not a directory");
+      } catch {
+        throw invalid(`${patch.addRoot} is not a directory`);
+      }
+      if (real === "/") throw invalid("/ is too broad for a root");
+      if (!h.roots.includes(real)) h.roots.push(real);
+    }
+    if (patch.removeRoot) {
+      const target = patch.removeRoot;
+      const before = h.roots.length;
+      h.roots = h.roots.filter((r) => r !== target && r !== target.replace(/\/+$/, ""));
+      if (h.roots.length === before) throw invalid(`${target} is not a root`);
+    }
+    for (const [key, value] of Object.entries(patch.set ?? {})) {
+      if ((FROM_KEYS as readonly string[]).includes(key)) {
+        const [who, what] = key.split(".") as ["local" | "teammate", "wake" | "spawn"];
+        (h.from[who] as Record<string, unknown>)[what] = value;
+      } else if ((LIMIT_KEYS as readonly string[]).includes(key)) {
+        (h as Record<string, unknown>)[key] = value ?? undefined;
+      } else {
+        throw invalid(
+          `unknown setting "${key}"${didYouMean(key, [...LIMIT_KEYS, ...FROM_KEYS])}; settings: ${[...LIMIT_KEYS, ...FROM_KEYS].join(", ")}`,
+        );
+      }
+    }
+    config.headless = HeadlessSchema.parse(h);
+    saveConfig(ctx.paths, config);
+    ctx.config = config;
+    if (config.headless.enabled) s.headless.resume();
+    return headlessView();
+  });
+
+  /** Waits for an answer to `messageId`; stops early when the run ends without one. */
+  const waitRun = async (messageId: string, run: RunRow, ms: number, signal: AbortSignal) => {
+    if (run.state === "held" || ENDED.includes(run.state)) return undefined;
+    const stop = new AbortController();
+    signal.addEventListener("abort", () => stop.abort(), { once: true });
+    const poll = setInterval(() => {
+      if (ENDED.includes(s.headless.get(run.id).state)) stop.abort();
+    }, 250);
+    try {
+      return await mailbox.waitForReplies(messageId, 1, ms, stop.signal);
+    } finally {
+      clearInterval(poll);
+    }
+  };
+  const answerOf = (out: Awaited<ReturnType<typeof waitRun>>, req: Req) => {
+    const m = out?.replies[0];
+    return m ? { reply: replyView(m, viewer(req)) } : {};
+  };
+
+  route("POST", "/v1/spawn", async (req) => {
+    const body = SpawnSchema.parse(req.body);
+    const cwd = body.cwd ?? req.agent?.cwd;
+    if (!cwd || !isAbsolute(cwd)) throw invalid("which folder? pass an absolute --cwd");
+    const { agent, run, sent } = s.headless.spawn(sender(req), {
+      harness: body.harness,
+      cwd,
+      task: body.task,
+      ...(body.name ? { name: body.name } : {}),
+      ...(body.model ? { model: body.model } : {}),
+    });
+    const out = body.waitMs
+      ? await waitRun(String(sent.message.id), run, body.waitMs, req.signal)
+      : undefined;
+    return {
+      agent: agentView(agent),
+      run: s.headless.view(s.headless.get(run.id)),
+      message: sent.message,
+      note: s.headless.note(run, agent),
+      ...answerOf(out, req),
+      waited: !!body.waitMs,
+      timedOut: !!out?.timedOut,
+    };
+  });
+
+  route("POST", "/v1/wake", async (req) => {
+    const body = WakeSchema.parse(req.body);
+    const target = registry.resolveName(body.agent)?.agent ?? registry.require(body.agent);
+    if (req.agent?.id === target.id) throw invalid("an agent cannot wake itself");
+    if (body.text?.trim()) {
+      const result = mailbox.send(sender(req), { kind: "ask", to: [target.name], text: body.text });
+      const notes = engine.onQueued(result.queued);
+      const d = result.deliveries[0] as { id: number; state: string } | undefined;
+      const run = s.headless.activeFor(target.id);
+      const live = isLive(registry.byId(target.id) ?? target);
+      const out = !body.waitMs
+        ? undefined
+        : run
+          ? await waitRun(String(result.message.id), run, body.waitMs, req.signal)
+          : live
+            ? await mailbox.waitForReplies(String(result.message.id), 1, body.waitMs, req.signal)
+            : undefined;
+      return {
+        agent: target.name,
+        message: result.message,
+        note: (d && notes.get(d.id)) ?? d?.state ?? "sent",
+        run: run ? s.headless.view(s.headless.get(run.id)) : null,
+        ...answerOf(out, req),
+      };
+    }
+    const agent = registry.refreshLiveness(target);
+    if (isLive(agent)) {
+      const deliverer = engine.delivererFor(agent);
+      engine.maybeWake(agent);
+      return {
+        agent: agent.name,
+        run: null,
+        note: deliverer
+          ? `${agent.name} is running (${agent.state}); waking it via ${deliverer.id} if it has mail`
+          : `${agent.name} is running (${agent.state}); it reads its mail at its next turn`,
+      };
+    }
+    const pending = mailbox.pending(agent.id);
+    if (pending.length === 0)
+      throw invalid(
+        `nothing is waiting for ${agent.name}; give it something to do: agentlink wake ${agent.name} "<message>"`,
+      );
+    const run = s.headless.request({
+      agent,
+      requester: s.headless.requesterOf(sender(req)),
+      trigger: pending.find((i) => i.message.kind !== "info") ?? (pending[0] as InboxItem),
+    });
+    return { agent: agent.name, run: s.headless.view(run), note: s.headless.note(run, agent) };
+  });
+
+  const RunsQuery = z.object({
+    limit: z.coerce.number().int().min(1).max(200).default(20),
+    agent: z.string().min(1).max(200).optional(),
+    state: z.enum(["held", "queued", "running", "done", "failed", "stopped", "denied"]).optional(),
+  });
+  // Agents see the runs they asked for or ran in; you see all of them.
+  const visibleRun = (req: Req, run: RunRow) =>
+    !req.agent || run.agent_id === req.agent.id || run.requester_agent_id === req.agent.id;
+  const runFor = (req: Req, ref: string): RunRow => {
+    const id = parseRunRef(ref) ?? s.headless.activeFor(registry.require(ref).id)?.id;
+    if (id === undefined) throw invalid(`${ref} has no headless run in progress`);
+    const run = s.headless.get(id);
+    if (!visibleRun(req, run)) throw new AgentLinkError("not_found", `run ${ref} not found`, 404);
+    return run;
+  };
+
+  route("GET", "/v1/runs", (req) => {
+    const q = RunsQuery.parse(Object.fromEntries(req.query));
+    return {
+      runs: s.headless
+        .list({
+          limit: q.limit,
+          ...(q.agent ? { agentId: registry.require(q.agent).id } : {}),
+          ...(q.state ? { state: q.state } : {}),
+          ...(req.agent ? { viewer: req.agent.id } : {}),
+        })
+        .map((r) => s.headless.view(r)),
+    };
+  });
+
+  route("GET", "/v1/runs/:id", (req) => ({
+    run: s.headless.view(runFor(req, req.params.id as string)),
+  }));
+
+  // Stopping is the safe direction: the requester, the agent itself, or you.
+  route("POST", "/v1/runs/:id/stop", (req) => {
+    const run = runFor(req, req.params.id as string);
+    const who = req.agent ? req.agent.name : `@${ctx.config.handle}`;
+    return { run: s.headless.view(s.headless.stop(run.id, `stopped by ${who}`)) };
   });
 
   // ------------------------------------------------------------------ adapters

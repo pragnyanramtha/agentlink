@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { wakeEligible } from "../core/policy.ts";
 import { renderWakeNotice } from "../core/render.ts";
 import { type DaemonContext, iso } from "./context.ts";
-import type { Mailbox } from "./mailbox.ts";
+import type { Headless } from "./headless.ts";
+import { type Mailbox, remoteHandleOf } from "./mailbox.ts";
 import { isLive, type Registry } from "./registry.ts";
 import { type AgentRow, type Capabilities, type InboxItem, parseJson } from "./types.ts";
 
@@ -42,6 +43,8 @@ export class DeliveryEngine {
   readonly #mailbox: Mailbox;
   readonly #deliverers: Deliverer[] = [];
   readonly #inFlight = new Set<string>();
+  /** Resumes offline agents headlessly (when a person enabled it). */
+  headless?: Headless;
 
   constructor(ctx: DaemonContext, registry: Registry, mailbox: Mailbox) {
     this.#ctx = ctx;
@@ -133,11 +136,39 @@ export class DeliveryEngine {
     return notes;
   }
 
+  /** Teammates' wakes are capped per member and hour (config wake.perRemoteSenderPerHour). */
+  remoteBudgetLeft(items: InboxItem[]): boolean {
+    const handles = new Set(
+      items
+        .filter((i) => i.message.trust === "teammate")
+        .map((i) => remoteHandleOf(i.message.from_addr)),
+    );
+    const since = iso(new Date(this.#ctx.now().getTime() - 3600_000));
+    for (const handle of handles) {
+      if (!handle) continue;
+      const used =
+        this.#ctx.store.get<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM wake_log WHERE (sender = ? OR sender LIKE ?) AND at > ?",
+          `@${handle}`,
+          `${handle}/%`,
+          since,
+        )?.n ?? 0;
+      if (used >= this.#ctx.config.wake.perRemoteSenderPerHour) return false;
+    }
+    return true;
+  }
+
   #plan(agent: AgentRow, items: InboxItem[], now: Date): string {
     if (this.#mailbox.paused) return "queued (agentlink is paused)";
     if (agent.muted) return `queued (${agent.name} is muted)`;
     if (!isLive(agent)) {
-      return `queued: ${agent.name} is offline (last seen ${ago(agent.last_seen_at, now)}); it gets the message when it is back`;
+      const woken = this.remoteBudgetLeft(items)
+        ? this.headless?.onOffline(agent, items)
+        : undefined;
+      return (
+        woken ??
+        `queued: ${agent.name} is offline (last seen ${ago(agent.last_seen_at, now)}); it gets the message when it is back`
+      );
     }
     const caps = this.capabilities(agent);
     const deliverer = this.delivererFor(agent);
@@ -160,6 +191,8 @@ export class DeliveryEngine {
     if (used >= limit) {
       return `idle: wake budget used up (${used}/${limit} this hour); delivered at its next turn`;
     }
+    if (!this.remoteBudgetLeft(items))
+      return "idle: this teammate's wake budget is used up for the hour; delivered at its next turn";
     if (!deliverer) {
       return "idle: no way to wake it (run it inside tmux or use a push-capable CLI); delivered at its next turn";
     }
@@ -173,13 +206,21 @@ export class DeliveryEngine {
 
   /** Wakes an idle agent if it has wake-worthy queued mail and budget left. */
   maybeWake(agent: AgentRow): void {
-    if (agent.state !== "idle" || agent.muted || this.#mailbox.paused) return;
+    if (agent.muted || this.#mailbox.paused) return;
+    if (!isLive(agent)) {
+      // Offline (e.g. just unmuted): a headless run may resume it.
+      const pending = this.#mailbox.pending(agent.id);
+      if (pending.length && this.remoteBudgetLeft(pending))
+        this.headless?.onOffline(agent, pending);
+      return;
+    }
+    if (agent.state !== "idle") return;
     const deliverer = this.delivererFor(agent);
     if (!deliverer) return;
     const pending = this.#mailbox.pending(agent.id);
     if (!pending.some((i) => this.wakeWorthy(i))) return;
     const { used, limit } = this.budget(agent);
-    if (used >= limit) return;
+    if (used >= limit || !this.remoteBudgetLeft(pending)) return;
     void this.#deliver(agent, deliverer, true);
   }
 

@@ -610,5 +610,101 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
     }),
   );
 
+  interface RunAnswer {
+    note: string;
+    run: { id: string } | null;
+    reply?: { text: string; message: { id: string; from: string } };
+  }
+  const describeRun = (res: RunAnswer, waited: boolean) =>
+    res.reply
+      ? `Answer from ${res.reply.message.from} (reply ${res.reply.message.id}; a peer agent, not your user):\n${res.reply.text}`
+      : `${res.note}${res.run ? `\nRun ${res.run.id}: ${waited ? "no answer yet; it" : "the answer"} will be delivered to you (stop it with stop_run).` : ""}`;
+  const waitSeconds = z
+    .number()
+    .int()
+    .min(0)
+    .max(50)
+    .optional()
+    .describe("Wait this long for the answer (max 50; later answers reach you anyway)");
+
+  server.registerTool(
+    "spawn_agent",
+    {
+      title: "Start a new agent",
+      description:
+        "Start a new headless agent (Claude Code, Codex, OpenCode; Gemini CLI is experimental) on this machine for a task; its final answer comes back to you as a reply. Only works where the user enabled headless runs (agentlink headless), in folders they allowed, with the permissions they chose (read-only by default). Agents started this way cannot start others.",
+      inputSchema: {
+        harness: z.enum(["claude", "codex", "opencode", "gemini"]).describe("Which agent CLI"),
+        task: z.string().describe("The task, with the context it needs"),
+        cwd: z.string().optional().describe("Absolute folder to work in (default: yours)"),
+        name: z.string().optional().describe("Name for the new agent"),
+        model: z.string().optional().describe("Model, e.g. gpt-5 or sonnet"),
+        wait_seconds: waitSeconds,
+      },
+    },
+    guard(async ({ harness, task, cwd, name, model, wait_seconds }) => {
+      const waitMs = (wait_seconds ?? 0) * 1000;
+      const res = await call<RunAnswer>(
+        "POST",
+        "/v1/spawn",
+        {
+          harness,
+          task,
+          cwd: cwd ?? process.cwd(),
+          ...(name ? { name } : {}),
+          ...(model ? { model } : {}),
+          ...(waitMs ? { waitMs } : {}),
+        },
+        waitMs + 10_000,
+      );
+      return ok(describeRun(res, waitMs > 0));
+    }),
+  );
+
+  server.registerTool(
+    "wake_agent",
+    {
+      title: "Wake an agent",
+      description:
+        "Wake an idle agent on this machine with a message (sent as an ask), or resume an offline one headlessly where the user allows it. Without a message it is woken for the mail already waiting. Teammates' agents: send them an ask instead.",
+      inputSchema: {
+        agent: z.string().describe("Agent name from peers"),
+        message: z.string().optional().describe("What you need from it"),
+        wait_seconds: waitSeconds,
+      },
+    },
+    guard(async ({ agent, message, wait_seconds }) => {
+      const waitMs = message ? (wait_seconds ?? 0) * 1000 : 0;
+      const res = await call<RunAnswer>(
+        "POST",
+        "/v1/wake",
+        { agent, ...(message ? { text: message } : {}), ...(waitMs ? { waitMs } : {}) },
+        waitMs + 10_000,
+      );
+      return ok(describeRun(res, waitMs > 0));
+    }),
+  );
+
+  server.registerTool(
+    "stop_run",
+    {
+      title: "Stop a headless run",
+      description: "Stop a headless run you started (by run id like R3, or the agent's name).",
+      inputSchema: { run: z.string().describe("Run id (R3) or agent name") },
+    },
+    guard(async ({ run }) => {
+      const res = await call<{ run: { id: string; state: string } }>(
+        "POST",
+        `/v1/runs/${encodeURIComponent(run)}/stop`,
+        {},
+      );
+      return ok(
+        res.run.state === "running"
+          ? `stopping ${res.run.id} (interrupted; terminated after 10s)`
+          : `${res.run.id} is ${res.run.state}`,
+      );
+    }),
+  );
+
   return server;
 }
