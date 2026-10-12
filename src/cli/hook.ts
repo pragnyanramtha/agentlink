@@ -51,6 +51,8 @@ export function envExports(env: Record<string, string>): string {
 
 /** CLIs whose hook contract expects a JSON object on stdout even when there is nothing to say. */
 const JSON_STDOUT_TOOLS = new Set(["agy", "cursor", "copilot"]);
+/** Hooks that run on every tool or model call. */
+const FAST_EVENTS = new Set(["pre-tool", "post-tool", "pre-model"]);
 
 /**
  * `agentlink hook <tool> <event> [json]`, invoked by a CLI's hook system. It must fail open:
@@ -71,27 +73,34 @@ export async function runHook(
     } catch {
       // non-JSON payloads are ignored
     }
-    const slow = event === "session-start";
-    const client = new Client(paths, { timeoutMs: slow ? 5_000 : 2_000 });
-    if (slow) await client.ensureDaemon({ autoStart: true, waitMs: 4_000 });
+    // Within the CLIs' 10 s hook timeout; per-tool-call hooks hold up the agent the most. A slow
+    // answer is still better than none: the daemon keeps mail queued if the hook gives up.
+    const deadline = Date.now() + (FAST_EVENTS.has(event) ? 4_000 : 8_000);
+    const client = new Client(paths);
+    if (event === "session-start") await client.ensureDaemon({ autoStart: true, waitMs: 4_000 });
     const chain = ancestry(process.pid).map((p) => ({
       pid: p.pid,
       ppid: p.ppid,
       ...(p.start ? { start: p.start } : {}),
       cmd: p.cmd.slice(0, 4).map((a) => a.slice(0, 200)),
     }));
-    const res = await client.request<HookResponse>("POST", `/v1/hooks/${tool}/${event}`, {
-      payload,
-      chain,
-      env: {
-        cwd: process.cwd(),
-        ...(process.env.TMUX_PANE ? { tmuxPane: process.env.TMUX_PANE } : {}),
-        ...(process.env.TMUX ? { tmux: process.env.TMUX } : {}),
-        ...(process.env.CLAUDE_CODE_MESSAGING_SOCKET
-          ? { claudeSocket: process.env.CLAUDE_CODE_MESSAGING_SOCKET }
-          : {}),
+    const res = await client.request<HookResponse>(
+      "POST",
+      `/v1/hooks/${tool}/${event}`,
+      {
+        payload,
+        chain,
+        env: {
+          cwd: process.cwd(),
+          ...(process.env.TMUX_PANE ? { tmuxPane: process.env.TMUX_PANE } : {}),
+          ...(process.env.TMUX ? { tmux: process.env.TMUX } : {}),
+          ...(process.env.CLAUDE_CODE_MESSAGING_SOCKET
+            ? { claudeSocket: process.env.CLAUDE_CODE_MESSAGING_SOCKET }
+            : {}),
+        },
       },
-    });
+      { timeoutMs: Math.max(1_000, deadline - Date.now()) },
+    );
     if (!res.stdout && JSON_STDOUT_TOOLS.has(tool)) res.stdout = "{}";
     const envFile = process.env.CLAUDE_ENV_FILE;
     if (res.env && envFile) appendFileSync(envFile, envExports(res.env));

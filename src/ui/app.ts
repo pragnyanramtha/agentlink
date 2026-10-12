@@ -21,7 +21,13 @@ export function squeeze(src: string): string {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith("//"));
-  let out = "";
+  // Linear: chunks are joined once, and only the last two characters written are ever inspected.
+  const out: string[] = [];
+  let tail = "";
+  const put = (s: string) => {
+    out.push(s);
+    tail = (tail + s).slice(-2);
+  };
   for (const line of lines) {
     let i = 0;
     while (i < line.length) {
@@ -29,25 +35,27 @@ export function squeeze(src: string): string {
       if (ch === '"' || ch === "'") {
         let j = i + 1;
         while (j < line.length && line[j] !== ch) j += line[j] === "\\" ? 2 : 1;
-        out += line.slice(i, j + 1);
+        put(line.slice(i, j + 1));
         i = j + 1;
       } else if (ch === " ") {
         let j = i;
         while (line[j] === " ") j++;
-        const prev = out[out.length - 1] ?? "";
+        const prev = tail[tail.length - 1] ?? "";
         const next = line[j] ?? "";
         const sign = (c: string) => c === "+" || c === "-";
         if ((!PUNCT.includes(prev) && !PUNCT.includes(next)) || (sign(prev) && sign(next)))
-          out += " ";
+          put(" ");
         i = j;
       } else {
-        out += ch;
-        i++;
+        let j = i + 1;
+        while (j < line.length && line[j] !== " " && line[j] !== '"' && line[j] !== "'") j++;
+        put(line.slice(i, j));
+        i = j;
       }
     }
-    if (!/(?:[{([,;]|=>|&&|\|\|)$/.test(out)) out += "\n";
+    if (!/(?:[{([,;]|=>|&&|\|\|)$/.test(tail)) put("\n");
   }
-  return out;
+  return out.join("");
 }
 
 // The script reads a few colours and fonts from the sheet: by their short names, as served.

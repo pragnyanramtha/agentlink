@@ -1,9 +1,17 @@
 import { spawn } from "node:child_process";
-import { closeSync, fstatSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { request } from "node:http";
 import { fileURLToPath } from "node:url";
 import type { Paths } from "../core/paths.ts";
-import { ancestry } from "../core/proc.ts";
+import { ancestry, isAlive, procInfo } from "../core/proc.ts";
 import { safeTerminal } from "../core/sanitize.ts";
 
 export class ApiError extends Error {
@@ -189,17 +197,20 @@ export class Client {
       );
     }
     const offset = fileSize(this.paths.log);
-    const child = spawnDaemon(this.paths);
+    // A running daemon that is slow to answer (e.g. a busy disk) is waited for, not started twice.
+    const child = daemonRunning(this.paths) ? undefined : spawnDaemon(this.paths);
     const deadline = Date.now() + (opts.waitMs ?? 6_000);
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 100));
-      const h = await this.health(500);
+      const h = await this.health(Math.max(500, deadline - Date.now()));
       if (h) return h;
-      if (child.exitCode) break; // it gave up (0 means another daemon won the race: keep waiting)
+      if (child?.exitCode) break; // it gave up (0 means another daemon won the race: keep waiting)
     }
     throw new ApiError(
       "daemon_down",
-      startFailure(this.paths, readFrom(this.paths.log, offset), child.exitCode),
+      child
+        ? startFailure(this.paths, readFrom(this.paths.log, offset), child.exitCode)
+        : `the agentlink daemon (pid ${readPid(this.paths)}) is running but did not answer in time (log: ${this.paths.log})`,
       503,
     );
   }
@@ -267,6 +278,21 @@ export function spawnDaemon(paths: Paths): { readonly exitCode: number | null } 
   child.on("error", () => {});
   child.unref();
   return child;
+}
+
+const readPid = (paths: Paths) => {
+  try {
+    return Number(readFileSync(paths.pidFile, "utf8").trim()) || undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Whether daemon.pid names a live daemon process (not a reused pid). */
+function daemonRunning(paths: Paths): boolean {
+  const pid = readPid(paths);
+  const cmd = pid && isAlive(pid) ? (procInfo(pid)?.cmd ?? []) : [];
+  return cmd.some((a) => /(^|[/\\])daemon[/\\]run\.[jt]s$/.test(a));
 }
 
 const fileSize = (path: string) => {

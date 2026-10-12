@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { basename } from "node:path";
 
 export interface RepoInfo {
@@ -34,12 +34,45 @@ export function normalizeRemote(url: string): string {
   return u.toLowerCase();
 }
 
+/** The same as `git`, without blocking the event loop. */
+function gitAsync(cwd: string, args: string[]): Promise<string | undefined> {
+  return new Promise((resolve) => {
+    const child = execFile("git", args, { cwd, encoding: "utf8", timeout: 1_500 }, (error, out) =>
+      resolve(error ? undefined : out.trim()),
+    );
+    child.stdin?.end();
+  });
+}
+
+const TOPLEVEL = ["rev-parse", "--show-toplevel"];
+const DETAILS = [
+  ["remote", "get-url", "origin"],
+  ["rev-parse", "--abbrev-ref", "HEAD"],
+  ["rev-parse", "HEAD"],
+];
+
 export function repoInfo(cwd: string): RepoInfo {
-  const root = git(cwd, ["rev-parse", "--show-toplevel"]);
+  const root = git(cwd, TOPLEVEL);
   if (!root) return { name: basename(cwd) || "root" };
-  const remoteUrl = git(root, ["remote", "get-url", "origin"]);
-  const branch = git(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  const head = git(root, ["rev-parse", "HEAD"]);
+  const [remoteUrl, branch, head] = DETAILS.map((args) => git(root, args));
+  return describeRepo(root, remoteUrl, branch, head);
+}
+
+/** repoInfo for the daemon: its git runs never stall other requests, and run side by side. */
+export async function repoInfoAsync(cwd: string): Promise<RepoInfo> {
+  const [root, remoteUrl, branch, head] = await Promise.all(
+    [TOPLEVEL, ...DETAILS].map((args) => gitAsync(cwd, args)),
+  );
+  if (!root) return { name: basename(cwd) || "root" };
+  return describeRepo(root, remoteUrl, branch, head);
+}
+
+function describeRepo(
+  root: string,
+  remoteUrl: string | undefined,
+  branch: string | undefined,
+  head: string | undefined,
+): RepoInfo {
   return {
     root,
     ...(remoteUrl ? { remote: normalizeRemote(remoteUrl) } : {}),

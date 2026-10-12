@@ -1,20 +1,26 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync, type SQLInputValue } from "node:sqlite";
+import { DatabaseSync, type SQLInputValue, type StatementSync } from "node:sqlite";
 import { MIGRATIONS } from "./migrations.ts";
 
 export type Row = Record<string, SQLInputValue>;
 export type Params = SQLInputValue[];
 
+const STATEMENT_CACHE = 256;
+
 /** Thin synchronous wrapper around node:sqlite with migrations and transactions. */
 export class Store {
   readonly db: DatabaseSync;
   #depth = 0;
+  readonly #stmts = new Map<string, StatementSync>();
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL");
+    // No fsync per commit (each hook commits; on some disks that takes 100s of ms). With WAL this
+    // stays consistent after a crash; a power loss can drop the last few commits.
+    this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.migrate();
@@ -34,20 +40,37 @@ export class Store {
         this.db.prepare("UPDATE schema_version SET version = ?").run(version + 1);
       });
       version += 1;
+      this.#stmts.clear();
     }
     return version;
   }
 
+  /** Prepared statements by SQL text, least recently used first (preparing each query cost CPU and memory). */
+  #prepare(sql: string): StatementSync {
+    let stmt = this.#stmts.get(sql);
+    if (stmt) this.#stmts.delete(sql);
+    else {
+      stmt = this.db.prepare(sql);
+      if (this.#stmts.size >= STATEMENT_CACHE)
+        this.#stmts.delete(this.#stmts.keys().next().value as string);
+    }
+    this.#stmts.set(sql, stmt);
+    return stmt;
+  }
+
   get<T = Row>(sql: string, ...params: Params): T | undefined {
-    return this.db.prepare(sql).get(...params) as T | undefined;
+    return this.#prepare(sql).get(...params) as T | undefined;
   }
 
   all<T = Row>(sql: string, ...params: Params): T[] {
-    return this.db.prepare(sql).all(...params) as T[];
+    return this.#prepare(sql).all(...params) as T[];
   }
 
   run(sql: string, ...params: Params): { changes: number; lastInsertRowid: number } {
-    const r = this.db.prepare(sql).run(...params);
+    // Cached statements keep the columns they were prepared with ("SELECT *"): a schema change drops them.
+    const ddl = /^\s*(ALTER|CREATE|DROP)\b/i.test(sql);
+    const r = (ddl ? this.db.prepare(sql) : this.#prepare(sql)).run(...params);
+    if (ddl) this.#stmts.clear();
     return { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) };
   }
 
@@ -83,6 +106,7 @@ export class Store {
   }
 
   close(): void {
+    this.#stmts.clear();
     this.db.close();
   }
 }

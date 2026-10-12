@@ -80,11 +80,14 @@ async function lookup(socket: Socket, run: SsRunner, share = false): Promise<Loo
     .map((line) => ROW.exec(line.trim()))
     .filter((m) => m && Number(m[2]) === inode);
   // A shared table taken before this connection was accepted lacks it: look again, alone.
-  if (reused && rows.length === 0) return lookup(socket, run);
+  if (reused && rows.length !== 1) return lookup(socket, run);
   if (rows.length !== 1 || !rows[0]) return { table };
   const [, client = "", , procs = ""] = rows[0];
   const holders = ssPids(procs).filter(({ pid, fd }) => fdTarget(pid, fd) === `socket:[${client}]`);
   const pids = new Set(holders.map((p) => p.pid));
+  // `ss -p` maps sockets to processes before it lists them: a connection made during a shared run
+  // can be listed without its process. Look again, alone.
+  if (reused && pids.size !== 1) return lookup(socket, run);
   return {
     table,
     row: { client, procs },
