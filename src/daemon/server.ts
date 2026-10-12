@@ -4,7 +4,7 @@ import { z } from "zod";
 import { loadConfig } from "../core/config.ts";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
 import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
-import { peerPid, stdinIsTty } from "../core/peer.ts";
+import { peerLookupAvailable, peerPid, stdinIsTty } from "../core/peer.ts";
 import { DEFAULT_POLICY, POLICY_ACTIONS, TRUSTS } from "../core/policy.ts";
 import { ancestry, isAlive, procCwd, procInfo } from "../core/proc.ts";
 import { scanSecrets } from "../core/redact.ts";
@@ -856,6 +856,13 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     if (s.trustClientCaller) return claimed;
     const pid = await peerPid(raw.socket);
     if (!pid) {
+      // Where the kernel can name callers, one it cannot name (e.g. a process that made itself
+      // non-dumpable, or one that exited before the lookup) is refused, never taken at its word.
+      if (peerLookupAvailable()) {
+        throw forbidden(
+          "agentlink cannot tell which process is calling (it is hidden from the kernel's socket table); refusing",
+        );
+      }
       if (!warnedUnverified) {
         warnedUnverified = true;
         ctx.log.warn(

@@ -25,16 +25,34 @@ export async function peerPid(socket: Socket): Promise<number | undefined> {
     });
   });
   if (!table) return undefined;
-  // Netid State Recv-Q Send-Q Local Inode Peer PeerInode Process
-  const row = /^\S+\s+\S+\s+\d+\s+\d+\s+\S+\s+\d+\s+\S+\s+(\d+)(?:\s+(.*))?$/;
-  for (const line of table.split("\n")) {
-    const m = row.exec(line.trim());
-    if (m && Number(m[1]) === inode) {
-      const pid = /pid=(\d+)/.exec(m[2] ?? "");
-      return pid ? Number(pid[1]) : undefined;
-    }
+  // Netid State Recv-Q Send-Q Local Inode Peer PeerInode Process: the row whose peer is our end
+  // describes the client's socket. Process names are printed unescaped (one can read `pid=1,fd=1`),
+  // so only pids that really hold the client's socket count, and anything ambiguous is undefined.
+  const row = /^\S+\s+\S+\s+\d+\s+\d+\s+\S+\s+(\d+)\s+\S+\s+(\d+)(?:\s+(.*))?$/;
+  const rows = table
+    .split("\n")
+    .map((line) => row.exec(line.trim()))
+    .filter((m) => m && Number(m[2]) === inode);
+  if (rows.length !== 1 || !rows[0]) return undefined;
+  const [, client, , procs] = rows[0];
+  const pids = new Set(
+    ssPids(procs ?? "")
+      .filter(({ pid, fd }) => fdTarget(pid, fd) === `socket:[${client}]`)
+      .map((p) => p.pid),
+  );
+  return pids.size === 1 ? [...pids][0] : undefined;
+}
+
+/** Every `pid=N,fd=M` in an `ss -p` process column. Names are not escaped, so some may be forged. */
+export const ssPids = (column: string) =>
+  [...column.matchAll(/pid=(\d+),fd=(\d+)/g)].map((m) => ({ pid: Number(m[1]), fd: Number(m[2]) }));
+
+function fdTarget(pid: number, fd: number): string | undefined {
+  try {
+    return readlinkSync(`/proc/${pid}/fd/${fd}`);
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 export const peerLookupAvailable = () => available;
