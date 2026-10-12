@@ -14,6 +14,7 @@ import type { Claims } from "./claims.ts";
 import type { DaemonContext } from "./context.ts";
 import type { OpenCodeBridge } from "./deliverers.ts";
 import type { DeliveryEngine } from "./delivery.ts";
+import type { DaemonEvent } from "./events.ts";
 import { type HookHandler, HookRequestSchema } from "./hooks.ts";
 import type { Mailbox } from "./mailbox.ts";
 import { agentView, isLive, type Registry } from "./registry.ts";
@@ -663,8 +664,15 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       connection: "keep-alive",
     });
     req.res.write(": connected\n\n");
+    // Like the log: an agent sees only events about messages it sent or received.
+    const visible = (event: DaemonEvent): boolean => {
+      if (!req.agent || event.type === "agent" || event.type === "notice") return true;
+      const id = event.type === "message" ? event.message.id : event.delivery.messageId;
+      const message = ctx.store.get<MessageRow>("SELECT * FROM messages WHERE id = ?", String(id));
+      return !!message && takesPart(req.agent, message);
+    };
     const unsubscribe = ctx.events.subscribe((event) => {
-      req.res.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (visible(event)) req.res.write(`data: ${JSON.stringify(event)}\n\n`);
     });
     const ping = setInterval(() => req.res.write(": ping\n\n"), 15_000);
     req.raw.on("close", () => {

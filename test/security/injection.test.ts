@@ -1,7 +1,8 @@
+import { request } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { renderInjection, renderWakeNotice } from "../../src/core/render.ts";
 import type { RemoteRouter } from "../../src/daemon/mailbox.ts";
-import { startTestDaemon, type TestDaemon } from "../helpers.ts";
+import { startTestDaemon, type TestDaemon, until } from "../helpers.ts";
 
 // A teammate controls every field of the envelopes and receipts it sends, except the sender
 // handle (checked against its signing device). None of it may change how an agent reads it.
@@ -184,3 +185,26 @@ describe("teammate receipts", () => {
   });
 });
 
+describe("the event stream", () => {
+  it("does not show an agent other agents' conversations", async () => {
+    const header = Buffer.from(
+      JSON.stringify({ pid: 0, chain: [], tty: false, as: "beta" }),
+    ).toString("base64url");
+    let seen = "";
+    const req = request({
+      socketPath: t.paths.socket,
+      path: "/v1/events",
+      headers: { "x-agentlink-caller": header },
+    });
+    req.on("response", (res) => res.on("data", (c: Buffer) => (seen += c.toString("utf8"))));
+    req.on("error", () => undefined);
+    req.end();
+    await until(() => seen.includes(": connected"));
+    await t.raw("POST", "/v1/messages", { to: ["alpha"], text: "private to alpha" });
+    // Events go out in order: once beta's own message shows, alpha's would have shown before it.
+    await t.raw("POST", "/v1/messages", { to: ["beta"], text: "meant for beta" });
+    await until(() => seen.includes("meant for beta"));
+    req.destroy();
+    expect(seen).not.toContain("private to alpha");
+  });
+});
