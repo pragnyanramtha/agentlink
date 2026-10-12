@@ -1,5 +1,6 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { isIPv6 } from "node:net";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { WebSocket, WebSocketServer } from "ws";
@@ -125,7 +126,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
     }
     return ++b.n <= max;
   };
-  const codeBudget = (ip: string) => budget(`code:${ip}`, 20, 60_000);
+  const codeBudget = (ip: string) => budget(`code:${rateKey(ip)}`, 20, 60_000);
 
   const send = (c: Conn, frame: ServerFrame) => {
     if (c.ws.readyState === WebSocket.OPEN) c.ws.send(JSON.stringify(frame));
@@ -302,7 +303,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
             message: "this relay needs a create token to start a team (team create --create-token)",
           });
         }
-        if (!budget(`create:${c.ip}`, TEAMS_PER_IP_PER_HOUR, 3600_000)) {
+        if (!budget(`create:${rateKey(c.ip)}`, TEAMS_PER_IP_PER_HOUR, 3600_000)) {
           return send(c, {
             t: "error",
             code: "rate",
@@ -677,6 +678,32 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         );
       }),
   };
+}
+
+/**
+ * The key per-IP budgets are counted under: IPv4 (and IPv4-mapped IPv6) per address, other IPv6
+ * per /64, since one subscriber usually controls a whole /64.
+ */
+export function rateKey(ip: string): string {
+  const a = ip.trim().toLowerCase().replace(/%.*$/, "");
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(a);
+  if (mapped) return mapped[1] as string;
+  if (!isIPv6(a)) return ip;
+  let s = a;
+  const v4 = /(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(s);
+  if (v4) {
+    const [b0, b1, b2, b3] = v4.slice(1).map(Number) as [number, number, number, number];
+    s = `${s.slice(0, v4.index)}${((b0 << 8) | b1).toString(16)}:${((b2 << 8) | b3).toString(16)}`;
+  }
+  const [head = "", tail] = s.split("::");
+  const h = head ? head.split(":") : [];
+  const t = tail ? tail.split(":") : [];
+  const groups =
+    tail === undefined ? h : [...h, ...Array<string>(8 - h.length - t.length).fill("0"), ...t];
+  return `${groups
+    .slice(0, 4)
+    .map((g) => Number.parseInt(g, 16).toString(16))
+    .join(":")}::/64`;
 }
 
 function isPrivateAddress(address: string): boolean {

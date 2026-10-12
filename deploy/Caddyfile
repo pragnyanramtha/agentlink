@@ -44,5 +44,7 @@ http://:8080 {
 }
 
 {$AGENTLINK_HOST} {
+	# Clients reach this site directly, so CF-Connecting-IP is theirs to forge; only Cloudflare may set it.
+	request_header -Cf-Connecting-Ip
 	import agentlink
 }
