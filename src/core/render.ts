@@ -9,7 +9,7 @@ export interface RenderItem {
   thread: string;
   kind: Kind;
   from: string;
-  /** Human description of the sender, e.g. `Codex session "codex-api"`. */
+  /** Human description of the sender, e.g. `codex-api (Codex · gpt-5 · ~/work/api · on laptop)`. */
   fromLabel: string;
   trust: Trust;
   sentAt: string;
@@ -102,7 +102,8 @@ function renderOne(raw: RenderItem, maxBodyChars: number): string {
     id: headerField(raw.id),
     thread: headerField(raw.thread),
     from: headerField(raw.from),
-    fromLabel: headerField(raw.fromLabel),
+    // Carries claims (model, session title) from other agents: never a look-alike wrapper tag.
+    fromLabel: neutralize(headerField(raw.fromLabel)),
     sentAt: headerField(raw.sentAt),
     ...(raw.replyTo ? { replyTo: headerField(raw.replyTo) } : {}),
     ...(raw.replyToPreview ? { replyToPreview: headerField(raw.replyToPreview) } : {}),

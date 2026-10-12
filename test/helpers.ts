@@ -34,7 +34,8 @@ export interface TestDaemon {
     event: string,
     payload: Record<string, unknown>,
     agentProc: { pid: number; start?: string },
-    toolBin?: string,
+    /** The agent process's command line (a binary path, or the whole argv). */
+    toolBin?: string | string[],
   ): Promise<T>;
   stop(keepHome?: boolean): Promise<void>;
 }
@@ -122,7 +123,7 @@ export async function startTestDaemon(
         pid: agentProc.pid,
         ppid: 1,
         ...(agentProc.start ? { start: agentProc.start } : {}),
-        cmd: [toolBin ?? `/usr/local/bin/${tool}`],
+        cmd: Array.isArray(toolBin) ? toolBin : [toolBin ?? `/usr/local/bin/${tool}`],
       },
     ];
     const res = await raw("POST", `/v1/hooks/${tool}/${event}`, {

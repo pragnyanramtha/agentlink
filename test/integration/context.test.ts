@@ -61,6 +61,11 @@ beforeAll(async () => {
     });
   }
   claudeProc = t.fakeAgentProcess("claude");
+  await sessionStart();
+  const auto = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents.find(
+    (a) => a.tool === "claude",
+  );
+  await t.client(String(auto?.name)).request("POST", "/v1/agents/rename", { name: "claude" });
 }, 30_000);
 
 afterAll(async () => {

@@ -1,9 +1,22 @@
+import { hostname } from "node:os";
 import { basename } from "node:path";
 import { NAME_RE, slugify } from "../core/addr.ts";
 import { AgentLinkError, invalid, notFound } from "../core/errors.ts";
 import { repoInfo } from "../core/git.ts";
+import {
+  coversQuery,
+  facetsOf,
+  homeShort,
+  identityLine,
+  LIMITS,
+  modelFamily,
+  modelShort,
+  projectName,
+  sessionTag,
+} from "../core/identity.ts";
 import { ulid } from "../core/ids.ts";
-import { isAlive } from "../core/proc.ts";
+import { ancestry, isAlive } from "../core/proc.ts";
+import { safeField } from "../core/sanitize.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import {
@@ -12,6 +25,7 @@ import {
   type CallerInfo,
   type Capabilities,
   parseJson,
+  toolLabel,
 } from "./types.ts";
 
 export interface RegisterInput {
@@ -24,7 +38,14 @@ export interface RegisterInput {
   capabilities?: Capabilities;
   adapter?: Record<string, unknown>;
   state?: AgentState;
+  /** Claims from the hook payload or the agent's command line (display and address hints only). */
+  model?: string;
+  title?: string;
 }
+
+const DEFAULT_BRANCHES = ["main", "master", "HEAD", "trunk", "develop"];
+/** Auto names stay addressable (NAME_RE allows 63 characters) even with a number appended. */
+const clipName = (name: string) => slugify(name, 56);
 
 export const isLive = (a: Pick<AgentRow, "state">) => a.state === "busy" || a.state === "idle";
 
@@ -89,29 +110,40 @@ export class Registry {
     );
   }
 
-  register(input: RegisterInput): { agent: AgentRow; created: boolean; resumed: boolean } {
+  register(raw: RegisterInput): { agent: AgentRow; created: boolean; resumed: boolean } {
     const { store } = this.#ctx;
     const now = iso(this.#ctx.now());
+    const model = safeField(raw.model, LIMITS.model) ?? undefined;
+    const title = safeField(raw.title, LIMITS.title) ?? undefined;
+    const input: RegisterInput = { ...raw, model, title };
     const result = store.tx(() => {
       let existing = input.sessionId ? this.bySession(input.tool, input.sessionId) : undefined;
       if (!existing && input.pid) existing = this.byLivePid(input.tool, input.pid);
       const repo = input.cwd ? repoInfo(input.cwd) : undefined;
+      const project = input.cwd
+        ? (safeField(projectName(repo ?? {}, input.cwd), LIMITS.project) ?? undefined)
+        : undefined;
+      const place = repo?.root ?? input.cwd;
+      const auto = (freeOnly = false) =>
+        this.#autoName(input.tool, project ?? "agent", repo?.branch, place, model, freeOnly);
 
       if (existing) {
         const resumed = !isLive(existing);
-        this.#update(existing, input, repo, now);
+        this.#update(existing, input, repo, project, now);
         if (input.name && input.name !== existing.name) this.rename(existing.id, input.name);
+        else if (!input.name && this.#legacy(existing)) this.#renameAuto(existing, auto(true).name);
         return { id: existing.id, created: false, resumed };
       }
 
-      const chosen = input.name
-        ? this.#claimUserName(input.name)
-        : this.#autoName(
-            input.tool,
-            repo?.name || basename(input.cwd ?? "") || "agent",
-            repo?.branch ?? undefined,
-            repo?.root ?? input.cwd,
-          );
+      let chosen = input.name ? this.#claimUserName(input.name) : auto();
+      if (!input.name && !chosen.takeover) {
+        // Earlier versions named a tool's first session just `codex`: that agent's mail passes
+        // to a new session in the same place, which then gets the new name (the old one stays
+        // an alias).
+        const legacy = this.byName(slugify(input.tool, 16));
+        if (legacy && this.#legacy(legacy) && this.#inheritable(legacy, input.tool, place))
+          chosen = { name: chosen.name, takeover: legacy };
+      }
       if (chosen.takeover) {
         if (!input.pid) {
           // Never keep the previous session's process: it is gone, and a stale pid would make the
@@ -132,14 +164,15 @@ export class Registry {
             chosen.takeover.id,
           );
         }
-        this.#update(chosen.takeover, { ...input, name: undefined }, repo, now, true);
+        this.#update(chosen.takeover, { ...input, name: undefined }, repo, project, now, true);
+        if (chosen.takeover.name !== chosen.name) this.#renameAuto(chosen.takeover, chosen.name);
         return { id: chosen.takeover.id, created: false, resumed: true };
       }
       const id = ulid();
       store.run(
         `INSERT INTO agents (id, name, name_source, tool, session_id, pid, pid_start, cwd, repo_root, repo_remote,
-           branch, state, state_at, capabilities, adapter, created_at, last_seen_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           branch, model, title, project, state, state_at, capabilities, adapter, created_at, last_seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         id,
         chosen.name,
         input.name ? "user" : "auto",
@@ -151,6 +184,9 @@ export class Registry {
         repo?.root ?? null,
         repo?.remote ?? null,
         repo?.branch ?? null,
+        model ?? null,
+        title ?? null,
+        project ?? null,
         input.state ?? "idle",
         now,
         JSON.stringify(input.capabilities ?? {}),
@@ -169,6 +205,7 @@ export class Registry {
     row: AgentRow,
     input: RegisterInput,
     repo: ReturnType<typeof repoInfo> | undefined,
+    project: string | undefined,
     now: string,
     takeover = false,
   ): void {
@@ -177,11 +214,14 @@ export class Registry {
       : { ...parseJson(row.adapter, {}), ...(input.adapter ?? {}) };
     const capabilities = { ...parseJson(row.capabilities, {}), ...(input.capabilities ?? {}) };
     const state = input.state ?? (isLive(row) ? row.state : "idle");
+    // Another session taking over the name brings its own model and title.
+    const keep = (v: string | null) => (takeover ? null : v);
     this.#ctx.store.run(
       `UPDATE agents SET session_id = COALESCE(?, session_id), pid = COALESCE(?, pid),
          pid_start = CASE WHEN ? IS NULL THEN pid_start ELSE ? END,
          cwd = COALESCE(?, cwd), repo_root = COALESCE(?, repo_root), repo_remote = COALESCE(?, repo_remote),
-         branch = COALESCE(?, branch), state = ?, state_at = CASE WHEN state = ? THEN state_at ELSE ? END,
+         branch = COALESCE(?, branch), model = ?, title = ?, project = COALESCE(?, project),
+         state = ?, state_at = CASE WHEN state = ? THEN state_at ELSE ? END,
          capabilities = ?, adapter = ?, last_seen_at = ?, stop_blocks = 0
        WHERE id = ?`,
       input.sessionId ?? null,
@@ -192,6 +232,9 @@ export class Registry {
       repo?.root ?? null,
       repo?.remote ?? null,
       repo?.branch ?? null,
+      input.model ?? keep(row.model),
+      input.title ?? keep(row.title),
+      project ?? null,
       state,
       state,
       now,
@@ -202,59 +245,92 @@ export class Registry {
     );
   }
 
+  /** Model and session title can change mid-session; they never rename the agent. */
+  setIdentity(agentId: string, claims: { model?: string; title?: string }): AgentRow | undefined {
+    const row = this.byId(agentId);
+    if (!row) return undefined;
+    const model = safeField(claims.model, LIMITS.model) ?? row.model;
+    const title = safeField(claims.title, LIMITS.title) ?? row.title;
+    if (model === row.model && title === row.title) return row;
+    this.#ctx.store.run(
+      "UPDATE agents SET model = ?, title = ? WHERE id = ?",
+      model,
+      title,
+      agentId,
+    );
+    const agent = this.byId(agentId) as AgentRow;
+    this.#emit(agent);
+    return agent;
+  }
+
   /**
-   * Names stay short: the first session of a tool is just `codex`. Another live session of the
-   * same tool gets its repo (`codex-api`), then its branch (`codex-api-feat-login`), then a number.
-   * A new session in the same place (git repo, else working directory) takes over an offline
-   * agent's name with the mail waiting for it; an offline agent from elsewhere moves aside to
-   * `<tool>-<its folder>` and keeps its mail, so one project's messages never reach another's.
+   * Names say what and where: `<tool>-<project>` (`codex-api`), never the bare tool name, which
+   * stops meaning anything once a second session starts. Another live session in the same
+   * project adds its branch (`codex-api-feat-login`), then its model family when that tells them
+   * apart (`claude-api-sonnet`), then a number. A new session in the same place (git repo, else
+   * working directory) takes over an offline agent's name with the mail waiting for it; a
+   * session elsewhere never does, so one project's messages never reach another's.
    */
   #autoName(
     tool: string,
-    repoName: string,
+    project: string,
     branch: string | undefined,
     place: string | undefined,
+    model: string | undefined,
+    freeOnly: boolean,
   ): { name: string; takeover?: AgentRow } {
-    const short = slugify(tool, 16);
-    const withRepo = `${short}-${slugify(repoName, 40)}`;
+    const base = clipName(`${slugify(tool, 16)}-${slugify(project, 40)}`);
     const byBranch =
-      branch && !["main", "master", "HEAD", "trunk", "develop"].includes(branch)
-        ? `${withRepo}-${slugify(branch, 24)}`
+      branch && !DEFAULT_BRANCHES.includes(branch)
+        ? clipName(`${base}-${slugify(branch, 24)}`)
         : undefined;
-    const placeOf = (row: AgentRow) => row.repo_root ?? row.cwd ?? undefined;
-    // An offline agent's name (and queued mail) passes only to a session in the same place.
-    // Folder names are not unique (~/work/api, ~/oss/api), and an unknown place never matches.
-    const inheritable = (row: AgentRow) =>
+    const last = byBranch ?? base;
+    const family = model ? modelFamily(model) : undefined;
+    const holder = this.byName(last);
+    const qualified =
+      family && holder && (holder.model ? modelFamily(holder.model) : undefined) !== family
+        ? clipName(`${last}-${slugify(family, 16)}`)
+        : undefined;
+    const numbered = Array.from({ length: 98 }, (_, i) => `${clipName(last)}-${i + 2}`);
+    for (const name of [base, byBranch, qualified, ...numbered]) {
+      if (!name) continue;
+      const row = this.byName(name);
+      if (!row) return { name };
+      if (!freeOnly && this.#inheritable(row, tool, place)) return { name, takeover: row };
+    }
+    return { name: `${clipName(base)}-${ulid().slice(-6).toLowerCase()}` };
+  }
+
+  /**
+   * An offline agent's name (and queued mail) passes only to a session in the same place.
+   * Folder names are not unique (~/work/api, ~/oss/api), and an unknown place never matches.
+   */
+  #inheritable(row: AgentRow, tool: string, place: string | undefined): boolean {
+    return (
       !isLive(row) &&
       row.tool === tool &&
       row.name_source === "auto" &&
       !!place &&
-      placeOf(row) === place;
-    for (const name of [short, withRepo, ...(byBranch ? [byBranch] : [])]) {
-      const row = this.byName(name);
-      if (!row) return { name };
-      if (inheritable(row)) return { name, takeover: row };
-      if (isLive(row) || row.tool !== tool || row.name_source !== "auto" || name !== short)
-        continue;
-      // Deliberately no alias for the vacated name: it now belongs to the new session.
-      const aside = this.#freeName(
-        `${short}-${slugify(basename(placeOf(row) ?? "") || "old", 40)}`,
-      );
-      this.#ctx.store.run("UPDATE agents SET name = ? WHERE id = ?", aside, row.id);
-      this.#ctx.store.run(
-        "UPDATE deliveries SET to_addr = ? WHERE to_agent_id = ? AND state IN ('queued','delivered','held')",
-        aside,
-        row.id,
-      );
-      return { name };
-    }
-    for (let i = 2; i < 100; i++) {
-      const name = `${byBranch ?? withRepo}-${i}`;
-      const row = this.byName(name);
-      if (!row) return { name };
-      if (inheritable(row)) return { name, takeover: row };
-    }
-    return { name: `${withRepo}-${ulid().slice(-6).toLowerCase()}` };
+      (row.repo_root ?? row.cwd ?? undefined) === place
+    );
+  }
+
+  /** Named by an earlier version: just the tool (`codex`). */
+  #legacy(row: AgentRow): boolean {
+    return row.name_source === "auto" && row.name === slugify(row.tool, 16);
+  }
+
+  /** A new automatic name; the old one stays an alias, so addresses people copied still work. */
+  #renameAuto(row: AgentRow, name: string): void {
+    const { store } = this.#ctx;
+    store.run("UPDATE agents SET name = ? WHERE id = ?", name, row.id);
+    store.run("DELETE FROM agent_aliases WHERE name = ?", name);
+    store.run(
+      "INSERT OR REPLACE INTO agent_aliases (name, agent_id, created_at) VALUES (?, ?, ?)",
+      row.name,
+      row.id,
+      iso(this.#ctx.now()),
+    );
   }
 
   #claimUserName(raw: string): { name: string; takeover?: AgentRow } {
@@ -309,10 +385,23 @@ export class Registry {
     return agent;
   }
 
-  #freeName(base: string): string {
-    if (!this.byName(base)) return base;
-    for (let i = 2; i < 100; i++) if (!this.byName(`${base}-${i}`)) return `${base}-${i}`;
-    return `${base}-${ulid().slice(-6).toLowerCase()}`;
+  /** Short tag for the agent's current session (`#3f9a` in peers -l). */
+  tagOf(a: Pick<AgentRow, "id" | "tool" | "session_id">): string {
+    return sessionTag(hostname(), a.tool, a.session_id ?? a.id);
+  }
+
+  /**
+   * Agents whose facets (tool, project, branch, model, host; title words with `withTitle`) cover
+   * `query`. Running agents first: offline ones count only when no running one matches.
+   */
+  byFacets(query: string, opts: { withTitle?: boolean; tag?: string } = {}): AgentRow[] {
+    const all = this.list({ includeOffline: true }).filter(
+      (a) =>
+        (!opts.tag || this.tagOf(a) === opts.tag) &&
+        coversQuery(query, facetsOf({ ...a, host: hostname() }, opts)),
+    );
+    const live = all.filter(isLive);
+    return live.length ? live : all;
   }
 
   /** An agent by its current name, or by a name it had before a rename. */
@@ -492,10 +581,29 @@ export class Registry {
 
 export function agentView(a: AgentRow): Record<string, unknown> {
   const adapter = parseJson<Record<string, unknown>>(a.adapter, {});
+  const host = hostname();
+  const dir = a.cwd ? homeShort(a.cwd) : null;
   return {
     id: a.id,
     name: a.name,
     tool: a.tool,
+    harness: toolLabel(a.tool),
+    model: a.model,
+    modelShort: a.model ? modelShort(a.model) : null,
+    title: a.title,
+    project: a.project,
+    dir,
+    host,
+    tag: sessionTag(host, a.tool, a.session_id ?? a.id),
+    identity: identityLine({
+      name: a.name,
+      harness: toolLabel(a.tool),
+      model: a.model,
+      dir,
+      branch: a.branch,
+      title: a.title,
+      host,
+    }),
     state: a.state,
     stateAt: a.state_at,
     lastSeenAt: a.last_seen_at,

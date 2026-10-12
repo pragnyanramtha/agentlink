@@ -17,6 +17,7 @@ import {
   teamMacOk,
   verifyJson,
 } from "../core/crypto.ts";
+import { LIMITS } from "../core/identity.ts";
 import { ulid } from "../core/ids.ts";
 import { safeField } from "../core/sanitize.ts";
 import {
@@ -56,11 +57,53 @@ export interface RemoteAgent {
   reach?: string;
   /** Host name of the machine it runs on. */
   host?: string;
-  /** Short session tag (last characters of its id on its own machine). */
+  /** Short session tag (a hash of host, tool and session id on its own machine). */
   sid?: string;
   /** Names it had before a rename (still accepted as addresses). */
   aliases?: string[];
+  /** Claims for display and addressing: active model, session title, project (repo name). */
+  model?: string | null;
+  title?: string | null;
+  project?: string | null;
   at: string;
+}
+
+/** Presence comes from another machine: keep only well-formed, bounded, printable fields. */
+export function sanitizeRemoteAgent(
+  raw: unknown,
+  meta: { member: string; deviceId: string; at: string; host?: string | undefined },
+): RemoteAgent | undefined {
+  const a = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  if (typeof a.name !== "string" || !NAME_RE.test(a.name)) return undefined;
+  const reach = safeField(a.reach, 40);
+  return {
+    name: a.name,
+    tool: safeField(a.tool, 32) ?? "unknown",
+    state:
+      typeof a.state === "string" && ["busy", "idle", "offline", "stale"].includes(a.state)
+        ? a.state
+        : "offline",
+    repo: safeField(a.repo, 200),
+    branch: safeField(a.branch, 100),
+    status: safeField(a.status, 200),
+    model: safeField(a.model, LIMITS.model),
+    title: safeField(a.title, LIMITS.title),
+    project: safeField(a.project, LIMITS.project),
+    ...(typeof a.stateAt === "string" ? { stateAt: a.stateAt.slice(0, 40) } : {}),
+    ...(reach ? { reach } : {}),
+    ...(typeof a.sid === "string" && /^[a-z0-9]{1,8}$/.test(a.sid) ? { sid: a.sid } : {}),
+    ...(Array.isArray(a.aliases)
+      ? {
+          aliases: (a.aliases as unknown[])
+            .filter((x): x is string => typeof x === "string" && NAME_RE.test(x))
+            .slice(0, 5),
+        }
+      : {}),
+    member: meta.member,
+    deviceId: meta.deviceId,
+    at: meta.at,
+    ...(meta.host ? { host: meta.host } : {}),
+  };
 }
 
 export type Inbound =
@@ -304,43 +347,17 @@ export class RelayClient {
             teamDecrypt(this.#team.teamKey, frame.box, `presence|${frame.deviceId}`).toString(
               "utf8",
             ),
-          ) as {
-            agents: Omit<RemoteAgent, "member" | "deviceId" | "at">[];
-            host?: string;
-          };
+          ) as { agents?: unknown; host?: unknown };
           const host = safeField(p.host, 64) ?? undefined;
+          const meta = { member: member.handle, deviceId: frame.deviceId, at: frame.at, host };
           this.#presence.set(frame.deviceId, {
             handle: member.handle,
             at: frame.at,
             ...(host ? { host } : {}),
-            // Presence comes from another machine: keep only well-formed, bounded, printable fields.
             agents: (Array.isArray(p.agents) ? p.agents : [])
               .slice(0, 100)
-              .filter((a) => typeof a?.name === "string" && NAME_RE.test(a.name))
-              .map((a) => ({
-                name: a.name,
-                tool: safeField(a.tool, 32) ?? "unknown",
-                state: ["busy", "idle", "offline", "stale"].includes(a.state) ? a.state : "offline",
-                repo: safeField(a.repo, 200),
-                branch: safeField(a.branch, 100),
-                status: safeField(a.status, 200),
-                ...(typeof a.stateAt === "string" ? { stateAt: a.stateAt.slice(0, 40) } : {}),
-                ...(safeField(a.reach, 40) ? { reach: safeField(a.reach, 40) as string } : {}),
-                ...(typeof a.sid === "string" && /^[a-z0-9]{1,8}$/.test(a.sid)
-                  ? { sid: a.sid }
-                  : {}),
-                ...(Array.isArray(a.aliases)
-                  ? {
-                      aliases: (a.aliases as unknown[])
-                        .filter((x): x is string => typeof x === "string" && NAME_RE.test(x))
-                        .slice(0, 5),
-                    }
-                  : {}),
-                member: member.handle,
-                deviceId: frame.deviceId,
-                at: frame.at,
-                ...(host ? { host } : {}),
-              })),
+              .map((a) => sanitizeRemoteAgent(a, meta))
+              .filter((a): a is RemoteAgent => !!a),
           });
           this.onRoster?.();
         } catch {

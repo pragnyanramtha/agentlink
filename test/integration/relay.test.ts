@@ -1,5 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { silentLogger } from "../../src/core/log.ts";
@@ -88,6 +89,42 @@ describe("team relay", () => {
       .request<{ agent: { address: string }; host: string }>("GET", "/v1/whoami");
     expect(who.agent.address).toBe("alice/claude-web");
     expect(who.host).toBe(hostname());
+  });
+
+  it("shares model, title and project (not local paths) and resolves teammates' agents by facet or tag", async () => {
+    const proj = join(bob.home, "proj");
+    mkdirSync(proj, { recursive: true });
+    execFileSync("git", ["init", "-q", proj]);
+    const p = bob.fakeAgentProcess("codex");
+    await bob.hook(
+      "codex",
+      "session-start",
+      { session_id: "b-codex", cwd: proj, model: "gpt-5.1-codex", session_title: "ship v2" },
+      p,
+    );
+    const seen = await until(async () => {
+      const r = await alice.client().request<{ agents: Json[] }>("GET", "/v1/agents");
+      return r.agents.find((a) => a.name === "bob/codex-proj" && a.title === "ship v2");
+    }, 8_000);
+    expect(seen).toMatchObject({
+      model: "gpt-5.1-codex",
+      project: "proj",
+      harness: "Codex",
+      identity: `bob/codex-proj · Codex · gpt-5.1-codex · proj · "ship v2" · ${hostname()}`,
+    });
+    expect(JSON.stringify(seen)).not.toContain(bob.home); // no absolute paths leave bob's machine
+    const send = (to: string) =>
+      alice.raw<SendRes>("POST", "/v1/messages", { to: [to], text: "hi" }, { as: "claude-web" });
+    expect((await send("bob/gpt-5")).data.deliveries[0]?.to).toBe("bob/codex-proj");
+    expect((await send("bob/codex")).data.deliveries[0]?.to).toBe("bob/codex-proj");
+    expect((await send(`bob/codex#${seen?.tag}`)).data.deliveries[0]?.to).toBe("bob/codex-proj");
+    expect((await send(`#${seen?.tag}`)).data.deliveries[0]?.to).toBe("bob/codex-proj");
+    const none = await send("bob/opus");
+    expect(none.status).toBe(404);
+    expect(JSON.stringify(none.data)).toContain("codex-proj");
+    // bare facets never pick an agent on another machine
+    expect((await send("gpt-5")).status).toBe(404);
+    p.kill();
   });
 
   it("both members see each other with fingerprints; invites are single-use", async () => {

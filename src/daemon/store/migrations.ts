@@ -142,4 +142,10 @@ export const MIGRATIONS: string[] = [
   `
   CREATE INDEX messages_created ON messages(created_at);
   `,
+  // 6: who an agent is, for people and addresses (claims from hooks; never identity)
+  `
+  ALTER TABLE agents ADD COLUMN model TEXT;              -- active model, e.g. claude-opus-4-5
+  ALTER TABLE agents ADD COLUMN title TEXT;              -- the session's custom title (/rename)
+  ALTER TABLE agents ADD COLUMN project TEXT;            -- git remote's repo name, else folder name
+  `,
 ];

@@ -38,6 +38,7 @@ export interface Overview {
 interface AgentRow {
   name: string;
   state: string;
+  modelShort?: string | null;
   status?: string | null;
   local?: boolean;
   member?: string;
@@ -103,7 +104,7 @@ export function overviewText(
     const machine = remoteAgent ? (a.member ?? a.name.split("/")[0] ?? "?") : ov.handle;
     const name = remoteAgent ? a.name.slice(machine.length + 1) || a.name : a.name;
     const dot = a.state === "busy" ? c.yellow("●") : a.state === "idle" ? c.green("○") : c.dim("○");
-    const label = `${dot} ${a.state === "busy" || a.state === "idle" ? c.bold(name) : c.dim(name)}`;
+    const label = `${dot} ${a.state === "busy" || a.state === "idle" ? c.bold(name) : c.dim(name)}${a.modelShort ? c.dim(` ${a.modelShort}`) : ""}`;
     const list = machines.get(machine) ?? [];
     list.push(a.status ? `${label} ${c.dim(`(${clip(a.status, 32)})`)}` : label);
     machines.set(machine, list);

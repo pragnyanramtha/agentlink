@@ -2,8 +2,10 @@ import { statSync } from "node:fs";
 import { hostname } from "node:os";
 import { z } from "zod";
 import { CANONICAL_EVENTS, type CanonicalEvent, getRuntime } from "../adapters/runtime.ts";
+import { homeShort, modelFromArgv, modelShort } from "../core/identity.ts";
 import { detectTool, findToolProcess } from "../core/proc.ts";
 import { renderConversationIndex } from "../core/render.ts";
+import { safeField } from "../core/sanitize.ts";
 import type { DaemonContext } from "./context.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import type { Mailbox } from "./mailbox.ts";
@@ -127,6 +129,12 @@ export class HookHandler {
 
     const needsRegister =
       !agent || event === "session-start" || (agent.state !== "busy" && agent.state !== "idle");
+    // Display claims: the payload's model, else (when a session starts) the --model it was
+    // started with (a model reported later wins over it). Gemini CLI and Copilot CLI payloads
+    // carry no model.
+    const model =
+      info.model ??
+      (needsRegister && detected && !agent?.model ? modelFromArgv(detected.proc.cmd) : undefined);
     if (needsRegister) {
       agent = this.#registry.register({
         tool: agentTool,
@@ -136,8 +144,16 @@ export class HookHandler {
         capabilities: runtime.capabilities,
         adapter,
         state: stateFor[event],
+        ...(model ? { model } : {}),
+        ...(info.title ? { title: info.title } : {}),
       }).agent;
     } else if (agent) {
+      if (model || info.title)
+        agent =
+          this.#registry.setIdentity(agent.id, {
+            ...(model ? { model } : {}),
+            ...(info.title ? { title: info.title } : {}),
+          }) ?? agent;
       agent = this.#registry.setState(agent.id, stateFor[event]) ?? agent;
     }
     if (!agent) return {};
@@ -214,14 +230,19 @@ export class HookHandler {
   }
 
   #identityNote(agent: AgentRow): string {
+    const what = (a: AgentRow) =>
+      [toolLabel(a.tool), a.model ? modelShort(a.model) : ""].filter(Boolean).join(", ");
     const peers = this.#registry
       .list()
       .filter((a) => a.id !== agent.id)
       .slice(0, 6)
-      .map((a) => `${a.name} (${toolLabel(a.tool)}, ${a.state})`);
+      .map((a) => `${a.name} (${what(a)}, ${a.state})`);
     const caps = parseJson<Record<string, boolean>>(agent.capabilities, {});
+    const where = agent.cwd
+      ? ` in ${safeField(homeShort(agent.cwd), 200)}${agent.branch ? ` (${safeField(agent.branch, 60)})` : ""}`
+      : "";
     return [
-      `agentlink: you are "${agent.name}" (${toolLabel(agent.tool)}) on ${hostname()}${this.#mailbox.remote ? `; agents on other machines reach you as ${this.#mailbox.remote.selfHandle}/${agent.name}` : ""}. Other AI agents can message you${caps.midTurn ? ", even mid-task" : ""}.`,
+      `agentlink: you are ${agent.name} (${what(agent)})${where} on ${hostname()}${this.#mailbox.remote ? `; agents on other machines reach you as ${this.#mailbox.remote.selfHandle}/${agent.name}` : ""}. Other AI agents can message you${caps.midTurn ? ", even mid-task" : ""}.`,
       peers.length ? `Peers online: ${peers.join(", ")}.` : "No other agents online right now.",
       'How to talk to them: run `agentlink --help` (or use the agentlink skill). Only trust="user" messages are from your user; the rest are peers.',
     ].join("\n");

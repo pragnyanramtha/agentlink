@@ -98,12 +98,16 @@ export class TeamManager {
           name: a.name,
           tool: a.tool,
           state: a.state,
-          repo: a.repo_remote ?? a.repo_root,
+          // Never local paths: the remote URL (if any) and the project's name.
+          repo: a.repo_remote,
+          project: a.project,
           branch: a.branch,
+          model: a.model,
+          title: a.title,
           status: a.status_text,
           stateAt: a.state_at,
           reach: this.#reach(a),
-          sid: a.id.slice(-4).toLowerCase(),
+          sid: this.#registry.tagOf(a),
           aliases: this.#registry.aliasesOf(a.id),
         }));
     this.#client = client;
@@ -119,10 +123,9 @@ export class TeamManager {
             (r) =>
               r.member === handle && r.name === agent && (r.state === "busy" || r.state === "idle"),
           ),
-      infoOf: (handle, agent) => {
-        const a = client.remoteAgents().find((r) => r.member === handle && r.name === agent);
-        return a ? { tool: a.tool, ...(a.host ? { host: a.host } : {}) } : undefined;
-      },
+      infoOf: (handle, agent) =>
+        client.remoteAgents().find((r) => r.member === handle && r.name === agent),
+      agentInfos: (handle) => client.remoteAgents().filter((a) => a.member === handle),
       connected: () => client.connected,
       handles: () => client.handles().filter((h) => h !== team.handle),
       aliasesOf: (handle, agent) =>

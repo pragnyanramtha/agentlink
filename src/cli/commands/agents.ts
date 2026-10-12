@@ -3,10 +3,21 @@ import { toolLabel } from "../../daemon/types.ts";
 import { type Command, out, parse, parseDuration, UsageError } from "../args.ts";
 import { ago, c, stateColor, table } from "../format.ts";
 
-interface AgentView {
+export interface AgentView {
   id: string;
   name: string;
   tool: string;
+  harness?: string;
+  model?: string | null;
+  modelShort?: string | null;
+  title?: string | null;
+  project?: string | null;
+  /** Working directory (home as ~) here, project name for teammates' agents. */
+  dir?: string | null;
+  host?: string | null;
+  tag?: string | null;
+  /** `claude-api · Claude Code · opus-4.5 · ~/work/api (feat-login) · "fix login" · laptop` */
+  identity?: string;
   state: string;
   stateAt: string;
   lastSeenAt: string;
@@ -45,7 +56,7 @@ export const whoami: Command = async (ctx) => {
   out(ctx, res, () =>
     res.agent
       ? [
-          `${c.bold(res.agent.name)} (${toolLabel(res.agent.tool)}, ${stateColor(res.agent.state)}) on ${c.bold(res.host)}${paused}`,
+          `${identityText(res.agent, res.host)} (${stateColor(res.agent.state)})${paused}`,
           c.dim(
             res.team
               ? `  agents on other machines in team ${res.team} reach it as ${res.agent.address}`
@@ -56,6 +67,12 @@ export const whoami: Command = async (ctx) => {
   );
   return 0;
 };
+
+/** The identity line with the name in bold (older daemons send no identity). */
+export function identityText(a: AgentView, host: string): string {
+  const line = a.identity ?? `${a.name} · ${toolLabel(a.tool)} · ${host}`;
+  return line.startsWith(a.name) ? c.bold(a.name) + line.slice(a.name.length) : line;
+}
 
 export const peers: Command = async (ctx) => {
   const { values } = parse(ctx.argv, {
@@ -73,56 +90,80 @@ export const peers: Command = async (ctx) => {
   const banner = res.paused
     ? `${c.yellow("⏸ agentlink is PAUSED: messages are queued, not delivered (agentlink resume)")}\n`
     : "";
-  out(ctx, res, () => banner + listing());
+  out(
+    ctx,
+    res,
+    () =>
+      banner +
+      peersText(res.agents, {
+        all: !!values.all,
+        long: !!(values.long || ctx.verbose),
+        team: !!res.team,
+        ...(who.agent ? { you: who.agent.id } : {}),
+      }),
+  );
   return 0;
+};
 
-  function listing(): string {
-    if (res.agents.length === 0) {
-      return c.dim(
-        values.all
-          ? "No agents yet. Start an agent after `agentlink install`, or run `agentlink register` inside one."
-          : "No agents online. (agentlink peers --all shows offline ones.)",
-      );
-    }
-    // In a team, every row shows the full address, so names mean the same on every machine.
-    const team = res.agents.some((a) => (a as { local?: boolean }).local === false) || !!res.team;
-    const nameOf = (a: AgentView) =>
-      team ? ((a as { address?: string }).address ?? a.name) : a.name;
-    if (!values.long && !ctx.verbose) {
-      // Short by default: who, state, what they do (and where, for other repos). -l shows everything.
-      return table(
-        res.agents.map((a) => [
-          c.bold(nameOf(a)) + (who.agent?.id === a.id ? c.dim(" (you)") : ""),
-          stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
-          a.status || c.dim(shortRepo(a.repo)),
-        ]),
-        ["NAME", "STATE", "DOING"],
-      );
-    }
-    return table(
-      res.agents.map((a) => [
-        c.bold(nameOf(a)) +
-          c.dim(
-            (a as { local?: boolean }).local === false
-              ? (a as { sid?: string | null }).sid
-                ? ` #${(a as { sid?: string | null }).sid}`
-                : ""
-              : ` #${a.id.slice(-4).toLowerCase()}`,
-          ) +
-          (who.agent?.id === a.id ? c.dim(" (you)") : ""),
-        (a as { host?: string | null }).host ?? "-",
-        a.tool,
-        stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
-        reach(a),
-        shortRepo(a.repo),
-        a.branch ?? "-",
-        a.status ?? "",
-        c.dim(ago(a.state === "busy" || a.state === "idle" ? a.stateAt : a.lastSeenAt)),
-      ]),
-      ["NAME", "HOST", "TOOL", "STATE", "REACH", "REPO", "BRANCH", "DOING", "SINCE"],
+/** The peers table: who each agent is and what it is doing. */
+export function peersText(
+  agents: AgentView[],
+  opts: { all?: boolean; long?: boolean; team?: boolean; you?: string },
+): string {
+  if (agents.length === 0) {
+    return c.dim(
+      opts.all
+        ? "No agents yet. Start an agent after `agentlink install`, or run `agentlink register` inside one."
+        : "No agents online. (agentlink peers --all shows offline ones.)",
     );
   }
-};
+  // In a team, every row shows the full address, so names mean the same on every machine.
+  const team = agents.some((a) => a.local === false) || !!opts.team;
+  const nameOf = (a: AgentView) =>
+    team ? ((a as { address?: string }).address ?? a.name) : a.name;
+  const long = !!opts.long;
+  const doing = agents.some((a) => a.status);
+  // Harness, model, where, session title and machine; -l adds the session tag (only needed to
+  // tell otherwise identical sessions apart), reach and since.
+  return table(
+    agents.map((a) => [
+      c.bold(nameOf(a)) +
+        (long && a.tag ? c.dim(` #${a.tag}`) : "") +
+        (opts.you === a.id ? c.dim(" (you)") : ""),
+      a.harness ?? toolLabel(a.tool),
+      a.modelShort ?? c.dim("-"),
+      place(a),
+      a.title ?? c.dim("-"),
+      a.host ?? "-",
+      stateColor(a.state) + (a.muted ? c.red(" muted") : ""),
+      ...(long
+        ? [
+            reach(a),
+            c.dim(ago(a.state === "busy" || a.state === "idle" ? a.stateAt : a.lastSeenAt)),
+          ]
+        : []),
+      ...(doing ? [a.status ?? ""] : []),
+    ]),
+    [
+      "NAME",
+      "HARNESS",
+      "MODEL",
+      "PROJECT/DIR",
+      "SESSION",
+      "HOST",
+      "STATE",
+      ...(long ? ["REACH", "SINCE"] : []),
+      ...(doing ? ["DOING"] : []),
+    ],
+  );
+}
+
+/** `~/work/api (feat-login)` here; `api (feat-login)` for teammates' agents. */
+function place(a: AgentView): string {
+  const where = a.dir ?? (a.repo ? shortRepo(a.repo) : null);
+  if (!where) return a.branch ? `(${a.branch})` : c.dim("-");
+  return a.branch ? `${where} ${c.dim(`(${a.branch})`)}` : where;
+}
 
 export const name: Command = async (ctx) => {
   const { values, positionals } = parse(ctx.argv, { agent: { type: "string" } });

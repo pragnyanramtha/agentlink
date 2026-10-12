@@ -21,6 +21,9 @@ export interface HookInfo {
   toolInput?: unknown;
   transcriptPath?: string;
   source?: string;
+  /** Claims for display: the active model and the session's custom title. */
+  model?: string;
+  title?: string;
 }
 
 /** How agentlink talks to one CLI's hook system at runtime (what the installers wire up). */
@@ -70,7 +73,14 @@ function genericParse(p: Record<string, unknown>): HookInfo {
     firstString(p, ["tool_name", "toolName"]) ??
     str((p.toolCall as Record<string, unknown> | undefined)?.name);
   const source = str(p.source);
+  // Verified: Claude Code (SessionStart `model`; SessionStart/UserPromptSubmit `session_title`),
+  // Codex and Cursor (`model` on every event), the OpenCode plugin (both). Never a bare `title`:
+  // that is a notification's title (Claude Notification).
+  const model = str(p.model);
+  const title = str(p.session_title);
   return {
+    ...(model ? { model } : {}),
+    ...(title ? { title } : {}),
     ...(sessionId ? { sessionId } : {}),
     ...(cwd ? { cwd } : {}),
     ...(p.stop_hook_active === true ? { stopHookActive: true } : {}),

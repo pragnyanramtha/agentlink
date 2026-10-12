@@ -163,7 +163,7 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
     {
       title: "List agents",
       description:
-        "List other AI agents you can message: name, tool, state (busy/idle/offline), repo, branch and what they are doing.",
+        "List other AI agents you can message: name, harness, model, folder (branch), session title, host, state (busy/idle/offline) and what they are doing. Besides exact names, a unique match on those words works as an address (e.g. opus, codex-api, alice/gpt-5).",
       inputSchema: { include_offline: z.boolean().optional().describe("Also list offline agents") },
     },
     guard(async ({ include_offline }) => {
@@ -178,16 +178,20 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
       if (others.length === 0) return ok("No other agents are online.");
       return ok(
         others
-          .map((a) =>
-            [
-              `${res.team ? (a.address ?? a.name) : a.name} (${a.tool}, ${a.state}${a.host ? `, on ${a.host}` : ""})`,
-              a.repo ? `repo ${a.repo}` : "",
-              a.branch ? `branch ${a.branch}` : "",
+          .map((a) => {
+            const name = String(res.team ? (a.address ?? a.name) : a.name);
+            // identity: name · harness · model · dir (branch) · "session title" · host
+            const identity = typeof a.identity === "string" ? a.identity : `${name} · ${a.tool}`;
+            return [
+              res.team && !identity.startsWith(name)
+                ? `${name}${identity.slice(String(a.name).length)}`
+                : identity,
+              String(a.state),
               a.status ? `doing: ${a.status}` : "",
             ]
               .filter(Boolean)
-              .join(" · "),
-          )
+              .join(" · ");
+          })
           .join("\n"),
       );
     }),
@@ -354,13 +358,13 @@ export function createMcpServer(opts: { paths: Paths; as?: string }): McpServer 
     },
     guard(async () => {
       const res = await call<{
-        agent: { name: string; tool: string; address?: string } | null;
+        agent: { name: string; tool: string; address?: string; identity?: string } | null;
         host: string;
         team: string | null;
       }>("GET", "/v1/whoami");
       if (!res.agent) return ok(`Not registered as an agent (host ${res.host}).`);
       return ok(
-        `You are ${res.agent.name} (${res.agent.tool}) on ${res.host}.${
+        `You are ${res.agent.identity ?? `${res.agent.name} (${res.agent.tool}) on ${res.host}`}.${
           res.team
             ? ` Agents on other machines in team ${res.team} reach you as ${res.agent.address}.`
             : ""

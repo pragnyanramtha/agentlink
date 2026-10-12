@@ -26,6 +26,9 @@ export interface AgentRow {
   repo_root: string | null;
   repo_remote: string | null;
   branch: string | null;
+  model: string | null;
+  title: string | null;
+  project: string | null;
   state: AgentState;
   state_at: string;
   capabilities: string;

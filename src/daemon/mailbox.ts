@@ -1,3 +1,4 @@
+import { hostname } from "node:os";
 import { formatAddr, parseAddress } from "../core/addr.ts";
 import {
   type AckValue,
@@ -15,6 +16,7 @@ import {
   textOf,
 } from "../core/envelope.ts";
 import { AgentLinkError, invalid, limited, notFound } from "../core/errors.ts";
+import { coversQuery, facetsOf, fromLabelOf, homeShort, identityLine } from "../core/identity.ts";
 import { partsHaveInvite } from "../core/invite-code.ts";
 import { echoKey, LIMITS } from "../core/limits.ts";
 import {
@@ -29,6 +31,7 @@ import { safeField } from "../core/sanitize.ts";
 import { didYouMean } from "../core/suggest.ts";
 import { type DaemonContext, iso } from "./context.ts";
 import { isLive, type Registry } from "./registry.ts";
+import type { RemoteAgent } from "./relay-client.ts";
 import { ensureSearchIndex, searchDoc } from "./store/search.ts";
 import {
   type AgentRow,
@@ -133,8 +136,10 @@ export interface RemoteRouter {
   agentOnline(handle: string, agent: string): boolean;
   /** Current name of a teammate's agent that used to be called `agent`. */
   aliasesOf(handle: string, agent: string): string | undefined;
-  /** Tool and host of a teammate's agent, from presence. */
-  infoOf(handle: string, agent: string): { tool?: string; host?: string } | undefined;
+  /** What a teammate's agent says it is (tool, host, model, title, project), from presence. */
+  infoOf(handle: string, agent: string): RemoteInfo | undefined;
+  /** All of a teammate's agents from presence (for facet and tag addresses). */
+  agentInfos(handle: string): RemoteInfo[];
   connected(): boolean;
   handles(): string[];
   agentsOf(handle: string): string[];
@@ -144,6 +149,11 @@ export interface RemoteRouter {
     receipt: { messageId: string; to: string; state: string; note?: string },
   ): void;
 }
+
+export type RemoteInfo = Pick<
+  RemoteAgent,
+  "name" | "tool" | "state" | "host" | "model" | "title" | "project" | "branch" | "sid"
+>;
 
 const UNREAD: DeliveryState[] = ["queued", "delivered"];
 
@@ -253,26 +263,75 @@ export class Mailbox {
   }
 
   /**
-   * Addresses copied from peers may carry a session tag: "claude-web #7f3a" or "alice/codex-api#c01d"
-   * (the tag is dropped), or be just "#7f3a" (an agent on this machine).
+   * Addresses copied from peers may carry a session tag: "claude #7f3a", "alice/codex#c01d", or
+   * be just "#7f3a". The tag picks among the agents the rest matches; an exact name wins anyway.
    */
-  #fromTag(input: string): string {
+  #fromTag(input: string): { addr: string; tag?: string } {
     const m = /^\s*(\S*?)\s*#([a-z0-9]{1,8})\s*$/i.exec(input);
-    if (!m) return input;
-    const [, name, tag] = m as unknown as [string, string, string];
-    const t = tag.toLowerCase();
+    if (!m) return { addr: input };
+    const [, name, raw] = m as unknown as [string, string, string];
+    const tag = raw.toLowerCase();
+    if (name) return { addr: name, tag };
     const local = this.#registry
       .list({ includeOffline: true })
-      .find((a) => a.id.toLowerCase().endsWith(t));
-    if (!name) {
-      if (local) return local.name;
-      throw new AgentLinkError(
-        "not_found",
-        `no agent with session tag #${t}; see: agentlink peers`,
-        404,
+      .filter((a) => this.#registry.tagOf(a) === tag);
+    const remote = (this.remote?.handles() ?? []).flatMap((h) =>
+      (this.remote?.agentInfos(h) ?? []).filter((a) => a.sid === tag).map((a) => `${h}/${a.name}`),
+    );
+    const all = [...local.map((a) => a.name), ...remote];
+    if (all.length === 1) return { addr: all[0] as string };
+    if (all.length > 1)
+      throw invalid(`#${tag} matches several agents; use one of: ${all.join(", ")}`);
+    throw new AgentLinkError(
+      "not_found",
+      `no agent with session tag #${tag}; see: agentlink peers`,
+      404,
+    );
+  }
+
+  /** One running match (else one offline match), or a clear error listing who matches. */
+  #pick<T extends { state?: string }>(
+    query: string,
+    found: T[],
+    describe: (a: T) => string,
+  ): T | undefined {
+    const live = found.filter((a) => a.state === "busy" || a.state === "idle");
+    const pool = live.length ? live : found;
+    if (pool.length > 1) {
+      throw invalid(
+        `"${query}" matches ${pool.length} agents; use a full name: ${pool.slice(0, 8).map(describe).join("; ")}`,
       );
     }
-    return name;
+    return pool[0];
+  }
+
+  #describeLocal(a: AgentRow): string {
+    return identityLine({
+      name: a.name,
+      harness: toolLabel(a.tool),
+      model: a.model,
+      dir: a.cwd ? homeShort(a.cwd) : a.project,
+      branch: a.branch,
+    });
+  }
+
+  /** A teammate's agent by facets of its presence (model, project, …); title words last. */
+  #remoteByFacets(member: string, query: string, tag?: string): string | undefined {
+    const infos = (this.remote?.agentInfos(member) ?? []).filter((a) => !tag || a.sid === tag);
+    const describe = (a: RemoteInfo) =>
+      identityLine({
+        name: `${member}/${a.name}`,
+        harness: toolLabel(a.tool),
+        model: a.model ?? null,
+        dir: a.project ?? null,
+        branch: a.branch ?? null,
+        host: a.host ?? null,
+      });
+    for (const withTitle of [false, true]) {
+      const found = infos.filter((a) => coversQuery(query, facetsOf(a, { withTitle })));
+      if (found.length) return this.#pick(`${member}/${query}`, found, describe)?.name;
+    }
+    return undefined;
   }
 
   #noSuchAgent(name: string): AgentLinkError {
@@ -303,7 +362,7 @@ export class Mailbox {
       toAddr: agent.name,
       agent,
     });
-    const remoteRecipient = (member: string, agent?: string): Recipient => {
+    const remoteRecipient = (member: string, agent?: string, tag?: string): Recipient => {
       const remote = this.remote;
       if (!remote) throw teamNotReady(agent ? `${member}/${agent}` : `@${member}`);
       if (!remote.handles().includes(member)) {
@@ -314,9 +373,10 @@ export class Mailbox {
         );
       }
       // Presence lists a teammate's agents; catch typos before anything waits on them.
+      // Exact names and aliases first, then facets of what they say they are ("alice/opus").
       const theirs = remote.agentsOf(member);
       if (agent && !theirs.includes(agent)) {
-        const renamed = remote.aliasesOf(member, agent);
+        const renamed = remote.aliasesOf(member, agent) ?? this.#remoteByFacets(member, agent, tag);
         if (renamed) agent = renamed;
       }
       if (agent && theirs.length > 0 && !theirs.includes(agent)) {
@@ -350,25 +410,39 @@ export class Mailbox {
       } else throw invalid(`cannot route a reply to ${original.from_addr}`);
     }
 
+    // A local agent by exact name or alias, else by facets ("opus", "codex-api"); title words
+    // count only after teammates' exact names, so a session title can't take someone's address.
+    const localAgent = (name: string, tag?: string, beforeTitles?: () => boolean) => {
+      const found = this.#registry.resolveName(name)?.agent;
+      if (found) return found;
+      for (const withTitle of [false, true]) {
+        if (withTitle && beforeTitles?.()) return undefined;
+        const facets = this.#registry.byFacets(name, { withTitle, ...(tag ? { tag } : {}) });
+        const one = this.#pick(name, facets, (a) => this.#describeLocal(a));
+        if (one) return one;
+      }
+      return undefined;
+    };
+
     for (const input of to) {
-      const raw = this.#fromTag(input);
+      const { addr: raw, tag } = this.#fromTag(input);
       const spec = parseAddress(raw);
       switch (spec.kind) {
         case "name": {
-          const found = this.#registry.resolveName(spec.name);
-          if (found) {
-            out.push(agentRecipient(this.#registry.refreshLiveness(found.agent)));
-            break;
-          }
-          if (spec.name === this.handle) {
+          if (spec.name === this.handle && !this.#registry.resolveName(spec.name)) {
             out.push(humanRecipient());
             break;
           }
-          // A bare name can also mean a teammate's agent, when it is unambiguous.
-          const owners = (this.remote?.handles() ?? []).filter((h) =>
-            this.remote?.agentsOf(h).includes(spec.name),
-          );
-          if (owners.length === 1) out.push(remoteRecipient(owners[0] as string, spec.name));
+          // A bare name can also mean a teammate's agent (exact name only), when unambiguous.
+          let owners: string[] = [];
+          const found = localAgent(spec.name, tag, () => {
+            owners = (this.remote?.handles() ?? []).filter((h) =>
+              this.remote?.agentsOf(h).includes(spec.name),
+            );
+            return owners.length > 0;
+          });
+          if (found) out.push(agentRecipient(this.#registry.refreshLiveness(found)));
+          else if (owners.length === 1) out.push(remoteRecipient(owners[0] as string, spec.name));
           else if (owners.length > 1) {
             throw invalid(
               `"${spec.name}" is ambiguous; use one of: ${owners.map((h) => `${h}/${spec.name}`).join(", ")}`,
@@ -382,12 +456,12 @@ export class Mailbox {
           break;
         case "member-agent": {
           if (spec.member !== this.handle) {
-            out.push(remoteRecipient(spec.member, spec.agent));
+            out.push(remoteRecipient(spec.member, spec.agent, tag));
             break;
           }
-          const found = this.#registry.resolveName(spec.agent);
+          const found = localAgent(spec.agent, tag);
           if (!found) throw this.#noSuchAgent(spec.agent);
-          out.push(agentRecipient(this.#registry.refreshLiveness(found.agent)));
+          out.push(agentRecipient(this.#registry.refreshLiveness(found)));
           break;
         }
         case "repo": {
@@ -1223,15 +1297,33 @@ export class Mailbox {
       !author && env.from.role === "agent" && env.from.agent
         ? this.remote?.infoOf(env.from.member, env.from.agent)
         : undefined;
-    // Short labels: "codex (Codex)", "alice/claude (Claude Code on alice-laptop)", "@alice".
+    // Who is writing: "codex-api (Codex · gpt-5 · ~/work/api · on laptop)",
+    // "alice/claude-web (Claude Code · opus-4.5 · web · 'fix login' · on alice-laptop)", "@alice".
+    // Model, title and project are the sender's claims: shown, never trusted.
     const fromLabel = author
-      ? `${author.name} (${toolLabel(author.tool)})`
+      ? fromLabelOf({
+          name: author.name,
+          harness: toolLabel(author.tool),
+          model: author.model,
+          dir: author.cwd ? homeShort(author.cwd) : author.project,
+          branch: author.branch,
+          title: author.title,
+          host: hostname(),
+        })
       : env.from.role === "system"
         ? "agentlink"
         : env.from.role === "human"
           ? `@${env.from.member}`
           : remoteInfo
-            ? `${env.from.member}/${env.from.agent} (${[remoteInfo.tool ? toolLabel(remoteInfo.tool) : "", remoteInfo.host ? `on ${remoteInfo.host}` : ""].filter(Boolean).join(" ") || "agent"})`
+            ? fromLabelOf({
+                name: `${env.from.member}/${env.from.agent}`,
+                harness: toolLabel(remoteInfo.tool),
+                model: remoteInfo.model ?? null,
+                dir: remoteInfo.project ?? null,
+                branch: remoteInfo.branch ?? null,
+                title: remoteInfo.title ?? null,
+                host: remoteInfo.host ?? null,
+              })
             : formatAddr(env.from, this.handle);
     const attachments = env.parts
       .map((p, i) => ({ p, i }))

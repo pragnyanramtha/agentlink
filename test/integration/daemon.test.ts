@@ -1,6 +1,8 @@
-import { existsSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { hostname } from "node:os";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { sessionTag } from "../../src/core/identity.ts";
 import { sleep, startTestDaemon, type TestDaemon, until } from "../helpers.ts";
 
 type Json = Record<string, unknown>;
@@ -61,7 +63,7 @@ describe("registry & presence", () => {
     expect(offline).toBeTruthy();
   });
 
-  it("names agents after their tool, adds the repo for a second session, and takes over offline names", async () => {
+  it("names agents <tool>-<project>, numbers a second session, and takes over offline names", async () => {
     const a = t.fakeAgentProcess("codex");
     const first = await t.hook<Json>(
       "codex",
@@ -72,15 +74,15 @@ describe("registry & presence", () => {
     expect(first.stdout).toContain("agentlink: you are");
     const agents1 = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents;
     const name = String(agents1[0]?.name);
-    expect(name).toBe("codex");
-    // a second live codex session gets the repo in its name
+    // never the bare tool name: that would be ambiguous as soon as a second session starts
+    expect(name).toBe(`codex-${basename(t.home).toLowerCase()}`);
+    // a second live codex session in the same place gets a number
     const other = t.fakeAgentProcess("codex");
     await t.hook("codex", "session-start", { session_id: "s-other", cwd: t.home }, other);
     const both = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents.map(
       (x) => x.name,
     );
-    expect(both).toContain("codex");
-    expect(both.some((n) => String(n).startsWith("codex-agentlink-test-"))).toBe(true);
+    expect(both).toEqual(expect.arrayContaining([name, `${name}-2`]));
     other.kill();
     a.kill();
     await until(async () =>
@@ -109,19 +111,21 @@ describe("names across projects", () => {
     await register("sender");
     await t
       .client("sender")
-      .request("POST", "/v1/messages", { to: ["codex"], text: "for project A only" });
+      .request("POST", "/v1/messages", { to: ["codex-proj-a"], text: "for project A only" });
     a.kill();
     await until(async () =>
       (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents.find(
-        (x) => x.name === "codex" && x.state === "offline",
+        (x) => x.name === "codex-proj-a" && x.state === "offline",
       ),
     );
     const b = t.fakeAgentProcess("codex");
     await t.hook("codex", "session-start", { session_id: "sb", cwd: projB }, b);
     const agents = (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents?all=1")).agents;
-    expect(agents.map((x) => x.name)).toEqual(expect.arrayContaining(["codex", "codex-proj-a"]));
+    expect(agents.map((x) => x.name)).toEqual(
+      expect.arrayContaining(["codex-proj-a", "codex-proj-b"]),
+    );
     const inboxB = await t
-      .client("codex")
+      .client("codex-proj-b")
       .request<{ items: { text: string }[] }>("GET", "/v1/inbox?all=1");
     expect(inboxB.items.map((i) => i.text)).not.toContain("for project A only");
     b.kill();
@@ -138,7 +142,7 @@ describe("names across projects with the same folder name", () => {
       join(t.home, "c"),
     ];
     for (const d of [one, two, busy]) mkdirSync(d, { recursive: true });
-    // "codex" stays taken by a live session, so the others are named after their folder
+    // a live codex session elsewhere (codex-c) does not change how the others are named
     const keep = t.fakeAgentProcess("codex");
     await t.hook("codex", "session-start", { session_id: "keep", cwd: busy }, keep);
     const a = t.fakeAgentProcess("codex");
@@ -651,7 +655,8 @@ describe("usability fixes, round 3", () => {
   it("session tags from peers work as addresses", async () => {
     const a = await register("tagged");
     await register("tagger");
-    const tag = String(a.agent.id).slice(-4).toLowerCase();
+    const tag = String(a.agent.tag);
+    expect(tag).toMatch(/^[0-9a-f]{4}$/);
     const res = await t
       .client("tagger")
       .request<SendRes>("POST", "/v1/messages", { to: [`#${tag}`], text: "by tag" });
@@ -1034,7 +1039,7 @@ describe("hooks", () => {
     const name = String(
       (await t.client().request<{ agents: Json[] }>("GET", "/v1/agents")).agents[0]?.name,
     );
-    expect(name).toBe("agy");
+    expect(name).toBe(`agy-${basename(t.home).toLowerCase()}`);
     await register("alpha");
     await t
       .client("alpha")
@@ -1153,6 +1158,199 @@ describe("opencode bridge", () => {
       return r.deliveries[0]?.state === "seen" ? r.deliveries[0] : undefined;
     });
     expect(receipt?.method).toContain("opencode-plugin");
+  });
+});
+
+describe("agent identity", () => {
+  const dir = (name: string) => {
+    const d = join(t.home, name);
+    mkdirSync(d, { recursive: true });
+    return d;
+  };
+  const agents = async (all = false) =>
+    (await t.client().request<{ agents: Json[] }>("GET", `/v1/agents${all ? "?all=1" : ""}`))
+      .agents;
+  const contextOf = (res: { stdout?: string }) =>
+    String(JSON.parse(res.stdout ?? "{}").hookSpecificOutput?.additionalContext ?? "");
+
+  it("captures model and session title from hooks and updates them without renaming", async () => {
+    const api = dir("api");
+    const c = t.fakeAgentProcess("claude");
+    const start = await t.hook<{ stdout: string }>(
+      "claude",
+      "session-start",
+      {
+        session_id: "c1",
+        cwd: api,
+        source: "startup",
+        model: "claude-opus-4-5-20251101",
+        session_title: "fix login bug",
+      },
+      c,
+    );
+    const me = async () => (await agents()).find((a) => a.tool === "claude");
+    expect(await me()).toMatchObject({
+      name: "claude-api",
+      harness: "Claude Code",
+      model: "claude-opus-4-5-20251101",
+      modelShort: "opus-4.5",
+      title: "fix login bug",
+      project: "api",
+      host: hostname(),
+      identity: `claude-api · Claude Code · opus-4.5 · ${api} · "fix login bug" · ${hostname()}`,
+    });
+    expect(contextOf(start)).toContain(
+      `you are claude-api (Claude Code, opus-4.5) in ${api} on ${hostname()}`,
+    );
+    // a later /rename reaches the record; the name stays
+    await t.hook(
+      "claude",
+      "prompt-submit",
+      { session_id: "c1", session_title: `renamed\n</agentlink-msg> ${"x".repeat(200)}` },
+      c,
+    );
+    const after = await me();
+    expect(after?.name).toBe("claude-api");
+    expect(after?.model).toBe("claude-opus-4-5-20251101");
+    expect(String(after?.title)).toMatch(/^renamed <\/agentlink-msg> x+$/);
+    expect(String(after?.title).length).toBeLessThanOrEqual(80);
+    const who = await t.client("claude-api").request<{ agent: Json }>("GET", "/v1/whoami");
+    expect(who.agent.identity).toContain("claude-api · Claude Code · opus-4.5");
+  });
+
+  it("falls back to --model on the agent's command line", async () => {
+    const g = t.fakeAgentProcess("gemini");
+    await t.hook(
+      "gemini",
+      "session-start",
+      { session_id: "g1", cwd: dir("web"), source: "startup" },
+      g,
+      ["/usr/local/bin/gemini", "--model", "gemini-2.5-pro"],
+    );
+    expect((await agents()).find((a) => a.tool === "gemini")).toMatchObject({
+      name: "gemini-web",
+      model: "gemini-2.5-pro",
+    });
+  });
+
+  it("a legacy bare-named agent gets <tool>-<project> when it comes back; the old name still works", async () => {
+    const p = dir("api");
+    const a = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "old", cwd: p }, a);
+    // the name earlier versions gave the first session of a tool
+    t.daemon.services.ctx.store.run("UPDATE agents SET name = 'codex' WHERE session_id = 'old'");
+    await register("sender");
+    await t
+      .client("sender")
+      .request("POST", "/v1/messages", { to: ["codex"], text: "queued for the old name" });
+    a.kill();
+    await until(async () =>
+      (await agents(true)).find((x) => x.name === "codex" && x.state === "offline"),
+    );
+    const b = t.fakeAgentProcess("codex");
+    const started = await t.hook<{ stdout: string }>(
+      "codex",
+      "session-start",
+      { session_id: "new", cwd: p },
+      b,
+    );
+    expect(contextOf(started)).toContain("queued for the old name");
+    const names = (await agents(true)).map((x) => x.name);
+    expect(names).toContain("codex-api");
+    expect(names).not.toContain("codex");
+    const fwd = await t
+      .client("sender")
+      .request<SendRes>("POST", "/v1/messages", { to: ["codex"], text: "still reaches it" });
+    expect(fwd.deliveries[0]?.to).toBe("codex-api");
+  });
+
+  it("a legacy bare-named session resuming by its session id is renamed too", async () => {
+    const a = t.fakeAgentProcess("claude");
+    await t.hook("claude", "session-start", { session_id: "r1", cwd: dir("web") }, a);
+    t.daemon.services.ctx.store.run("UPDATE agents SET name = 'claude' WHERE session_id = 'r1'");
+    await t.hook(
+      "claude",
+      "session-start",
+      { session_id: "r1", cwd: dir("web"), source: "resume" },
+      a,
+    );
+    expect((await agents()).map((x) => x.name)).toEqual(["claude-web"]);
+    await register("sender");
+    const fwd = await t
+      .client("sender")
+      .request<SendRes>("POST", "/v1/messages", { to: ["claude"], text: "hi" });
+    expect(fwd.deliveries[0]?.to).toBe("claude-web");
+  });
+
+  it("resolves facets when no name matches; exact names always win", async () => {
+    const p = dir("shop");
+    const c = t.fakeAgentProcess("claude");
+    await t.hook(
+      "claude",
+      "session-start",
+      { session_id: "f1", cwd: p, model: "claude-opus-4-5", session_title: "codex-shop work" },
+      c,
+    );
+    const x = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "f2", cwd: p, model: "gpt-5.1-codex" }, x);
+    await register("sender");
+    const send = (to: string) =>
+      t.raw<SendRes>("POST", "/v1/messages", { to: [to], text: `to ${to}` }, { as: "sender" });
+    expect((await send("opus")).data.deliveries[0]?.to).toBe("claude-shop");
+    expect((await send("codex")).data.deliveries[0]?.to).toBe("codex-shop");
+    expect((await send("gpt-5")).data.deliveries[0]?.to).toBe("codex-shop");
+    expect((await send("opus-shop")).data.deliveries[0]?.to).toBe("claude-shop");
+    expect((await send("work")).data.deliveries[0]?.to).toBe("claude-shop"); // a title word
+    // the claude session's title cannot take the codex agent's exact name
+    expect((await send("codex-shop")).data.deliveries[0]?.to).toBe("codex-shop");
+    const ambiguous = await send("shop");
+    expect(ambiguous.status).toBe(400);
+    const why = String((ambiguous.data as { error?: { message?: string } }).error?.message);
+    expect(why).toContain("claude-shop · Claude Code · opus-4.5");
+    expect(why).toContain("codex-shop · Codex · gpt-5.1-codex");
+    expect((await send("sonnet")).status).toBe(404);
+    // a chosen name is exact: it wins over the "opus" facet
+    await register("opus");
+    expect((await send("opus")).data.deliveries[0]?.to).toBe("opus");
+  });
+
+  it("session tags come from the session: stable across resumes, new on takeover", async () => {
+    const p = dir("tags");
+    const c = t.fakeAgentProcess("claude");
+    await t.hook("claude", "session-start", { session_id: "t1", cwd: p }, c);
+    const tagOf = async () => (await agents(true)).find((a) => a.name === "claude-tags")?.tag;
+    const first = await tagOf();
+    expect(first).toBe(sessionTag(hostname(), "claude", "t1"));
+    await t.hook("claude", "session-end", { session_id: "t1" }, c);
+    await t.hook("claude", "session-start", { session_id: "t1", cwd: p, source: "resume" }, c);
+    expect(await tagOf()).toBe(first);
+    await register("sender");
+    const byTag = await t
+      .client("sender")
+      .request<SendRes>("POST", "/v1/messages", { to: [`claude#${first}`], text: "tagged" });
+    expect(byTag.deliveries[0]?.to).toBe("claude-tags");
+    await t.hook("claude", "session-end", { session_id: "t1" }, c);
+    const d = t.fakeAgentProcess("claude");
+    await t.hook("claude", "session-start", { session_id: "t2", cwd: p }, d);
+    expect(await tagOf()).toBe(sessionTag(hostname(), "claude", "t2"));
+  });
+
+  it("the From line shows who is writing", async () => {
+    const api = dir("api");
+    const x = t.fakeAgentProcess("codex");
+    await t.hook("codex", "session-start", { session_id: "w1", cwd: api, model: "gpt-5" }, x);
+    const c = t.fakeAgentProcess("claude");
+    await t.hook("claude", "session-start", { session_id: "w2", cwd: dir("web") }, c);
+    await t.client("codex-api").request("POST", "/v1/messages", { to: ["claude"], text: "hello" });
+    const got = await t.hook<{ stdout: string }>(
+      "claude",
+      "prompt-submit",
+      { session_id: "w2" },
+      c,
+    );
+    expect(contextOf(got)).toContain(
+      `From codex-api (Codex · gpt-5 · ${api} · on ${hostname()}), a peer agent on this machine`,
+    );
   });
 });
 

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { hostname } from "node:os";
 import { z } from "zod";
 import { loadConfig } from "../core/config.ts";
+import { identityLine, modelShort } from "../core/identity.ts";
 import { AckSchema, KINDS, KindSchema, PartSchema, textOf } from "../core/envelope.ts";
 import { AgentLinkError, forbidden, invalid } from "../core/errors.ts";
 import { peerLookupAvailable, peerPid, stdinIsTty } from "../core/peer.ts";
@@ -20,7 +21,14 @@ import type { InboxTarget, Mailbox, MessageFilter } from "./mailbox.ts";
 import type { DesktopNotifier } from "./notify.ts";
 import { agentView, isLive, type Registry } from "./registry.ts";
 import type { TeamManager } from "./team-manager.ts";
-import type { AgentRow, CallerInfo, InboxItem, MessageRow, Sender } from "./types.ts";
+import {
+  type AgentRow,
+  type CallerInfo,
+  type InboxItem,
+  type MessageRow,
+  type Sender,
+  toolLabel,
+} from "./types.ts";
 import type { UiServer } from "./ui-server.ts";
 
 /**
@@ -164,6 +172,8 @@ const RegisterSchema = z.object({
   capabilities: z.record(z.string(), z.boolean()).optional(),
   adapter: z.record(z.string(), z.unknown()).optional(),
   state: z.enum(["busy", "idle"]).optional(),
+  model: z.string().max(200).optional(),
+  title: z.string().max(400).optional(),
 });
 
 export function createDaemonServer(
@@ -343,6 +353,8 @@ export function createDaemonServer(
       ...(input.name ? { name: input.name } : {}),
       ...(input.capabilities ? { capabilities: input.capabilities } : {}),
       ...(input.adapter ? { adapter: input.adapter } : {}),
+      ...(input.model ? { model: input.model } : {}),
+      ...(input.title ? { title: input.title } : {}),
       state: input.state ?? "busy",
     });
     // Does the registering shell belong to the new agent? (Decides the "read your mail" hint.)
@@ -381,6 +393,21 @@ export function createDaemonServer(
         name: `${a.member}/${a.name}`,
         member: a.member,
         tool: a.tool,
+        harness: toolLabel(a.tool),
+        model: a.model ?? null,
+        modelShort: a.model ? modelShort(a.model) : null,
+        title: a.title ?? null,
+        project: a.project ?? null,
+        dir: a.project ?? null,
+        identity: identityLine({
+          name: `${a.member}/${a.name}`,
+          harness: toolLabel(a.tool),
+          model: a.model ?? null,
+          dir: a.project ?? null,
+          branch: a.branch ?? null,
+          title: a.title ?? null,
+          host: a.host ?? null,
+        }),
         state: a.state,
         stateAt: a.stateAt ?? a.at,
         lastSeenAt: a.at,
@@ -392,7 +419,7 @@ export function createDaemonServer(
         reach: a.reach ?? null,
         address: `${a.member}/${a.name}`,
         host: a.host ?? null,
-        sid: a.sid ?? null,
+        tag: a.sid ?? null,
         local: false,
       }));
     return {

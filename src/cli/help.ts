@@ -54,8 +54,9 @@ Setup & control
 
 Run "agentlink <command> --help" for details. Global flags: --json, --verbose (ids, delivery
 details), --as <agent>, --home <dir>.
-Agents are named after their tool (claude, codex; a second session adds its repo: codex-api);
-agents on other machines are handle/agent, e.g. alice/codex.`;
+Agents are named <tool>-<project> (claude-api, codex-web); words like opus or codex work as
+addresses when they pick out one agent. Agents on other machines are handle/agent, e.g.
+alice/codex-api.`;
 
 const REACH = `REACH (peers -l) says how a message gets in:
   push       queued straight into the session
@@ -88,9 +89,15 @@ const FILTERS = `Filters:
 const H: Record<string, string> = {
   peers: `agentlink peers [-a|--all] [-l|--long]
 
-List the agents you can message: this machine's and your teammates' (alice/…).
-By default: name, state and what each is doing. -l adds session tag, host, tool,
-reach, repo, branch and how long it has been in that state.
+List the agents you can message: this machine's and your teammates' (alice/…),
+with who each one is: harness (Claude Code, Codex, …), model, folder and branch
+(teammates' agents: project), session title, host, state and what it is doing.
+-l adds the session tag (#3f9a), reach and how long it has been in that state.
+
+Addresses: an exact name (claude-api) always wins. Otherwise words that pick out
+one agent work too: its harness, project, branch, model or host, joined with
+'-' (opus, codex-web, gpt-5, alice/sonnet). If several match, you get the list.
+A tag picks one session among look-alikes: claude#3f9a, alice/codex#c01d.
 
   -a, --all     include offline agents
   -l, --long    all columns
@@ -268,12 +275,15 @@ delivery updates are collapsed). Ctrl-C stops.`,
 
   whoami: `agentlink whoami
 
-Which agent this shell belongs to (or that you are the human), and your handle.`,
+Which agent this shell belongs to (name · harness · model · folder · session
+title · host), or that you are the human, and your handle.`,
 
   name: `agentlink name <new-name> [--agent <current-name>]
 
 Rename this agent (lowercase letters, digits, . _ -). Taking the name of an offline
-agent inherits its queued messages.`,
+agent inherits its queued messages. Without a chosen name, agents are named
+<harness>-<project> (codex-api), then -<branch>, -<model family> or a number when
+another session has it. The old name keeps working after a rename.`,
 
   doing: `agentlink doing "<what you are working on>" | --clear
 
