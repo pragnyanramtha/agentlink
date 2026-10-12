@@ -34,6 +34,7 @@ import { isLive, Registry } from "./registry.ts";
 import { createDaemonServer, type Services } from "./server.ts";
 import { Store } from "./store/db.ts";
 import { TeamManager } from "./team-manager.ts";
+import { UiServer } from "./ui-server.ts";
 
 export interface RunningDaemon {
   services: Services;
@@ -184,6 +185,7 @@ export async function startDaemon(
       clearInterval(expiry);
       stopNotifier();
       team.stop();
+      void ui.close();
       server.close(() => {
         rmSync(paths.socket, { force: true });
         rmSync(paths.pidFile, { force: true });
@@ -201,6 +203,8 @@ export async function startDaemon(
   };
 
   const server = createDaemonServer(services, () => void close());
+  const ui = new UiServer(server.dispatch, ctx, registry);
+  services.ui = ui;
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -240,7 +244,7 @@ export async function startDaemon(
       }
     }
     if (!opts.idleExitMs) return;
-    if (registry.list().some(isLive)) {
+    if (registry.list().some(isLive) || ui.connections > 0) {
       lastActivity = Date.now();
       return;
     }

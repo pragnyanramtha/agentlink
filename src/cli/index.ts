@@ -45,6 +45,7 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   setup: async () => (await import("./commands/setup.ts")).setup,
   team: async () => (await import("./commands/team.ts")).team,
   relay: async () => (await import("./commands/team.ts")).relay,
+  ui: async () => (await import("./commands/ui.ts")).ui,
 };
 
 /** Pulls global flags out of argv (anywhere on the line). */

@@ -21,6 +21,18 @@ import type { DesktopNotifier } from "./notify.ts";
 import { agentView, isLive, type Registry } from "./registry.ts";
 import type { TeamManager } from "./team-manager.ts";
 import type { AgentRow, CallerInfo, InboxItem, MessageRow, Sender } from "./types.ts";
+import type { UiServer } from "./ui-server.ts";
+
+/**
+ * Runs one request through the daemon's routes. With `as`, the caller is that in-process human
+ * (the web UI) and the body is already parsed; it is never resolved to an agent.
+ */
+export type Dispatch = (
+  raw: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  as?: { caller: CallerInfo; body: unknown },
+) => Promise<void>;
 
 export interface Services {
   ctx: DaemonContext;
@@ -32,6 +44,7 @@ export interface Services {
   opencode: OpenCodeBridge;
   team: TeamManager;
   notifier: DesktopNotifier;
+  ui?: UiServer;
   /** Tests only: take the caller's claimed process tree/TTY at face value. */
   trustClientCaller?: boolean;
 }
@@ -153,7 +166,10 @@ const RegisterSchema = z.object({
   state: z.enum(["busy", "idle"]).optional(),
 });
 
-export function createDaemonServer(s: Services, shutdown: () => void): Server {
+export function createDaemonServer(
+  s: Services,
+  shutdown: () => void,
+): Server & { dispatch: Dispatch } {
   const { ctx, registry, mailbox, engine } = s;
   const routes: { method: string; re: RegExp; keys: string[]; handler: Handler }[] = [];
   const route = (method: string, pattern: string, handler: Handler) => {
@@ -284,6 +300,16 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     requireHuman(req, false);
     setTimeout(shutdown, 50);
     return { ok: true };
+  });
+
+  // A person at a terminal (like approvals) gets a one-time link into the local web UI.
+  route("POST", "/v1/ui/session", (req) => {
+    requireHuman(req);
+    const body = z
+      .object({ port: z.number().int().min(1024).max(65535).optional() })
+      .parse(req.body);
+    if (!s.ui) throw invalid("the web UI is not available in this daemon");
+    return s.ui.session(body.port);
   });
 
   // ------------------------------------------------------------------ agents
@@ -1024,10 +1050,9 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     };
   }
 
-  const server = createServer(async (raw, res) => {
+  const dispatch: Dispatch = async (raw, res, url, as) => {
     const controller = new AbortController();
     res.on("close", () => controller.abort());
-    const url = new URL(raw.url ?? "/", "http://agentlink");
     const match = routes
       .filter((r) => r.method === raw.method)
       .map((r) => ({ r, m: r.re.exec(url.pathname) }))
@@ -1040,8 +1065,10 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
     if (!match?.m)
       return send(404, { error: { code: "no_route", message: `${raw.method} ${url.pathname}` } });
     try {
-      const caller = await verifyCaller(raw, parseCaller(raw.headers["x-agentlink-caller"]));
+      const caller =
+        as?.caller ?? (await verifyCaller(raw, parseCaller(raw.headers["x-agentlink-caller"])));
       const skipCaller =
+        !!as ||
         url.pathname === "/v1/health" ||
         url.pathname.startsWith("/v1/hooks/") ||
         url.pathname.startsWith("/v1/adapters/");
@@ -1062,7 +1089,7 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
       const params = Object.fromEntries(
         match.r.keys.map((k, i) => [k, decodeURIComponent(match.m?.[i + 1] ?? "")]),
       );
-      const body = raw.method === "GET" ? {} : await readBody(raw);
+      const body = as ? as.body : raw.method === "GET" ? {} : await readBody(raw);
       const out = await match.r.handler({
         method: raw.method ?? "GET",
         path: url.pathname,
@@ -1100,9 +1127,12 @@ export function createDaemonServer(s: Services, shutdown: () => void): Server {
         });
       }
     }
-  });
+  };
+  const server = createServer((raw, res) =>
+    dispatch(raw, res, new URL(raw.url ?? "/", "http://agentlink")),
+  );
   server.requestTimeout = 0;
   server.headersTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
-  return server;
+  return Object.assign(server, { dispatch });
 }

@@ -237,6 +237,10 @@ people with the token can start teams: agentlink team create … --create-token 
 
 Set your handle (how teammates address you) and start the daemon.`,
 
+  ui: `agentlink ui [--no-open] [--port N]
+
+Open the live web viewer: agents, conversations, search, approvals (local, private).`,
+
   install: `agentlink install <tool…|all> [--project <dir>] [--dry-run] [--no-mcp]
 
 Wire agentlink into agent CLIs: hooks (presence + message delivery), the MCP server,
