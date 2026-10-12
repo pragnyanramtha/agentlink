@@ -49,6 +49,7 @@ const MAX_QUEUE_PER_DEVICE = 5_000;
 const MAX_QUEUE_BYTES_PER_DEVICE = 100 * 1024 * 1024;
 const RATE_PER_MINUTE = 600;
 const FRAMES_PER_MINUTE = 1_200;
+const ACKS_PER_MINUTE = 100_000;
 const BYTES_PER_MINUTE = 50 * 1024 * 1024;
 const MAX_PRESENCE_BYTES = 64 * 1024;
 // Quotas for a public relay (anyone may create a team).
@@ -64,6 +65,7 @@ interface Conn {
   sentThisMinute: number;
   minute: number;
   framesThisMinute: number;
+  acksThisMinute: number;
   bytesThisMinute: number;
   codeTries: number;
   /** Queued messages sent on this connection and not acked yet (backlog paging). */
@@ -85,6 +87,10 @@ export interface RelayOptions {
   createToken?: string;
   /** Send the next backlog page after this long even if the current one is not acked (tests). */
   pageStallMs?: number;
+  /** Length of the rate-limit window (tests; the limits stay per window). */
+  rateWindowMs?: number;
+  /** Sends allowed per window (tests). */
+  sendsPerWindow?: number;
 }
 
 export interface RunningRelay {
@@ -106,6 +112,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   }
   const db = new DatabaseSync(join(opts.dataDir, "relay.db"));
   db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA synchronous = NORMAL");
   db.exec(SCHEMA);
   const log = opts.logger;
   const conns = new Set<Conn>();
@@ -428,7 +435,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         return send(c, { t: "ok", op: "invite", ...(frame.id ? { ref: frame.id } : {}) });
       }
       case "send": {
-        if (++c.sentThisMinute > RATE_PER_MINUTE) {
+        if (++c.sentThisMinute > (opts.sendsPerWindow ?? RATE_PER_MINUTE)) {
           return send(c, { t: "error", code: "rate", message: "rate limited", ref: frame.id });
         }
         if (
@@ -597,33 +604,51 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
       sentThisMinute: 0,
       minute: 0,
       framesThisMinute: 0,
+      acksThisMinute: 0,
       bytesThisMinute: 0,
       codeTries: 0,
       ip: fromProxy && forwarded ? forwarded : direct,
     };
     conns.add(c);
     ws.on("message", (data) => {
-      const minute = Math.floor(Date.now() / 60_000);
+      const minute = Math.floor(Date.now() / (opts.rateWindowMs ?? 60_000));
       if (c.minute !== minute) {
         c.minute = minute;
         c.sentThisMinute = 0;
         c.framesThisMinute = 0;
+        c.acksThisMinute = 0;
         c.bytesThisMinute = 0;
       }
       c.bytesThisMinute += (data as Buffer).length ?? 0;
-      if (++c.framesThisMinute > FRAMES_PER_MINUTE || c.bytesThisMinute > BYTES_PER_MINUTE) {
-        send(c, { t: "error", code: "rate", message: "too many frames; slow down" });
+      let frame: ClientFrame | undefined;
+      let bad: unknown;
+      if (c.bytesThisMinute <= BYTES_PER_MINUTE) {
+        try {
+          frame = ClientFrameSchema.parse(JSON.parse(String(data)));
+        } catch (error) {
+          bad = error;
+        }
+      }
+      // Acks are budgeted by id (catching up on a backlog takes many), other frames by count.
+      if (frame?.t === "ack") c.acksThisMinute += frame.ids.length;
+      else c.framesThisMinute++;
+      const over =
+        c.bytesThisMinute > BYTES_PER_MINUTE ||
+        (frame?.t === "ack"
+          ? c.acksThisMinute > ACKS_PER_MINUTE
+          : c.framesThisMinute > FRAMES_PER_MINUTE);
+      if (over) {
+        const ref = frame?.t === "send" ? { ref: frame.id } : {};
+        send(c, { t: "error", code: "rate", message: "too many frames; slow down", ...ref });
+        if (frame?.t === "ack") c.framesThisMinute++;
         if (c.framesThisMinute > FRAMES_PER_MINUTE * 2) ws.close(4008, "rate limited");
         return;
       }
-      let frame: ClientFrame;
-      try {
-        frame = ClientFrameSchema.parse(JSON.parse(String(data)));
-      } catch (error) {
+      if (!frame) {
         return send(c, {
           t: "error",
           code: "invalid",
-          message: `bad frame: ${String((error as Error).message).slice(0, 200)}`,
+          message: `bad frame: ${String((bad as Error).message).slice(0, 200)}`,
         });
       }
       try {

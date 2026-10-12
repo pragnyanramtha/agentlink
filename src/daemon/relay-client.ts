@@ -17,6 +17,7 @@ import {
   teamMacOk,
   verifyJson,
 } from "../core/crypto.ts";
+import { AgentLinkError } from "../core/errors.ts";
 import { LIMITS } from "../core/identity.ts";
 import { ulid } from "../core/ids.ts";
 import { safeField } from "../core/sanitize.ts";
@@ -123,6 +124,13 @@ type Mode =
   | { kind: "join"; token: string };
 
 const aad = (teamId: string, from: string, to: string) => `agentlink/v1|${teamId}|${from}|${to}`;
+/** Sends awaiting the relay's answer at a time; outbox flushes go out in steps of this. */
+const SEND_WINDOW = 100;
+/** Unanswered sends are sent again after this (and the outbox is re-checked as often). */
+const RESEND_MS = 30_000;
+/** Receipts kept for devices off the team, and for how long. */
+const WAITING_MAX = 1_000;
+const WAITING_MS = 15 * 60_000;
 
 /** Keeps one authenticated WebSocket to the team relay; seals, verifies and routes traffic. */
 export class RelayClient {
@@ -142,9 +150,22 @@ export class RelayClient {
   #backoff = 1_000;
   #mode: Mode;
   #onWelcome: ((error?: Error) => void) | undefined;
+  /** Outbox rows sent on this connection and not answered yet (id → when). */
+  readonly #pending = new Map<string, number>();
+  /** After a rate refusal: nothing goes out before `#holdUntil`, then one frame at a time. */
+  #rateBackoff = 0;
+  #holdUntil = 0;
+  #pumpTimer: NodeJS.Timeout | undefined;
+  #tick: NodeJS.Timeout | undefined;
+  #acks: string[] = [];
+  /** Receipts refused because their device had left the team, oldest first. */
+  #waiting: { id: string; frame: string; to: string; at: number }[] = [];
+  #ackTimer: NodeJS.Timeout | undefined;
   onInbound?: (msg: Inbound) => void;
   /** The relay accepted a frame carrying `messageId` for `handle`. */
   onSent?: (messageId: string, handle: string) => void;
+  /** The relay refused a frame carrying `messageId` for `handle` for good. */
+  onFailed?: (messageId: string, handle: string, note: string) => void;
   onRoster?: () => void;
   presenceSource?: () => Omit<RemoteAgent, "member" | "deviceId" | "at">[];
 
@@ -219,6 +240,9 @@ export class RelayClient {
   /** Starts (and keeps) the connection. For create/join, resolves once the relay welcomed us. */
   start(): Promise<void> {
     this.#stopped = false;
+    clearInterval(this.#tick);
+    this.#tick = setInterval(() => this.#resendStale(), RESEND_MS);
+    this.#tick.unref();
     return new Promise((resolve, reject) => {
       this.#onWelcome = (error) => (error ? reject(error) : resolve());
       this.#connect();
@@ -227,6 +251,9 @@ export class RelayClient {
 
   stop(): void {
     this.#stopped = true;
+    clearInterval(this.#tick);
+    clearTimeout(this.#pumpTimer);
+    this.#flushAcks();
     this.#ws?.close();
   }
 
@@ -291,6 +318,8 @@ export class RelayClient {
       const wasReady = this.#ready;
       this.#ready = false;
       this.#online.clear();
+      this.#pending.clear();
+      this.#acks = [];
       if (wasReady) this.#ctx.log.info("relay disconnected");
       if (code === 4000) {
         // The relay keeps one connection per device: another daemon with this device key took over.
@@ -321,6 +350,10 @@ export class RelayClient {
         this.#backoff = 1_000;
         this.#mode = { kind: "hello" };
         for (const id of frame.online ?? []) this.#online.add(id);
+        // Before the roster: what it queues (receipts for devices that are back) goes out once.
+        this.#pending.clear();
+        this.#rateBackoff = 0;
+        this.#holdUntil = 0;
         this.#setRoster(frame.roster);
         this.#ctx.log.info("relay connected", {
           relay: this.#team.relay,
@@ -328,11 +361,12 @@ export class RelayClient {
         });
         this.#onWelcome?.();
         this.#onWelcome = undefined;
-        this.#flushOutbox();
+        this.#pump();
         this.publishPresence();
         return;
       case "roster":
         this.#setRoster(frame.roster);
+        this.#pump(); // receipts waiting for a device that is back
         return;
       case "online":
         if (frame.online) this.#online.add(frame.deviceId);
@@ -369,8 +403,12 @@ export class RelayClient {
         this.#onMsg(frame);
         return;
       case "error":
-        this.#ctx.log.warn("relay error", { code: frame.code, message: frame.message });
+        this.#ctx.log[frame.code === "rate" ? "debug" : "warn"]("relay error", {
+          code: frame.code,
+          message: frame.message,
+        });
         if (frame.ref) this.#waiters.get(`ref:${frame.ref}`)?.(frame);
+        if (this.#ready && (frame.code === "rate" || frame.ref)) this.#refused(frame);
         // Before the welcome, any refusal (bad invite, handle taken, …) ends a create/join.
         if (
           this.#onWelcome &&
@@ -391,7 +429,10 @@ export class RelayClient {
           frame.id,
         );
         this.#ctx.store.run("DELETE FROM outbox WHERE id = ?", frame.id);
+        this.#pending.delete(frame.id);
+        if (Date.now() >= this.#holdUntil) this.#rateBackoff = 0;
         if (row?.message_id && row.handle) this.onSent?.(row.message_id, row.handle);
+        this.#pump();
         return;
       }
       default:
@@ -449,7 +490,28 @@ export class RelayClient {
         this.#ctx.store.run("DELETE FROM members WHERE device_id = ?", id);
       }
     }
+    this.#release();
     this.onRoster?.();
+  }
+
+  /** Queues waiting receipts for devices back in the team; drops those that stayed away. */
+  #release(): void {
+    if (this.#waiting.length === 0) return;
+    const waiting = this.#waiting;
+    this.#waiting = [];
+    let gone = 0;
+    for (const w of waiting) {
+      if (this.#members.has(w.to)) {
+        this.#ctx.store.run(
+          "INSERT OR REPLACE INTO outbox (id, frame, created_at) VALUES (?, ?, ?)",
+          w.id,
+          w.frame,
+          new Date().toISOString(),
+        );
+      } else if (Date.now() - w.at > WAITING_MS) gone++;
+      else this.#waiting.push(w);
+    }
+    if (gone) this.#ctx.log.info("dropped receipts for devices that left the team", { gone });
   }
 
   #onMsg(frame: Extract<ServerFrame, { t: "msg" }>): void {
@@ -492,13 +554,29 @@ export class RelayClient {
         });
       }
     } catch (error) {
-      this.#ctx.log.warn("inbound handling failed", { error: String(error) });
+      // A message we can never take is dropped; anything else stays at the relay for a retry.
+      const lasting =
+        error instanceof AgentLinkError || (error as Error | undefined)?.name === "ZodError";
+      this.#ctx.log.warn("inbound handling failed", { error: String(error), dropped: lasting });
+      if (!lasting) return;
     }
     this.#ack(frame.id);
   }
 
+  /** Acks go out in batches (up to 500 ids a frame). */
   #ack(id: string): void {
-    this.#ws?.send(JSON.stringify({ t: "ack", ids: [id] }));
+    this.#acks.push(id);
+    if (this.#acks.length >= 500) this.#flushAcks();
+    else this.#ackTimer ??= setTimeout(() => this.#flushAcks(), 50);
+  }
+
+  #flushAcks(): void {
+    clearTimeout(this.#ackTimer);
+    this.#ackTimer = undefined;
+    const ids = this.#acks.splice(0, 500);
+    if (ids.length && this.#ws?.readyState === WebSocket.OPEN)
+      this.#ws.send(JSON.stringify({ t: "ack", ids }));
+    if (this.#acks.length) this.#flushAcks();
   }
 
   #frame(
@@ -513,16 +591,76 @@ export class RelayClient {
       meta?.messageId ?? null,
       meta?.handle ?? null,
     );
-    if (this.#ready && this.#ws?.readyState === WebSocket.OPEN)
-      this.#ws.send(JSON.stringify(frame));
+    this.#pump();
   }
 
-  #flushOutbox(): void {
-    for (const row of this.#ctx.store.all<{ frame: string }>(
-      "SELECT frame FROM outbox ORDER BY created_at",
-    )) {
-      this.#ws?.send(row.frame);
+  /**
+   * Sends waiting outbox rows, oldest first, keeping at most SEND_WINDOW unanswered (one while
+   * recovering from a rate refusal). Receipts and messages share the outbox and its pace.
+   */
+  #pump(): void {
+    if (!this.#ready || this.#ws?.readyState !== WebSocket.OPEN) return;
+    const wait = this.#holdUntil - Date.now();
+    if (wait > 0) {
+      clearTimeout(this.#pumpTimer);
+      this.#pumpTimer = setTimeout(() => this.#pump(), wait);
+      this.#pumpTimer.unref();
+      return;
     }
+    const room = (this.#rateBackoff ? 1 : SEND_WINDOW) - this.#pending.size;
+    if (room <= 0) return;
+    const rows = this.#ctx.store
+      .all<{ id: string; frame: string }>(
+        "SELECT id, frame FROM outbox ORDER BY created_at, id LIMIT ?",
+        this.#pending.size + room,
+      )
+      .filter((r) => !this.#pending.has(r.id))
+      .slice(0, room);
+    for (const row of rows) {
+      this.#pending.set(row.id, Date.now());
+      this.#ws.send(row.frame);
+    }
+  }
+
+  /** The relay refused a frame: a rate refusal is retried after a pause, anything else fails. */
+  #refused(frame: Extract<ServerFrame, { t: "error" }>): void {
+    const row = frame.ref
+      ? this.#ctx.store.get<{ message_id: string | null; handle: string | null; frame: string }>(
+          "SELECT message_id, handle, frame FROM outbox WHERE id = ?",
+          frame.ref,
+        )
+      : undefined;
+    if (frame.ref) this.#pending.delete(frame.ref);
+    if (frame.code === "rate") {
+      // One step per pause (a burst gets many refusals at once).
+      if (Date.now() >= this.#holdUntil) {
+        this.#rateBackoff = Math.min(Math.max(this.#rateBackoff * 2, 2_000), 60_000);
+        this.#holdUntil = Date.now() + this.#rateBackoff;
+      }
+      this.#pump();
+      return;
+    }
+    if (!row) return;
+    this.#ctx.store.run("DELETE FROM outbox WHERE id = ?", frame.ref as string);
+    // A receipt for a device that left the team waits for it to come back (e.g. re-joining).
+    if (frame.code === "unknown_device" && !row.message_id) {
+      const to = String((JSON.parse(row.frame) as { to?: unknown }).to);
+      this.#waiting.push({ id: frame.ref as string, frame: row.frame, to, at: Date.now() });
+      if (this.#waiting.length > WAITING_MAX) this.#waiting.shift();
+    } else if (row.message_id && row.handle)
+      this.onFailed?.(
+        row.message_id,
+        row.handle,
+        `not sent: the relay refused it: ${frame.message}`,
+      );
+    this.#pump();
+  }
+
+  /** Sends again what the relay never answered (e.g. dropped as over its frame budget). */
+  #resendStale(): void {
+    for (const [id, at] of this.#pending)
+      if (Date.now() - at >= RESEND_MS) this.#pending.delete(id);
+    this.#pump();
   }
 
   /** Seals a signed payload to every device of `handle`; returns how many devices it went to. */

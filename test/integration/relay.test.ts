@@ -255,7 +255,7 @@ describe("team relay", () => {
           kind: "file",
           file: {
             name: "notes.txt",
-            bytes: Buffer.from("token ghp_" + "a".repeat(36)).toString("base64"),
+            bytes: Buffer.from(`token ghp_${"a".repeat(36)}`).toString("base64"),
           },
         },
       ],

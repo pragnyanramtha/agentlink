@@ -36,6 +36,9 @@ const RECEIPT_STATES = new Set([
   "expired",
   "failed",
 ]);
+const PARKED_MAX = 1_000;
+const PARKED_MS = 15 * 60_000;
+type Receipt = Parameters<NonNullable<Mailbox["remote"]>["receipt"]>[1];
 const RANK: Record<string, number> = {
   held: 2,
   delivered: 3,
@@ -54,6 +57,12 @@ export class TeamManager {
   readonly #mailbox: Mailbox;
   readonly #engine: DeliveryEngine;
   readonly #sentReceipts = new Map<number, string>();
+  /** Receipts for a teammate missing from the roster (e.g. re-joining), sent once it is back. */
+  #parked: { handle: string; at: number; r: Receipt }[] = [];
+  #parkDrops = 0;
+  /** The team this machine last left (receipts wait for a re-join), and deliveries changed since. */
+  #left: string | undefined;
+  readonly #later = new Set<number>();
   #client: RelayClient | undefined;
   #heartbeat: NodeJS.Timeout | undefined;
 
@@ -89,6 +98,7 @@ export class TeamManager {
     const client = new RelayClient(this.#ctx, team, deviceKeys(this.#ctx.paths), mode);
     client.onInbound = (msg) => this.#inbound(msg);
     client.onSent = (messageId, handle) => this.#mailbox.markRelaySent(messageId, handle);
+    client.onFailed = (messageId, handle, note) => this.#failed(messageId, handle, note);
     // Recently offline agents are listed too, so teammates can still queue mail for them.
     client.presenceSource = () =>
       this.#registry
@@ -138,8 +148,11 @@ export class TeamManager {
           .filter((a) => a.member === handle)
           .map((a) => a.name),
       deliver: (handle, envelope) => client.sendTo(handle, { kind: "envelope", envelope }),
-      receipt: (handle, r) => void client.sendTo(handle, { kind: "receipt", ...r }),
+      receipt: (handle, r) => {
+        if (client.sendTo(handle, { kind: "receipt", ...r }) === 0) this.#park(handle, r);
+      },
     };
+    client.onRoster = () => this.#unpark(client);
     clearInterval(this.#heartbeat);
     this.#heartbeat = setInterval(() => client.publishPresence(), 60_000);
     this.#heartbeat.unref();
@@ -248,6 +261,21 @@ export class TeamManager {
     }
   }
 
+  /** Our copy for `handle` will never leave this machine: its deliveries fail, authors are told. */
+  #failed(messageId: string, handle: string, note: string): void {
+    for (const d of this.#ctx.store.all<{ to_addr: string }>(
+      "SELECT to_addr FROM deliveries WHERE message_id = ? AND to_agent_id IS NULL AND (to_addr = ? OR to_addr LIKE ?)",
+      messageId,
+      `@${handle}`,
+      `${handle}/%`,
+    ))
+      this.#mailbox.applyReceipt(
+        handle,
+        { messageId, to: d.to_addr, state: "failed", note },
+        { local: true },
+      );
+  }
+
   #reach(a: AgentRow): string {
     const caps = parseJson<Capabilities>(a.capabilities, {});
     const bits: string[] = [];
@@ -261,12 +289,19 @@ export class TeamManager {
 
   /** Tells a teammate how its message is doing here (seen, replied, …). */
   #maybeReceipt(deliveryId: number): void {
-    if (!this.#client || !Number.isFinite(deliveryId)) return;
-    const d = this.#ctx.store.get<DeliveryRow & { m_trust: string; m_from: string }>(
-      "SELECT d.*, m.trust AS m_trust, m.from_addr AS m_from FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.id = ?",
+    if ((!this.#client && !this.#left) || !Number.isFinite(deliveryId)) return;
+    const d = this.#ctx.store.get<
+      DeliveryRow & { m_trust: string; m_from: string; m_envelope: string }
+    >(
+      "SELECT d.*, m.trust AS m_trust, m.from_addr AS m_from, m.envelope AS m_envelope FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.id = ?",
       deliveryId,
     );
     if (d?.m_trust !== "teammate") return;
+    if (!this.#client) {
+      // This machine is off the team (e.g. re-joining): reported once it is back.
+      if (this.#later.size < PARKED_MAX) this.#later.add(deliveryId);
+      return;
+    }
     // A message released from hold (approved) is reported as delivered.
     const state = d.state === "queued" && d.decided_by ? "delivered" : d.state;
     const last = this.#sentReceipts.get(deliveryId);
@@ -274,15 +309,61 @@ export class TeamManager {
     if (last && (RANK[last] ?? 0) >= (RANK[state] ?? 0)) return;
     const handle = remoteHandleOf(d.m_from);
     if (!handle) return;
+    // Most recently reported last; the oldest is forgotten beyond 5000 (at worst a repeat receipt).
+    this.#sentReceipts.delete(deliveryId);
     this.#sentReceipts.set(deliveryId, state);
+    if (this.#sentReceipts.size > 5_000)
+      this.#sentReceipts.delete(this.#sentReceipts.keys().next().value as number);
     const me = this.#client.team.handle;
-    const to = d.to_addr.startsWith("@") ? `@${me}` : `${me}/${d.to_addr}`;
+    const to = d.to_addr.startsWith("@") ? `@${me}` : `${me}/${this.#addressedAs(d, me)}`;
     this.#mailbox.remote?.receipt(handle, {
       messageId: d.message_id,
       to,
       state,
       ...(state === "delivered" ? { note: `approved by ${me}` } : {}),
     });
+  }
+
+  #park(handle: string, r: Receipt): void {
+    this.#parked.push({ handle, at: Date.now(), r });
+    if (this.#parked.length > PARKED_MAX && ++this.#parkDrops % 100 === 1)
+      this.#ctx.log.warn("too many receipts for teammates off the team; dropping the oldest");
+    if (this.#parked.length > PARKED_MAX) this.#parked.shift();
+  }
+
+  #unpark(client: RelayClient): void {
+    if (client !== this.#client) return;
+    if (this.#later.size) {
+      const later = [...this.#later];
+      this.#later.clear();
+      for (const id of later) this.#maybeReceipt(id);
+    }
+    if (this.#parked.length === 0) return;
+    const here = new Set(client.handles());
+    const parked = this.#parked;
+    this.#parked = [];
+    let expired = 0;
+    for (const p of parked) {
+      if (Date.now() - p.at > PARKED_MS) expired++;
+      else if (!here.has(p.handle) || client.sendTo(p.handle, { kind: "receipt", ...p.r }) === 0)
+        this.#parked.push(p);
+    }
+    if (expired)
+      this.#ctx.log.info("dropped receipts for teammates that did not come back", { expired });
+  }
+
+  /** The name the sender used for this delivery's agent (filed under its new name if renamed). */
+  #addressedAs(d: DeliveryRow & { m_envelope: string }, me: string): string {
+    const to = parseJson<{ to?: { member?: string; agent?: string }[] }>(d.m_envelope, {}).to;
+    const names = (Array.isArray(to) ? to : []).flatMap((a) =>
+      a?.member === me && typeof a.agent === "string" ? [a.agent] : [],
+    );
+    return (
+      names.find((n) => n === d.to_addr) ??
+      names.find((n) => this.#registry.resolveName(n)?.agent.id === d.to_agent_id) ??
+      (names.length === 1 ? names[0] : undefined) ??
+      d.to_addr
+    );
   }
 
   status(): Record<string, unknown> {
@@ -326,6 +407,7 @@ export class TeamManager {
       admin: true,
       joinedAt: new Date().toISOString(),
     };
+    this.#leftovers(team.teamId);
     await this.#attach(team, { kind: "create", ...(createToken ? { createToken } : {}) });
     saveTeam(this.#ctx.paths, team);
     this.#announce("created", team);
@@ -416,6 +498,7 @@ export class TeamManager {
       admin: false,
       joinedAt: new Date().toISOString(),
     };
+    this.#leftovers(team.teamId);
     await this.#attach(team, { kind: "join", token: invite.token });
     saveTeam(this.#ctx.paths, team);
     this.#announce("joined", team);
@@ -444,16 +527,31 @@ export class TeamManager {
     setTimeout(() => old?.stop(), 300).unref();
     this.#client = undefined;
     this.#mailbox.remote = undefined;
+    // Receipts wait (in the outbox and parked) in case this machine re-joins the same team.
+    this.#left = team?.teamId;
     clearInterval(this.#heartbeat);
     clearTeam(this.#ctx.paths);
     this.#ctx.store.run("DELETE FROM members");
-    this.#ctx.store.run("DELETE FROM outbox");
+    const unsent = this.#ctx.store.all<{ message_id: string; handle: string }>(
+      "SELECT DISTINCT message_id, handle FROM outbox WHERE message_id IS NOT NULL AND handle IS NOT NULL",
+    );
+    this.#ctx.store.run("DELETE FROM outbox WHERE message_id IS NOT NULL");
+    const note = `not sent: this machine left team ${safeField(team?.teamName, 64) ?? "?"}`;
+    for (const r of unsent) this.#failed(r.message_id, r.handle, note);
     if (team) this.#announce("left", team);
   }
 
   stop(): void {
     clearInterval(this.#heartbeat);
     this.#client?.stop();
+  }
+
+  /** Receipts left from a team this machine left are dropped unless it re-joins that team. */
+  #leftovers(teamId: string): void {
+    if (teamId === this.#left) return;
+    this.#ctx.store.run("DELETE FROM outbox");
+    this.#parked = [];
+    this.#later.clear();
   }
 
   /** Messages from teammates carry this device's identity in their receipts. */
