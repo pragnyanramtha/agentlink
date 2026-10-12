@@ -82,25 +82,38 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
 ]);
 export type ClientFrame = z.infer<typeof ClientFrameSchema>;
 
-export type ServerFrame =
-  | {
-      t: "welcome";
-      teamId: string;
-      deviceId: string;
-      roster: SignedMember[];
-      admins: string[];
-      /** Devices of the team connected right now (so a fresh join does not show everyone offline). */
-      online?: string[];
-    }
-  | { t: "roster"; roster: SignedMember[]; admins: string[] }
-  | { t: "msg"; id: string; from: string; blob: z.infer<typeof SealedSchema>; at: string }
-  | { t: "presence"; deviceId: string; box: z.infer<typeof TeamBoxSchema>; at: string }
-  | { t: "online"; deviceId: string; online: boolean }
-  | { t: "sent"; id: string; queued: boolean }
-  | { t: "ok"; op: string; ref?: string }
-  | { t: "pong" }
-  | { t: "code"; box: z.infer<typeof TeamBoxSchema> }
-  | { t: "error"; code: string; message: string; ref?: string };
+// The relay is untrusted for content: daemons validate every frame it sends.
+const Id = z.string().max(64);
+const At = z.string().max(64);
+const DeviceIds = z.array(Id).max(500);
+const Roster = z.array(SignedMemberSchema).max(500);
+
+export const ServerFrameSchema = z.discriminatedUnion("t", [
+  z.object({
+    t: z.literal("welcome"),
+    teamId: Id,
+    deviceId: Id,
+    roster: Roster,
+    admins: DeviceIds,
+    /** Devices of the team connected right now (so a fresh join does not show everyone offline). */
+    online: DeviceIds.optional(),
+  }),
+  z.object({ t: z.literal("roster"), roster: Roster, admins: DeviceIds }),
+  z.object({ t: z.literal("msg"), id: Id, from: Id, blob: SealedSchema, at: At }),
+  z.object({ t: z.literal("presence"), deviceId: Id, box: TeamBoxSchema, at: At }),
+  z.object({ t: z.literal("online"), deviceId: Id, online: z.boolean() }),
+  z.object({ t: z.literal("sent"), id: Id, queued: z.boolean() }),
+  z.object({ t: z.literal("ok"), op: Id, ref: Id.optional() }),
+  z.object({ t: z.literal("pong") }),
+  z.object({ t: z.literal("code"), box: TeamBoxSchema }),
+  z.object({
+    t: z.literal("error"),
+    code: Id,
+    message: z.string().max(1000),
+    ref: Id.optional(),
+  }),
+]);
+export type ServerFrame = z.infer<typeof ServerFrameSchema>;
 
 /** The part of a hello/create/join frame covered by the device signature. */
 export function authPayload(frame: {
@@ -127,19 +140,32 @@ export function authPayload(frame: {
 }
 
 /** Inner payload sealed to a recipient device. */
-export type Sealable =
-  | { kind: "envelope"; envelope: unknown; sig: string }
-  | { kind: "receipt"; messageId: string; to: string; state: string; note?: string; sig: string };
+export const SealableSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("envelope"), envelope: z.unknown(), sig: z.string().max(200) }),
+  z.object({
+    kind: z.literal("receipt"),
+    messageId: z.string().max(128),
+    to: z.string().max(200),
+    state: z.string().max(32),
+    note: z.string().max(2000).optional(),
+    sig: z.string().max(200),
+  }),
+]);
+export type Sealable = z.infer<typeof SealableSchema>;
 
-export interface Invite {
-  v: 1;
-  relay: string;
-  teamId: string;
-  teamName: string;
-  token: string;
-  teamKey: string;
-  by: { handle: string; fingerprint: string };
-}
+export const InviteSchema = z.object({
+  v: z.literal(1),
+  relay: z
+    .url({ protocol: /^wss?$/ })
+    .max(2048)
+    .regex(/^wss?:\/\/\S+$/),
+  teamId: z.string().min(1).max(64),
+  teamName: z.string().max(64),
+  token: z.string().min(1).max(128),
+  teamKey: z.string().min(1).max(128),
+  by: z.object({ handle: z.string().max(64), fingerprint: z.string().max(128) }),
+});
+export type Invite = z.infer<typeof InviteSchema>;
 
 export function encodeInvite(invite: Invite): string {
   return `al1.${Buffer.from(JSON.stringify(invite)).toString("base64url")}`;
@@ -148,11 +174,11 @@ export function encodeInvite(invite: Invite): string {
 export function decodeInvite(text: string): Invite {
   const trimmed = text.trim().replace(/^agentlink:\/\/join\//, "");
   if (!trimmed.startsWith("al1.")) throw new Error("not an agentlink invite (expected al1.…)");
-  const parsed = JSON.parse(Buffer.from(trimmed.slice(4), "base64url").toString("utf8")) as Invite;
-  if (parsed.v !== 1 || !parsed.relay || !parsed.teamId || !parsed.token || !parsed.teamKey) {
-    throw new Error("invite is incomplete");
-  }
-  return parsed;
+  const parsed = InviteSchema.safeParse(
+    JSON.parse(Buffer.from(trimmed.slice(4), "base64url").toString("utf8")),
+  );
+  if (!parsed.success) throw new Error("invite is incomplete");
+  return parsed.data;
 }
 
 export const MAX_FRAME_BYTES = 1024 * 1024;

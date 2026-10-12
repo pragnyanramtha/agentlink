@@ -23,7 +23,9 @@ import {
   authPayload,
   type MemberRecord,
   type Sealable,
+  SealableSchema,
   type ServerFrame,
+  ServerFrameSchema,
   type SignedMember,
 } from "../relay/protocol.ts";
 import type { DaemonContext } from "./context.ts";
@@ -229,7 +231,14 @@ export class RelayClient {
     ws.on("message", (data) => {
       if (ws !== this.#ws) return; // a replaced socket
       try {
-        this.#handle(JSON.parse(String(data)) as ServerFrame);
+        const frame = ServerFrameSchema.safeParse(JSON.parse(String(data)));
+        if (!frame.success) {
+          this.#ctx.log.warn("ignoring a malformed relay frame", {
+            error: frame.error.issues[0]?.message,
+          });
+          return;
+        }
+        this.#handle(frame.data);
       } catch (error) {
         this.#ctx.log.warn("relay frame failed", { error: String(error) });
       }
@@ -429,22 +438,25 @@ export class RelayClient {
   #onMsg(frame: Extract<ServerFrame, { t: "msg" }>): void {
     const member = this.#members.get(frame.from);
     if (!member) return; // unknown sender: leave it queued until the roster explains it
+    let raw: Record<string, unknown>;
     let inner: Sealable;
     try {
-      inner = JSON.parse(
+      raw = JSON.parse(
         open(
           this.#keys,
           frame.blob,
           aad(this.#team.teamId, frame.from, this.#keys.deviceId),
         ).toString("utf8"),
       );
+      inner = SealableSchema.parse(raw);
     } catch {
       this.#ctx.log.warn("dropping a message that failed to decrypt", { from: frame.from });
       this.#ack(frame.id);
       return;
     }
-    const { sig, ...signed } = inner;
-    if (!verifyJson(member.signPub, signed, sig)) {
+    // The signature covers the payload as sent (the parsed copy drops unknown fields).
+    const { sig: _, ...signed } = raw;
+    if (!verifyJson(member.signPub, signed, inner.sig)) {
       this.#ctx.log.warn("dropping a message with a bad signature", { from: member.handle });
       this.#ack(frame.id);
       return;
@@ -591,8 +603,14 @@ export function fetchCode(relayUrl: string, id: string): Promise<{ nonce: string
     ws.on("open", () => ws.send(JSON.stringify({ t: "code_get", id })));
     ws.on("message", (data) => {
       clearTimeout(timer);
-      const frame = JSON.parse(String(data)) as ServerFrame;
       ws.close();
+      let frame: ServerFrame;
+      try {
+        frame = ServerFrameSchema.parse(JSON.parse(String(data)));
+      } catch {
+        reject(new Error("unexpected answer from the relay"));
+        return;
+      }
       if (frame.t === "code") resolve(frame.box);
       else
         reject(new Error(frame.t === "error" ? frame.message : "unexpected answer from the relay"));
