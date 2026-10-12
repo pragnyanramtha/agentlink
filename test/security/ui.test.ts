@@ -1,6 +1,8 @@
 import { request } from "node:http";
+import { Script } from "node:vm";
 import { afterEach, describe, expect, it } from "vitest";
 import { ssPids } from "../../src/core/peer.ts";
+import { squeeze } from "../../src/ui/app.ts";
 import { startTestDaemon, type TestDaemon } from "../helpers.ts";
 import { mintToken, uiFetch, uiLogin } from "../ui-helpers.ts";
 
@@ -302,6 +304,77 @@ describe("web UI session bootstrap", () => {
     const css = await s.get("/app.css");
     expect(css.headers["content-type"]).toMatch(/^text\/css/);
     expect(css.text).not.toMatch(/@import|url\(\s*["']?https?:/);
+  });
+
+  it("serves a script that compiles, sets no inline styles and loads nothing from elsewhere", async () => {
+    t = await startTestDaemon();
+    const s = await uiLogin(t);
+    const js = (await s.get("/app.js")).text;
+    // Compiles as a classic script (the squeezed output is still valid JavaScript).
+    expect(() => new Script(js, { filename: "app.js" })).not.toThrow();
+    // style-src 'self' blocks style attributes: positions go through CSSOM (el.style.x = …) only.
+    expect(js).not.toMatch(/setAttribute\(\s*["']style["']|\bstyle:\s*["']/);
+    expect(js).not.toMatch(/\bimport\s*\(|importScripts|new Worker|WebSocket|\.src\s*=/);
+    // The only network calls are same-origin API paths and the event stream.
+    for (const m of js.matchAll(/fetch\(([^,)]*)/g)) expect(m[1]).toMatch(/^"\/api\/v1\/"/);
+    expect(js).toContain('new EventSource("/api/v1/events?k="');
+    const html = (await s.get("/")).text;
+    expect(html.match(/<script\b/g)).toHaveLength(1);
+    expect(
+      html.match(/<link\b[^>]*href="([^"]+)"/g)?.map((l) => l.replace(/.*href="|"$/g, "")),
+    ).toEqual(["/favicon.svg", "/app.css"]);
+    const icon = await s.get("/favicon.svg");
+    expect(icon.headers["content-type"]).toBe("image/svg+xml");
+    expect(icon.text).not.toMatch(/<script|\son[a-z]+=/i);
+  });
+
+  it("squeezes whitespace without touching strings or joining operators", () => {
+    const out = squeeze(
+      [
+        "// gone",
+        "  const a = \"x  y\" + 'p  q';",
+        "  b = c - -d + +e;",
+        "  if (a) { f(a, b); }",
+        "  g = x",
+        "  (y)",
+        "  h(1,",
+        "    2)",
+      ].join("\n"),
+    );
+    // Lines join only after a character that cannot end a statement: ASI never changes.
+    expect(out).toBe("const a=\"x  y\"+'p  q';b=c- -d+ +e;if(a){f(a,b);}\ng=x\n(y)\nh(1,2)\n");
+  });
+
+  it("keeps the transmission log quiet for screen readers and confirmations safe", async () => {
+    t = await startTestDaemon();
+    const s = await uiLogin(t);
+    const js = (await s.get("/app.js")).text;
+    // The log is not a live region; only held mail and questions for you are announced.
+    expect(js).not.toMatch(/role:"log"/);
+    expect(js).toContain('class:"txlog","aria-label":"Transmission log","aria-live":"off"');
+    // Confirmations (approve, deny, pause) put the focus on Cancel.
+    expect(js).toContain('$("[data-no]",dlg).focus()');
+    // Visible copy has no en or em dashes.
+    expect(js + (await s.get("/")).text).not.toMatch(/[\u2013\u2014]/);
+  });
+
+  it("serves a sheet whose custom properties all resolve", async () => {
+    t = await startTestDaemon();
+    const s = await uiLogin(t);
+    const css = (await s.get("/app.css")).text;
+    const js = (await s.get("/app.js")).text;
+    const defined = new Set([...css.matchAll(/(--[\w-]+):/g)].map((m) => m[1] as string));
+    // --h is set per element from the script (harness colour).
+    for (const [, name] of css.matchAll(/var\((--[\w-]+)/g))
+      expect(defined.has(name as string) || name === "--h", name).toBe(true);
+    // The script's lookups ("--x", or a prefix such as "--k-") name properties the sheet defines.
+    for (const [, name] of js.matchAll(/"(--[a-z0-9][\w-]*)"/g)) {
+      const n = name as string;
+      const ok = n.endsWith("-")
+        ? [...defined].some((d) => d.startsWith(n))
+        : defined.has(n) || n === "--h";
+      expect(ok, n).toBe(true);
+    }
   });
 });
 

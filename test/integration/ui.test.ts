@@ -1,4 +1,7 @@
+import { createContext, Script } from "node:vm";
 import { afterEach, describe, expect, it } from "vitest";
+import { squeeze } from "../../src/ui/app.ts";
+import { CORE } from "../../src/ui/core.ts";
 import { startTestDaemon, type TestDaemon, until } from "../helpers.ts";
 import { uiEvents, uiLogin } from "../ui-helpers.ts";
 
@@ -115,6 +118,94 @@ describe("web UI", () => {
     expect(alphaInbox.data.items.map((i) => i.message.from)).toContain("@tester");
   });
 
+  it("serves the tower shell and the data its views read", async () => {
+    t = await startTestDaemon();
+    const proc = t.fakeAgentProcess("claude");
+    await t.client().request("POST", "/v1/agents/register", {
+      tool: "claude",
+      name: "claude-api",
+      pid: proc.pid,
+      ...(proc.start ? { pidStart: proc.start } : {}),
+      cwd: t.home,
+      model: "claude-opus-4-5-20251101",
+      title: "fix login",
+      state: "busy",
+    });
+    await register("beta");
+    await register("gamma");
+    const ask = await t.raw<{ message: { id: string; thread: string } }>(
+      "POST",
+      "/v1/messages",
+      { to: ["beta"], kind: "ask", text: "which port?" },
+      { as: "claude-api" },
+    );
+    await t.raw(
+      "POST",
+      "/v1/messages",
+      { to: ["beta", "gamma"], kind: "info", text: "fyi" },
+      {
+        as: "claude-api",
+      },
+    );
+    const s = await uiLogin(t);
+
+    // Shell: ribbon views, tab bar, explorer, inspector and status bar, filled in by the script.
+    const html = (await s.get("/")).text;
+    for (const view of ["airspace", "graph", "threads", "agents", "approvals", "search"])
+      expect(html).toContain(`data-view="${view}"`);
+    for (const id of ["explorer", "tabs", "panes", "inspector", "statusbar", "announce"])
+      expect(html).toContain(`id="${id}"`);
+    const js = (await s.get("/app.js")).text;
+    for (const part of [
+      "function Airspace(",
+      "function Graph(",
+      "function ThreadView(",
+      "function palette(",
+    ])
+      expect(js).toContain(part);
+    const css = (await s.get("/app.css")).text;
+    expect(css).toContain(":root[data-theme=light]");
+    expect(css).toContain("prefers-reduced-motion:reduce");
+    const total = ["/", "/app.js", "/app.css", "/favicon.svg"].map(
+      async (p) => (await s.get(p)).text,
+    );
+    const bytes = (await Promise.all(total)).reduce((n, b) => n + Buffer.byteLength(b), 0);
+    expect(bytes).toBeLessThan(170 * 1024);
+
+    // Airspace blips and the inspector: identity fields for each agent.
+    const agents = await s.get("/api/v1/agents?all=1");
+    const api = agents.json.agents.find((a: { name: string }) => a.name === "claude-api");
+    expect(api).toMatchObject({
+      harness: "Claude Code",
+      modelShort: "opus-4.5",
+      title: "fix login",
+      state: "busy",
+      local: true,
+    });
+    expect(api.host).toBeTruthy();
+    expect(api.tag).toMatch(/^[0-9a-f]{4}$/);
+    // Strips, log and graph: messages with every delivery's receipts.
+    const log = await s.get("/api/v1/log?limit=500");
+    expect(log.json.messages).toHaveLength(2);
+    const group = log.json.messages.find(
+      (r: { message: { kind: string } }) => r.message.kind === "info",
+    );
+    expect(group.deliveries.map((d: { to: string }) => d.to).sort()).toEqual(["beta", "gamma"]);
+    for (const d of group.deliveries) expect(d).toHaveProperty("state");
+    // Agent note: its conversations. Conversation note: messages with re: links.
+    const mine = await s.get("/api/v1/threads?limit=20&with=beta");
+    expect(mine.json.threads.map((x: { thread: string }) => x.thread)).toContain(
+      ask.data.message.thread,
+    );
+    expect((await s.get("/api/v1/threads?limit=60")).json.threads).toHaveLength(2);
+    expect((await s.get("/api/v1/team")).json.team).toBeNull();
+    expect((await s.get("/api/v1/approvals")).json.items).toEqual([]);
+    // Conversation state, when the daemon reports it, is one of the four the UI labels.
+    const one = await s.get(`/api/v1/threads/${ask.data.message.thread}`);
+    if ("state" in one.json)
+      expect(["held", "waiting_on_you", "awaiting", "answered"]).toContain(one.json.state);
+  });
+
   it("streams live events over SSE", async () => {
     t = await startTestDaemon();
     await register("alpha");
@@ -136,5 +227,86 @@ describe("web UI", () => {
     }
     // The UI listener keeps the daemon's idle timer alive while connected, then lets go.
     expect(await until(() => t.daemon.services.ui?.connections === 0, 10_000)).toBe(true);
+  });
+});
+
+// The browser script's store, run on its own: no DOM is touched until a view renders.
+// biome-ignore lint/suspicious/noExplicitAny: the script is plain JavaScript
+function uiCore(): any {
+  const store = new Map<string, string>();
+  const ctx = createContext({
+    location: { hash: "", pathname: "/" },
+    history: { replaceState() {} },
+    localStorage: {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => store.set(k, v),
+    },
+    document: {},
+    Intl,
+    setTimeout,
+    clearTimeout,
+    views: new Map(),
+  });
+  new Script(
+    `${squeeze(CORE)}\nglobalThis.ui = { convState, threadState, S, views };`,
+  ).runInContext(ctx);
+  return (ctx as { ui: unknown }).ui;
+}
+const row = (kind: string, ...ds: [string, string][]) => ({
+  message: { id: `m${Math.random()}`, kind, from: "alpha" },
+  deliveries: ds.map(([to, state], i) => ({ id: i, to, state })),
+});
+
+describe("web UI conversation state", () => {
+  it("uses the daemon's state when it sends one", () => {
+    const ui = uiCore();
+    expect(ui.convState({ state: "awaiting", awaiting: ["beta", "gamma"] })).toMatchObject({
+      label: "awaiting beta +1",
+      cls: "await",
+    });
+    expect(ui.convState({ state: "held", held: 2 })).toMatchObject({
+      label: "2 held",
+      cls: "held",
+    });
+    expect(ui.convState({ state: "waiting_on_you" })).toMatchObject({
+      label: "waiting on you",
+      cls: "you",
+    });
+    expect(ui.convState({ state: "answered", needsAnswer: true })).toMatchObject({
+      label: "answered",
+      cls: "done",
+    });
+  });
+
+  it("derives the same four states from the messages when the daemon does not", () => {
+    const ui = uiCore();
+    ui.S.you = { handle: "tester", host: "h" };
+    const rows = (...xs: ReturnType<typeof row>[]) =>
+      xs.map((x) => ({ m: x.message, ds: x.deliveries }));
+    expect(ui.convState({}, rows(row("ask", ["beta", "delivered"]))).label).toBe("awaiting beta");
+    expect(ui.convState({}, rows(row("ask", ["@tester", "seen"]))).label).toBe("waiting on you");
+    expect(
+      ui.convState({}, rows(row("request", ["beta", "held"]), row("ask", ["@tester", "queued"])))
+        .label,
+    ).toBe("held");
+    expect(ui.convState({}, rows(row("ask", ["beta", "replied"]))).label).toBe("answered");
+    expect(ui.convState({}, rows(row("info", ["beta", "seen"]))).label).toBe("answered");
+    // Without messages, the summary's flags still give one of the four.
+    expect(ui.convState({ needsAnswer: true }).st).toBe("waiting_on_you");
+    expect(ui.convState({ open: true }).label).toBe("awaiting a reply");
+  });
+
+  it("reads a loaded conversation over the viewer's summary flags", () => {
+    const ui = uiCore();
+    ui.S.threads = [
+      { thread: "T1", open: false, needsAnswer: false, waiting: false, participants: [] },
+    ];
+    expect(ui.threadState("T1").label).toBe("answered");
+    ui.views.set("thread/T1", {
+      data: { thread: "T1", messages: [row("ask", ["teo/claude-data", "seen"])] },
+    });
+    expect(ui.threadState("T1")).toMatchObject({ label: "awaiting teo/claude-data", cls: "await" });
+    ui.views.get("thread/T1").data.state = "answered";
+    expect(ui.threadState("T1").label).toBe("answered");
   });
 });
