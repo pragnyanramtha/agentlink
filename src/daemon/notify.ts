@@ -145,7 +145,8 @@ export class DesktopNotifier {
     const key = `${state === "held" ? "held" : "mail"}:${String(d.id)}`;
     if (this.#seen.has(key)) return;
     const forHuman = d.to === human && state === "delivered";
-    if (!forHuman && state !== "held") return;
+    // A teammate's "held" receipt waits for a person on their machine, not you.
+    if (!forHuman && (state !== "held" || d.method === "relay")) return;
     const m = this.#ctx.store.get<MessageRow>(
       "SELECT from_addr, kind, preview FROM messages WHERE id = ?",
       String(d.messageId),

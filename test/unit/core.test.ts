@@ -242,6 +242,25 @@ describe("proc", () => {
     expect(findToolProcess("codex", chain)?.pid).toBe(8);
     expect(findToolProcess("gemini", chain)?.pid).toBe(8);
   });
+  it("never takes a terminal, test runner or harness for the agent", () => {
+    const hook = { pid: 10, ppid: 9, cmd: ["node", "/x/agentlink/dist/cli/index.js", "hook"] };
+    const shell = { pid: 9, ppid: 8, cmd: ["/bin/bash"] };
+    for (const cmd of [
+      ["/usr/libexec/gnome-terminal-server"],
+      ["tmux", "new", "-s", "work"],
+      ["sshd: pik@pts/3"],
+      ["node", "/repo/node_modules/vitest/dist/workers/forks.js"],
+      ["node", "/repo/node_modules/.bin/vitest", "run"],
+      ["node", "/repo/scripts/sim/worker.ts"],
+    ]) {
+      const chain = [hook, shell, { pid: 8, ppid: 7, cmd }, { pid: 7, ppid: 1, cmd: ["x"] }];
+      expect(findToolProcess("cursor", chain), cmd.join(" ")).toBeUndefined();
+    }
+    // a CLI we don't recognise by name is still found; agentlink wrappers (npx) are skipped
+    const npx = { pid: 9, ppid: 8, cmd: ["npm", "exec", "agentlink", "hook"] };
+    const chain = [hook, npx, { pid: 8, ppid: 1, cmd: ["/opt/newcli/bin/newcli"] }];
+    expect(findToolProcess("cursor", chain)?.pid).toBe(8);
+  });
   it("counts the caller itself when a plugin calls from inside the agent (OpenCode)", async () => {
     const { detectTool } = await import("../../src/core/proc.ts");
     // opencode run started from a shell; the plugin's request comes from the opencode process

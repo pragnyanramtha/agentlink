@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { hostname } from "node:os";
 import { isAbsolute } from "node:path";
 import { z } from "zod";
+import { getRuntime } from "../adapters/runtime.ts";
 import {
   HARNESSES,
   type HeadlessConfig,
@@ -343,8 +344,9 @@ export function createDaemonServer(
         ? {}
         : {
             held:
-              count("SELECT COUNT(*) AS n FROM deliveries WHERE state = 'held'") +
-              count("SELECT COUNT(*) AS n FROM runs WHERE state = 'held'"),
+              count(
+                "SELECT COUNT(*) AS n FROM deliveries WHERE state = 'held' AND COALESCE(method, '') <> 'relay'",
+              ) + count("SELECT COUNT(*) AS n FROM runs WHERE state = 'held'"),
           }),
       outbox: count("SELECT COUNT(*) AS n FROM outbox"),
       db: {
@@ -391,12 +393,15 @@ export function createDaemonServer(
   });
 
   // ------------------------------------------------------------------ agents
-  route("POST", "/v1/agents/register", (req) => {
+  route("POST", "/v1/agents/register", async (req) => {
     const input = RegisterSchema.parse(req.body);
     if (input.pid && !isAlive(input.pid)) throw invalid(`no running process with pid ${input.pid}`);
     if (req.agent && input.pid && input.pid !== req.agent.pid) {
       throw forbidden(`an agent can only register itself (you are ${req.agent.name})`);
     }
+    // The agent's own working directory decides its repo, not the shell that registered it.
+    const cwd = (input.pid ? procCwd(input.pid) : undefined) ?? input.cwd;
+    if (cwd) await registry.warmRepo(cwd, false);
     // One process, one identity: a second name for a live process would be a look-alike.
     const holder = input.pid
       ? registry.list().find((a) => a.pid === input.pid && isLive(a))
@@ -409,8 +414,6 @@ export function createDaemonServer(
       );
     }
     const previous = input.pid ? registry.byLivePid(input.tool, input.pid) : undefined;
-    // The agent's own working directory decides its repo, not the shell that registered it.
-    const cwd = (input.pid ? procCwd(input.pid) : undefined) ?? input.cwd;
     const pidStart = input.pidStart ?? (input.pid ? procInfo(input.pid)?.start : undefined);
     const { agent, created, resumed } = registry.register({
       tool: input.tool,
@@ -423,6 +426,7 @@ export function createDaemonServer(
       ...(input.adapter ? { adapter: input.adapter } : {}),
       ...(input.model ? { model: input.model } : {}),
       ...(input.title ? { title: input.title } : {}),
+      ...(req.caller.verified ? { chain: req.caller.chain } : {}),
       state: input.state ?? "busy",
     });
     // Does the registering shell belong to the new agent? (Decides the "read your mail" hint.)
@@ -690,7 +694,16 @@ export function createDaemonServer(
     };
   });
 
+  // The kill switch covers reads too: a paused agent sees no mail by any route until you resume.
+  const PAUSED =
+    "agentlink is paused: no messages are delivered until your user runs `agentlink resume`.";
+  const pausedFor = (req: Req): boolean => !!req.agent && mailbox.paused;
+  const refusePaused = (req: Req): void => {
+    if (pausedFor(req)) throw new AgentLinkError("paused", PAUSED, 423);
+  };
+
   route("GET", "/v1/todo", (req) => {
+    if (pausedFor(req)) return { items: [], paused: true };
     const target = req.agent ? { agent: req.agent } : ({ human: true } as const);
     return { items: mailbox.todo(target).map((i) => itemView(i, target)) };
   });
@@ -702,12 +715,9 @@ export function createDaemonServer(
         ? { count: 0, text, muted: true }
         : { items: [], muted: true };
     }
-    if (req.agent && mailbox.paused) {
-      // The kill switch covers reads too: a paused agent sees nothing until you resume.
-      const text =
-        "agentlink is paused: no messages are delivered until your user runs `agentlink resume`.";
+    if (pausedFor(req)) {
       return req.query.get("format") === "inject"
-        ? { count: 0, text, paused: true }
+        ? { count: 0, text: PAUSED, paused: true }
         : { items: [], paused: true };
     }
     const target = req.agent ? { agent: req.agent } : ({ human: true } as const);
@@ -741,6 +751,7 @@ export function createDaemonServer(
     mailbox.visibleTo({ agent }, message);
 
   route("GET", "/v1/messages/:id", (req) => {
+    refusePaused(req);
     const message = mailbox.resolveMessage(req.params.id as string, viewer(req));
     const envelope = mailbox.envelopeOf(message);
     const deliveries = mailbox.deliveriesOf(message.id);
@@ -790,6 +801,7 @@ export function createDaemonServer(
   });
 
   route("GET", "/v1/threads/:id", (req) => {
+    refusePaused(req);
     const thread = mailbox.resolveThread(req.params.id as string, viewer(req));
     const all = mailbox.thread(thread);
     const visible = req.agent
@@ -868,6 +880,7 @@ export function createDaemonServer(
     const { q, limit, offset } = Paging(100, 20)
       .extend({ q: z.string().max(500).optional() })
       .parse(Object.fromEntries(req.query));
+    if (pausedFor(req)) return { results: [], fts: mailbox.fts, paused: true };
     return {
       results: mailbox.search(viewer(req), filterOf(req), q, limit, offset),
       fts: mailbox.fts,
@@ -881,6 +894,7 @@ export function createDaemonServer(
         open: z.enum(["0", "1", "true", "false"]).optional(),
       })
       .parse(Object.fromEntries(req.query));
+    if (pausedFor(req)) return { threads: [], paused: true };
     return {
       threads: mailbox.threads(viewer(req), {
         limit: q.limit,
@@ -892,6 +906,7 @@ export function createDaemonServer(
   });
 
   route("GET", "/v1/log", (req) => {
+    if (pausedFor(req)) return { messages: [], paused: true };
     const limit = Math.min(Number(req.query.get("limit") ?? 30) || 30, 500);
     // In a team, local names are shown as full addresses so a pasted log means the same anywhere.
     const full = (name: string) =>
@@ -931,8 +946,20 @@ export function createDaemonServer(
       const message = ctx.store.get<MessageRow>("SELECT * FROM messages WHERE id = ?", String(id));
       return !!message && takesPart(req.agent, message);
     };
+    const send = (event: DaemonEvent) => req.res.write(`data: ${JSON.stringify(event)}\n\n`);
+    // While paused an agent gets one notice instead of mail events (again after a resume).
+    let toldPaused = pausedFor(req);
+    if (toldPaused) send({ type: "notice", level: "info", text: PAUSED });
     const unsubscribe = ctx.events.subscribe((event) => {
-      if (visible(event)) req.res.write(`data: ${JSON.stringify(event)}\n\n`);
+      if (event.type === "message" || event.type === "delivery") {
+        if (pausedFor(req)) {
+          if (!toldPaused) send({ type: "notice", level: "info", text: PAUSED });
+          toldPaused = true;
+          return;
+        }
+        toldPaused = false;
+      }
+      if (visible(event)) send(event);
     });
     const ping = setInterval(() => req.res.write(": ping\n\n"), 15_000);
     req.raw.on("close", () => {
@@ -1051,13 +1078,15 @@ export function createDaemonServer(
     }
     let deliveryId = Number(raw);
     if (!/^\d+$/.test(raw)) {
-      const held = mailbox
-        .deliveriesOf(mailbox.resolveMessage(raw).id)
-        .filter((d) => d.state === "held");
+      const all = mailbox.deliveriesOf(mailbox.resolveMessage(raw).id);
+      const held = all.filter((d) => d.state === "held" && d.method !== "relay");
       if (held.length !== 1) {
+        const there = all.find((d) => d.state === "held");
         throw invalid(
           held.length === 0
-            ? `message ${raw} has nothing held (see: agentlink approvals)`
+            ? there
+              ? `message ${raw} is ${String(mailbox.deliveryView(there).note)}; nothing here to decide`
+              : `message ${raw} has nothing held (see: agentlink approvals)`
             : `message ${raw} is held for several recipients; use one of #${held.map((d) => d.id).join(", #")}`,
         );
       }
@@ -1215,7 +1244,7 @@ export function createDaemonServer(
     const body = SpawnSchema.parse(req.body);
     const cwd = body.cwd ?? req.agent?.cwd;
     if (!cwd || !isAbsolute(cwd)) throw invalid("which folder? pass an absolute --cwd");
-    const { agent, run, sent } = s.headless.spawn(sender(req), {
+    const { agent, run, sent } = await s.headless.spawn(sender(req), {
       harness: body.harness,
       cwd,
       task: body.task,
@@ -1328,17 +1357,43 @@ export function createDaemonServer(
   });
 
   // ------------------------------------------------------------------ adapters
-  route("POST", "/v1/hooks/:tool/:event", (req) => {
+  route("POST", "/v1/hooks/:tool/:event", async (req) => {
     const tool = req.params.tool as string;
     const event = req.params.event as string;
     if (!s.hooks.isEvent(event)) throw invalid(`unknown hook event "${event}"`);
     const body = HookRequestSchema.parse(req.body);
+    // Registering reads the agent's repo with `git` (slow on a big or cold repo): read it here,
+    // without blocking the daemon, when a session starts or the folder is new to it.
+    const cwd = getRuntime(tool)?.parse(event, body.payload).cwd ?? body.env.cwd;
+    if (cwd) await registry.warmRepo(cwd, event === "session-start");
     // A verified caller's real process tree replaces whatever the hook process claimed.
-    return s.hooks.handle(
+    const { undo, ...out } = s.hooks.handle(
       tool,
       event,
       req.caller.verified ? { ...body, chain: req.caller.chain, verified: true } : body,
     );
+    if (undo) {
+      // The hook gave up (timed out) before the answer arrived: its mail stays queued.
+      const revert = () => {
+        try {
+          undo();
+          ctx.log.info("hook left before its answer; its mail stays queued", { tool, event });
+        } catch (error) {
+          ctx.log.warn("could not requeue a hook's mail", { error: String(error) });
+        }
+      };
+      // A write to a hook that left fails with EPIPE, yet `finish` (and writableFinished) can
+      // still come first: the socket's error decides.
+      let sent = false;
+      if (req.signal.aborted) revert();
+      else {
+        req.res.once("finish", () => {
+          sent = true;
+        });
+        req.res.once("close", () => (!sent || req.raw.socket.errored) && revert());
+      }
+    }
+    return out;
   });
 
   route("GET", "/v1/adapters/opencode/poll", async (req) => {

@@ -43,6 +43,9 @@ export class DeliveryEngine {
   readonly #mailbox: Mailbox;
   readonly #deliverers: Deliverer[] = [];
   readonly #inFlight = new Set<string>();
+  /** Deliveries an adapter is handing over right now (hooks leave them alone). */
+  readonly #claimed = new Set<number>();
+  #deferred: Set<string> | undefined;
   /** Resumes offline agents headlessly (when a person enabled it). */
   headless?: Headless;
 
@@ -106,14 +109,19 @@ export class DeliveryEngine {
     );
   }
 
-  logWake(agent: AgentRow, sender: string, method: string): void {
-    this.#ctx.store.run(
+  logWake(agent: AgentRow, sender: string, method: string): number {
+    return this.#ctx.store.run(
       "INSERT INTO wake_log (agent_id, sender, method, at) VALUES (?, ?, ?, ?)",
       agent.id,
       sender,
       method,
       iso(this.#ctx.now()),
-    );
+    ).lastInsertRowid;
+  }
+
+  /** Takes back a wake that never reached the agent (it does not count against the budget). */
+  unlogWake(id: number): void {
+    this.#ctx.store.run("DELETE FROM wake_log WHERE rowid = ?", id);
   }
 
   /** Plans delivery for freshly queued items; returns a sender-facing note per delivery id. */
@@ -204,8 +212,35 @@ export class DeliveryEngine {
     void this.#deliver(agent, deliverer, false);
   }
 
+  claimed(deliveryId: number): boolean {
+    return this.#claimed.has(deliveryId);
+  }
+
+  /**
+   * Runs `fn` (a hook answer) with wakes held back, then wakes whoever still qualifies: a hook
+   * that hands mail over itself (Stop, session start) must not also have it pushed.
+   */
+  deferWakes<T>(fn: () => T): T {
+    if (this.#deferred) return fn();
+    const held = new Set<string>();
+    this.#deferred = held;
+    try {
+      return fn();
+    } finally {
+      this.#deferred = undefined;
+      for (const id of held) {
+        const agent = this.#registry.byId(id);
+        if (agent) this.maybeWake(agent);
+      }
+    }
+  }
+
   /** Wakes an idle agent if it has wake-worthy queued mail and budget left. */
   maybeWake(agent: AgentRow): void {
+    if (this.#deferred) {
+      this.#deferred.add(agent.id);
+      return;
+    }
     if (agent.muted || this.#mailbox.paused) return;
     if (!isLive(agent)) {
       // Offline (e.g. just unmuted): a headless run may resume it.
@@ -227,9 +262,11 @@ export class DeliveryEngine {
   async #deliver(agent: AgentRow, deliverer: Deliverer, isWake: boolean): Promise<void> {
     if (this.#inFlight.has(agent.id)) return;
     this.#inFlight.add(agent.id);
+    let items: InboxItem[] = [];
     try {
-      const items = this.#mailbox.pending(agent.id).slice(0, 10);
+      items = this.#mailbox.pending(agent.id).slice(0, 10);
       if (items.length === 0) return;
+      for (const i of items) this.#claimed.add(i.delivery.id);
       const rendered = this.#mailbox.render(items, agent.name);
       const notice = renderWakeNotice(items.map((i) => this.#mailbox.renderItem(i)));
       const wakeWorthy = items.some((i) => this.wakeWorthy(i));
@@ -258,6 +295,7 @@ export class DeliveryEngine {
         error: String(error),
       });
     } finally {
+      for (const i of items) this.#claimed.delete(i.delivery.id);
       this.#inFlight.delete(agent.id);
     }
   }

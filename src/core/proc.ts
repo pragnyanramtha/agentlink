@@ -111,16 +111,28 @@ export function detectTool(chain: ProcInfo[]): { tool: string; proc: ProcInfo } 
 }
 
 const SHELLS = /(^|\/)(sh|bash|zsh|dash|fish|env|timeout|nohup|script)$/;
+/** Never an agent CLI: terminals, session managers, test runners and agentlink's own sim harness. */
+const NOT_AGENT_BIN =
+  /^(\S*\/)?(tmux|screen|sshd|login|systemd|init|sudo|su|gnome-terminal\S*|konsole|kitty|alacritty|wezterm\S*|xterm)(\b|$)/;
+const NOT_AGENT_ARGS = /(^|[\s/])(vitest|jest|mocha)(\.\w+)?([\s/]|$)|scripts\/sim\//;
 
 /**
  * Finds the agent process for a hook invocation: the nearest ancestor that looks like the
- * tool binary, else the first non-shell ancestor above the hook process.
+ * tool binary, else the first ancestor above the hook process that is not a shell or agentlink
+ * wrapper, unless that one is known not to be an agent (then none: going further up would
+ * name the terminal or harness, making everything else it runs that "agent").
  */
 export function findToolProcess(tool: string, chain: ProcInfo[]): ProcInfo | undefined {
   const byName = chain.find((p) => matchesTool(tool, p));
   if (byName) return byName;
   const above = chain.slice(1);
-  return above.find((p) => !SHELLS.test(p.cmd[0] ?? "") && !/agentlink/.test(p.cmd.join(" ")));
+  const next = above.find(
+    (p) => !SHELLS.test(p.cmd[0] ?? "") && !/agentlink/.test(p.cmd.join(" ")),
+  );
+  if (!next) return undefined;
+  const notAgent =
+    NOT_AGENT_BIN.test(next.cmd[0] ?? "") || NOT_AGENT_ARGS.test(next.cmd.slice(0, 4).join(" "));
+  return notAgent ? undefined : next;
 }
 
 /** A process's working directory (Linux; undefined elsewhere or when not permitted). */

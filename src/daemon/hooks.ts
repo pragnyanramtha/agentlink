@@ -3,14 +3,14 @@ import { hostname } from "node:os";
 import { z } from "zod";
 import { CANONICAL_EVENTS, type CanonicalEvent, getRuntime } from "../adapters/runtime.ts";
 import { homeShort, modelFromArgv, modelShort } from "../core/identity.ts";
-import { detectTool, findToolProcess } from "../core/proc.ts";
+import { detectTool, findToolProcess, isAlive } from "../core/proc.ts";
 import { renderConversationIndex } from "../core/render.ts";
 import { safeField } from "../core/sanitize.ts";
 import type { DaemonContext } from "./context.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import type { Mailbox } from "./mailbox.ts";
-import type { Registry } from "./registry.ts";
-import { type AgentRow, type AgentState, parseJson, toolLabel } from "./types.ts";
+import { holdsRow, type Registry } from "./registry.ts";
+import { type AgentRow, type AgentState, type InboxItem, parseJson, toolLabel } from "./types.ts";
 
 export const HookRequestSchema = z.object({
   payload: z.record(z.string(), z.unknown()).default({}),
@@ -41,9 +41,12 @@ export interface HookResponse {
   stdout?: string;
   /** Environment variables the hook should persist for the agent's shell (e.g. CLAUDE_ENV_FILE). */
   env?: Record<string, string>;
+  /** Daemon-side only (never sent): reverts what the answer handed over, if it never arrived. */
+  undo?: () => void;
 }
 
 const MAX_STOP_BLOCKS = 3;
+const CLAIM_WARN_MS = 10 * 60_000;
 /** Several configs can fire the same lifecycle hook for one agent (see detectTool). */
 const DEDUPE_MS = 1_500;
 const DEDUPED: CanonicalEvent[] = ["session-start", "stop", "session-end", "turn-complete"];
@@ -54,6 +57,7 @@ export class HookHandler {
   readonly #mailbox: Mailbox;
   readonly #engine: DeliveryEngine;
   readonly #recent = new Map<string, { at: number; source: string }>();
+  readonly #claimWarned = new Map<string, number>();
 
   constructor(ctx: DaemonContext, registry: Registry, mailbox: Mailbox, engine: DeliveryEngine) {
     this.#ctx = ctx;
@@ -67,12 +71,31 @@ export class HookHandler {
   }
 
   handle(tool: string, event: CanonicalEvent, req: HookRequest): HookResponse {
+    const undo: (() => void)[] = [];
+    const revert = () => {
+      for (const fn of undo) fn();
+    };
+    try {
+      const out = this.#engine.deferWakes(() => this.#handle(tool, event, req, undo));
+      return undo.length ? { ...out, undo: revert } : out;
+    } catch (error) {
+      revert();
+      throw error;
+    }
+  }
+
+  #handle(
+    tool: string,
+    event: CanonicalEvent,
+    req: HookRequest,
+    undo: (() => void)[],
+  ): HookResponse {
     // The hook config's tool decides payload/output format; the real process decides identity.
     const runtime = getRuntime(tool);
     if (!runtime) return {};
     const info = runtime.parse(event, req.payload);
     const detected = detectTool(req.chain);
-    const agentTool = detected?.tool ?? tool;
+    let agentTool = detected?.tool ?? tool;
     const proc = detected?.proc ?? findToolProcess(tool, req.chain);
     this.#ctx.log.debug("hook", {
       tool,
@@ -82,15 +105,44 @@ export class HookHandler {
       pid: proc?.pid,
     });
 
-    let agent = info.sessionId ? this.#registry.bySession(agentTool, info.sessionId) : undefined;
+    let session = info.sessionId;
+    let agent = session ? this.#registry.bySession(agentTool, session) : undefined;
+    let resumed = false;
     // A session id is only a claim: with a verified caller it must belong to its process tree.
-    if (agent && req.verified && agent.pid && !req.chain.some((p) => p.pid === agent?.pid)) {
-      this.#ctx.log.warn("hook claimed another agent's session; ignoring the claim", {
-        session: info.sessionId,
-      });
-      agent = undefined;
+    if (agent?.pid && req.verified && !holdsRow(agent, req.chain)) {
+      const owner = agent;
+      if (
+        !isAlive(owner.pid as number, owner.pid_start ?? undefined) &&
+        detected?.tool === owner.tool &&
+        this.#registry.samePlace(owner, info.cwd ?? req.env.cwd)
+      ) {
+        // The same CLI in the same place, its old process gone: a resume (`claude --resume`).
+        this.#ctx.log.info("session resumed in a new process", {
+          agent: owner.name,
+          pid: proc?.pid,
+        });
+        resumed = true;
+      } else {
+        const last = this.#claimWarned.get(owner.id) ?? 0;
+        if (Date.now() - last > CLAIM_WARN_MS) {
+          if (this.#claimWarned.size > 1_000) this.#claimWarned.clear();
+          this.#claimWarned.set(owner.id, Date.now());
+          this.#ctx.log.warn("hook claimed another agent's session; refused", {
+            session,
+            agent: owner.name,
+            pid: proc?.pid,
+          });
+        }
+        agent = undefined;
+        session = undefined;
+      }
     }
     if (!agent && proc) agent = this.#registry.byLivePid(agentTool, proc.pid);
+    // One process with two hook configs (Cursor runs its own and Claude's): one agent.
+    if (!agent && !detected && proc && session) {
+      agent = this.#registry.byLivePidSession(proc.pid, session);
+      if (agent) agentTool = agent.tool;
+    }
 
     // A second config (different declared tool) firing the same event right away is a duplicate;
     // the same config firing again (e.g. a second Stop after a continuation) is real.
@@ -128,7 +180,10 @@ export class HookHandler {
     if (info.transcriptPath) adapter.transcriptPath = info.transcriptPath;
 
     const needsRegister =
-      !agent || event === "session-start" || (agent.state !== "busy" && agent.state !== "idle");
+      !agent ||
+      resumed ||
+      event === "session-start" ||
+      (agent.state !== "busy" && agent.state !== "idle");
     // Display claims: the payload's model, else (when a session starts) the --model it was
     // started with (a model reported later wins over it). Gemini CLI and Copilot CLI payloads
     // carry no model.
@@ -138,7 +193,7 @@ export class HookHandler {
     if (needsRegister) {
       agent = this.#registry.register({
         tool: agentTool,
-        ...(info.sessionId ? { sessionId: info.sessionId } : {}),
+        ...(session ? { sessionId: session } : {}),
         ...(proc ? { pid: proc.pid, ...(proc.start ? { pidStart: proc.start } : {}) } : {}),
         ...((info.cwd ?? req.env.cwd) ? { cwd: (info.cwd ?? req.env.cwd) as string } : {}),
         capabilities: runtime.capabilities,
@@ -146,6 +201,7 @@ export class HookHandler {
         state: stateFor[event],
         ...(model ? { model } : {}),
         ...(info.title ? { title: info.title } : {}),
+        ...(req.verified ? { chain: req.chain } : {}),
       }).agent;
     } else if (agent) {
       if (model || info.title)
@@ -157,10 +213,21 @@ export class HookHandler {
       agent = this.#registry.setState(agent.id, stateFor[event]) ?? agent;
     }
     if (!agent) return {};
+    const me = agent;
+    const free = (i: InboxItem) => !this.#engine.claimed(i.delivery.id);
+    // Mail handed to this answer goes back to the queue if the answer never reaches the hook.
+    // Only events whose answer the CLI shows can take mail (else it would be seen, never shown).
+    const drain = (method: string) => {
+      if (method === "hook" && !runtime.contextOutput(event, "x")) return [];
+      const items = this.#mailbox.drain(me, method, free);
+      const ids = items.map((i) => i.delivery.id);
+      if (ids.length) undo.push(() => this.#mailbox.requeue(ids, "seen"));
+      return items;
+    };
 
     switch (event) {
       case "session-start": {
-        const items = this.#mailbox.drain(agent, "hook");
+        const items = drain("hook");
         const text = [
           this.#identityNote(agent),
           items.length ? this.#mailbox.render(items, agent.name) : "",
@@ -175,30 +242,37 @@ export class HookHandler {
       }
       case "prompt-submit": {
         this.#registry.setStopBlocks(agent.id, 0);
-        const items = this.#mailbox.drain(agent, "hook");
+        const items = drain("hook");
         if (items.length === 0) return {};
         return this.#context(runtime.contextOutput(event, this.#mailbox.render(items, agent.name)));
       }
       case "pre-model":
       case "post-tool":
       case "pre-tool": {
-        if (!runtime.contextOutput(event, "x")) return {};
-        const items = this.#mailbox.drain(agent, "hook");
+        const items = drain("hook");
         if (items.length === 0) return {};
         return this.#context(runtime.contextOutput(event, this.#mailbox.render(items, agent.name)));
       }
       case "stop": {
         if (!runtime.continueOutput) return {};
         if (agent.stop_blocks >= MAX_STOP_BLOCKS) return {};
-        const worthy = this.#mailbox.pending(agent.id, (i) => this.#engine.wakeWorthy(i));
+        const worthy = this.#mailbox.pending(
+          agent.id,
+          (i) => free(i) && this.#engine.wakeWorthy(i),
+        );
         if (worthy.length === 0) return {};
         const { used, limit } = this.#engine.budget(agent);
         if (used >= limit) return {};
-        const items = this.#mailbox.drain(agent, "hook:stop");
+        const items = drain("hook:stop");
         if (items.length === 0) return {};
         this.#registry.setStopBlocks(agent.id, agent.stop_blocks + 1);
-        this.#engine.logWake(agent, items[0]?.message.from_addr ?? "?", "stop-hook");
+        const wake = this.#engine.logWake(agent, items[0]?.message.from_addr ?? "?", "stop-hook");
         this.#registry.setState(agent.id, "busy");
+        undo.push(() => {
+          this.#registry.setStopBlocks(me.id, me.stop_blocks);
+          this.#engine.unlogWake(wake);
+          this.#registry.setState(me.id, "idle");
+        });
         const reason = `${this.#mailbox.render(items, agent.name)}\n\nBefore finishing: reply to each ask or request with \`agentlink reply <id> "<answer>"\` (a one-line refusal is fine) and accept or decline handoffs with \`agentlink ack <id> --accept|--decline\`.`;
         return { stdout: runtime.continueOutput(reason) };
       }

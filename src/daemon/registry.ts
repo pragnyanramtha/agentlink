@@ -2,7 +2,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { NAME_RE, slugify } from "../core/addr.ts";
 import { AgentLinkError, invalid, notFound } from "../core/errors.ts";
-import { repoInfo } from "../core/git.ts";
+import { type RepoInfo, repoInfo, repoInfoAsync } from "../core/git.ts";
 import {
   coversQuery,
   facetsOf,
@@ -41,6 +41,8 @@ export interface RegisterInput {
   /** Claims from the hook payload or the agent's command line (display and address hints only). */
   model?: string;
   title?: string;
+  /** The caller's kernel-verified process chain: a session held by a live process outside it is not reused. */
+  chain?: { pid: number; start?: string }[];
 }
 
 const DEFAULT_BRANCHES = ["main", "master", "HEAD", "trunk", "develop"];
@@ -51,12 +53,25 @@ export const isLive = (a: Pick<AgentRow, "state">) => a.state === "busy" || a.st
 
 const OFFLINE_RETENTION_MS = 14 * 24 * 3600_000;
 const PIDLESS_STALE_MS = 30 * 60_000;
+const REPO_TTL_MS = 60_000;
+/** An unchanged state refreshes last_seen_at at most this often (each write is a commit). */
+const SEEN_EVERY_MS = 30_000;
+
+/** Whether a process in `chain` is the one recorded for `row` (same pid, not a reused one). */
+export const holdsRow = (
+  row: Pick<AgentRow, "pid" | "pid_start">,
+  chain: { pid: number; start?: string }[],
+) =>
+  chain.some((p) => p.pid === row.pid && (!row.pid_start || !p.start || p.start === row.pid_start));
 
 export type StateListener = (agent: AgentRow, previous: AgentState) => void;
 
 export class Registry {
   readonly #ctx: DaemonContext;
   readonly #listeners = new Set<StateListener>();
+  readonly #repos = new Map<string, { at: number; info: RepoInfo }>();
+  readonly #reading = new Map<string, Promise<void>>();
+  readonly #claimWarned = new Map<string, number>();
 
   constructor(ctx: DaemonContext) {
     this.#ctx = ctx;
@@ -90,6 +105,15 @@ export class Registry {
     );
   }
 
+  /** A live agent of any tool for this process and session (one process, several hook configs). */
+  byLivePidSession(pid: number, sessionId: string): AgentRow | undefined {
+    return this.#ctx.store.get<AgentRow>(
+      "SELECT * FROM agents WHERE pid = ? AND session_id = ? AND state IN ('busy','idle') ORDER BY last_seen_at DESC LIMIT 1",
+      pid,
+      sessionId,
+    );
+  }
+
   require(nameOrId: string): AgentRow {
     const agent = this.byName(nameOrId) ?? this.byId(nameOrId);
     if (!agent) {
@@ -116,11 +140,27 @@ export class Registry {
     const model = safeField(raw.model, LIMITS.model) ?? undefined;
     const title = safeField(raw.title, LIMITS.title) ?? undefined;
     const input: RegisterInput = { ...raw, model, title };
+    // `git` runs outside the transaction (it can take a while on a big or cold repo).
+    const repo = input.cwd ? this.#repoInfo(input.cwd) : undefined;
     const result = store.tx(() => {
       let existing = input.sessionId ? this.bySession(input.tool, input.sessionId) : undefined;
+      let refused: AgentRow | undefined;
+      // A session id is only a claim: never move a session away from the live process holding it
+      // (without a verified chain, any other claimed pid counts as another process).
+      if (
+        existing?.pid &&
+        existing.pid !== input.pid &&
+        (input.chain ? !holdsRow(existing, input.chain) : !!input.pid) &&
+        isAlive(existing.pid, existing.pid_start ?? undefined)
+      ) {
+        refused = existing;
+        existing = undefined;
+        delete input.sessionId;
+      }
       if (!existing && input.pid) existing = this.byLivePid(input.tool, input.pid);
       if (!existing && input.pid) existing = this.#runAncestor(input.tool, input.pid);
-      const repo = input.cwd ? repoInfo(input.cwd) : undefined;
+      if (refused && !input.chain && existing?.id !== refused.id)
+        this.#warnClaim(refused, input.pid);
       const project = input.cwd
         ? (safeField(projectName(repo ?? {}, input.cwd), LIMITS.project) ?? undefined)
         : undefined;
@@ -200,6 +240,62 @@ export class Registry {
     const agent = this.byId(result.id) as AgentRow;
     this.#emit(agent);
     return { agent, created: result.created, resumed: result.resumed };
+  }
+
+  /** Logged at most once per agent every 10 minutes (a hook fires on every tool call). */
+  #warnClaim(owner: AgentRow, pid: number | undefined): void {
+    const last = this.#claimWarned.get(owner.id) ?? 0;
+    if (Date.now() - last < 10 * 60_000) return;
+    if (this.#claimWarned.size > 1_000) this.#claimWarned.clear();
+    this.#claimWarned.set(owner.id, Date.now());
+    this.#ctx.log.warn("a caller claimed another live agent's session; refused", {
+      agent: owner.name,
+      pid,
+    });
+  }
+
+  /**
+   * Up to 4 `git` runs: request paths read them ahead (warmRepo), so this only blocks for a
+   * folder never read (callers outside a request). An older answer is used while a new one is read.
+   */
+  #repoInfo(cwd: string): RepoInfo {
+    const hit = this.#repos.get(cwd);
+    if (hit) {
+      if (Date.now() - hit.at >= REPO_TTL_MS) void this.warmRepo(cwd, true);
+      return hit.info;
+    }
+    const info = repoInfo(cwd);
+    this.#remember(cwd, info);
+    return info;
+  }
+
+  #remember(cwd: string, info: RepoInfo): void {
+    if (this.#repos.size > 500) this.#repos.delete(this.#repos.keys().next().value as string);
+    this.#repos.delete(cwd);
+    this.#repos.set(cwd, { at: Date.now(), info });
+  }
+
+  /**
+   * Reads `cwd`'s repo ahead of a registration without blocking the daemon (`refresh`: unless
+   * read within the last minute; else only if never read).
+   */
+  warmRepo(cwd: string, refresh: boolean): Promise<void> {
+    const hit = this.#repos.get(cwd);
+    if (hit && (!refresh || Date.now() - hit.at < REPO_TTL_MS)) return Promise.resolve();
+    let reading = this.#reading.get(cwd);
+    if (!reading) {
+      reading = repoInfoAsync(cwd)
+        .then((info) => this.#remember(cwd, info))
+        .finally(() => this.#reading.delete(cwd));
+      this.#reading.set(cwd, reading);
+    }
+    return reading;
+  }
+
+  /** Whether `cwd` is the place (git repo, else folder) `row` was registered in. */
+  samePlace(row: AgentRow, cwd: string | undefined): boolean {
+    const place = cwd ? (this.#repoInfo(cwd).root ?? cwd) : undefined;
+    return !!place && (row.repo_root ?? row.cwd ?? undefined) === place;
   }
 
   #update(
@@ -547,6 +643,8 @@ export class Registry {
     if (!before) return undefined;
     const now = iso(this.#ctx.now());
     if (before.state === state) {
+      if (this.#ctx.now().getTime() - Date.parse(before.last_seen_at) < SEEN_EVERY_MS)
+        return before;
       this.#ctx.store.run("UPDATE agents SET last_seen_at = ? WHERE id = ?", now, agentId);
       return { ...before, last_seen_at: now };
     }

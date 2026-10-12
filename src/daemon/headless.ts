@@ -342,10 +342,12 @@ export class Headless {
   }
 
   /** Spawns a new agent: registers it, sends it the task as an ask, and runs it. */
-  spawn(
+  async spawn(
     sender: Sender,
     o: { harness: Harness; cwd: string; name?: string; model?: string; task: string },
-  ): { agent: AgentRow; run: RunRow; sent: SendResult } {
+  ): Promise<{ agent: AgentRow; run: RunRow; sent: SendResult }> {
+    // Registering reads the folder's repo: read it first without blocking the daemon.
+    await this.#registry.warmRepo(this.#check(o.harness, o.cwd), false);
     const requester = this.requesterOf(sender);
     const cwd = this.#check(o.harness, o.cwd);
     const decision = headlessDecision(requester.trust, "spawn", this.#cfg.from);

@@ -129,6 +129,13 @@ export interface ThreadStatus {
 }
 
 const EXPECTING = "('ask','request','handoff','review_request')";
+/** Over deliveries: not a copy sent to a teammate (its holds are decided on their machine). */
+const localHold = (d: string) => `COALESCE(${d}.method, '') <> 'relay'`;
+/** Over messages aliased `m`: a handoff someone took, so nobody else owes it an answer. */
+const taken = (m: string) => `(${m}.kind = 'handoff' AND EXISTS (SELECT 1 FROM messages tk
+  WHERE tk.reply_to = ${m}.id AND tk.kind = 'ack' AND json_extract(tk.envelope, '$.meta.ack') = 'accept'))`;
+const heldRemotely = (d: Pick<DeliveryRow, "to_addr">): string =>
+  `held on ${remoteHandleOf(d.to_addr) ?? d.to_addr}'s machine`;
 
 export type WaitOutcome =
   | { kind: "reply"; message: MessageRow }
@@ -162,7 +169,7 @@ export interface RemoteRouter {
 
 export type RemoteInfo = Pick<
   RemoteAgent,
-  "name" | "tool" | "state" | "host" | "model" | "title" | "project" | "branch" | "sid"
+  "name" | "tool" | "state" | "host" | "model" | "title" | "project" | "branch" | "sid" | "aliases"
 >;
 
 const UNREAD: DeliveryState[] = ["queued", "delivered"];
@@ -1015,13 +1022,13 @@ export class Mailbox {
         store.run(
           `UPDATE deliveries SET state = ?, ${isAck ? "acked_at" : "replied_at"} = ?, reply_id = COALESCE(reply_id, ?),
              note = COALESCE(?, note)
-           WHERE message_id = ? AND to_addr = ? AND state NOT IN ('refused','expired','replied')`,
+           WHERE message_id = ? AND to_addr IN (SELECT value FROM json_each(?)) AND state NOT IN ('refused','expired','replied')`,
           isAck ? "acked" : "replied",
           stamp,
           envelope.messageId,
           isAck ? ackNote(envelope.meta.ack, text) : null,
           original.id,
-          fromAddr,
+          JSON.stringify(this.#remoteAddrs(fromAddr)),
         );
       }
       return out;
@@ -1101,17 +1108,33 @@ export class Mailbox {
     }
   }
 
-  /** A teammate's daemon reports progress on a message we sent it. Never moves backwards. */
+  /** A teammate's `handle/agent`, then the names that agent had before (from its presence). */
+  #remoteAddrs(addr: string): string[] {
+    const [handle, agent] = addr.split("/");
+    if (!handle || !agent) return [addr];
+    const aliases = this.remote?.infoOf(handle, agent)?.aliases ?? [];
+    return [addr, ...aliases.slice(0, 20).map((a) => `${handle}/${a}`)];
+  }
+
+  /**
+   * A teammate's daemon reports progress on a message we sent it. Never moves backwards. With
+   * `local`, the report comes from this machine (e.g. the relay refused it), not the teammate.
+   */
   applyReceipt(
     fromHandle: string,
     receipt: { messageId: string; to: string; state: string; note?: string },
+    opts: { local?: boolean } = {},
   ): boolean {
     if (receipt.to !== `@${fromHandle}` && !receipt.to.startsWith(`${fromHandle}/`)) return false;
-    const d = this.#ctx.store.get<DeliveryRow>(
-      "SELECT * FROM deliveries WHERE message_id = ? AND to_addr = ?",
-      receipt.messageId,
-      receipt.to,
-    );
+    const d = this.#remoteAddrs(receipt.to)
+      .map((to) =>
+        this.#ctx.store.get<DeliveryRow>(
+          "SELECT * FROM deliveries WHERE message_id = ? AND to_addr = ?",
+          receipt.messageId,
+          to,
+        ),
+      )
+      .find((row) => !!row);
     if (!d) return false;
     const rank = RANK[receipt.state] ?? -1;
     const current = RANK[d.state] ?? 0;
@@ -1152,9 +1175,14 @@ export class Mailbox {
       if (author && message) {
         // The note is the teammate's text inside an agentlink notice: one quoted, attributed line.
         const note = safeField(receipt.note, 200)?.replace(/"/g, "'");
+        const why = !note
+          ? ""
+          : opts.local
+            ? ` (${note})`
+            : ` (${fromHandle}'s machine says: "${note}")`;
         this.notify(
           author,
-          `Your ${message.kind} ${message.id.slice(0, 12)} to ${receipt.to} was not delivered: ${receipt.state}${note ? ` (${fromHandle}'s machine says: "${note}")` : ""}.`,
+          `Your ${message.kind} ${message.id.slice(0, 12)} to ${receipt.to} was not delivered: ${receipt.state}${why}.`,
         );
       }
     }
@@ -1219,8 +1247,8 @@ export class Mailbox {
     return this.#ctx.store
       .all<DeliveryRow>(
         `SELECT d.* FROM deliveries d JOIN messages m ON m.id = d.message_id
-         WHERE ${clause} AND m.kind IN ('ask','request','handoff','review_request')
-           AND d.state IN ('queued','delivered','seen') ORDER BY d.id LIMIT 100`,
+         WHERE ${clause} AND m.kind IN ${EXPECTING}
+           AND d.state IN ('queued','delivered','seen') AND NOT ${taken("m")} ORDER BY d.id LIMIT 100`,
         param,
       )
       .map((r) => this.#item(r));
@@ -1282,12 +1310,17 @@ export class Mailbox {
     }
   }
 
-  /** Puts handed-over deliveries back in the queue (a headless run ended before reading them). */
-  requeue(deliveryIds: number[]): void {
+  /**
+   * Puts handed-over deliveries back in the queue: a headless run ended before reading them
+   * (`delivered`), or a hook's answer never reached the agent (`seen`).
+   */
+  requeue(deliveryIds: number[], from: "delivered" | "seen" = "delivered"): void {
     for (const id of deliveryIds) {
       const res = this.#ctx.store.run(
-        "UPDATE deliveries SET state = 'queued', method = NULL, delivered_at = NULL WHERE id = ? AND state = 'delivered'",
+        "UPDATE deliveries SET state = 'queued', method = NULL, delivered_at = NULL, seen_at = CASE WHEN ? = 'seen' THEN NULL ELSE seen_at END WHERE id = ? AND state = ?",
+        from,
         id,
+        from,
       );
       const d = res.changes
         ? this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", id)
@@ -1538,15 +1571,23 @@ export class Mailbox {
 
   // ---------------------------------------------------------------- approvals
 
+  /** Holds waiting for this machine's person (a teammate's "held" receipt is theirs to decide). */
   held(): InboxItem[] {
     return this.#ctx.store
-      .all<DeliveryRow>("SELECT * FROM deliveries WHERE state = 'held' ORDER BY id")
+      .all<DeliveryRow>(
+        `SELECT * FROM deliveries d WHERE state = 'held' AND ${localHold("d")} ORDER BY id`,
+      )
       .map((r) => this.#item(r));
   }
 
   decide(deliveryId: number, decision: "approve" | "deny", by: string): InboxItem {
     const d = this.#ctx.store.get<DeliveryRow>("SELECT * FROM deliveries WHERE id = ?", deliveryId);
     if (!d) throw notFound(`held delivery ${deliveryId}`);
+    if (d.state === "held" && d.method === "relay") {
+      throw invalid(
+        `delivery ${deliveryId} is ${heldRemotely(d)}; only a person there can decide it`,
+      );
+    }
     if (d.state !== "held") throw invalid(`delivery ${deliveryId} is ${d.state}, not held`);
     this.#ctx.store.run(
       "UPDATE deliveries SET state = ?, decided_by = ?, note = ? WHERE id = ?",
@@ -1866,11 +1907,12 @@ export class Mailbox {
          SELECT t.*,
            EXISTS (SELECT 1 FROM messages q JOIN deliveries d ON d.message_id = q.id
              WHERE q.thread_id = t.thread AND q.kind IN ${EXPECTING}
-               AND ${toMe("d")} AND +d.state IN ('queued','delivered','seen')) AS yours,
+               AND ${toMe("d")} AND +d.state IN ('queued','delivered','seen') AND NOT ${taken("q")}) AS yours,
            EXISTS (SELECT 1 FROM messages q JOIN deliveries d ON d.message_id = q.id
              WHERE q.thread_id = t.thread AND q.kind IN ${EXPECTING}
                AND ${byMe} AND +d.state IN ('queued','sent','held','delivered','seen')
                AND NOT EXISTS (SELECT 1 FROM deliveries x WHERE x.message_id = q.id AND x.state IN ('replied','acked'))
+               AND NOT ${taken("q")}
            ) AS theirs,
            (SELECT COUNT(*) FROM messages um JOIN deliveries u ON u.message_id = um.id
              WHERE um.thread_id = t.thread AND ${toMe("u")} AND +u.state IN ('queued','delivered')) AS unread
@@ -1933,21 +1975,24 @@ export class Mailbox {
 
   /** Who still owes answers in a thread and what is held, from the messages `viewer` sees. */
   threadStatus(threadId: string, viewer: InboxTarget): ThreadStatus {
-    const [vis, visParams] = this.#visibleSql(viewer);
+    const [vis, visParams] = this.#visibleSql(viewer, "q");
     const rows = this.#ctx.store.all<{
       to_addr: string;
       to_agent_id: string | null;
       state: string;
+      here: number;
     }>(
-      `SELECT d.to_addr, d.to_agent_id, d.state FROM messages m JOIN deliveries d ON d.message_id = m.id
-       WHERE m.thread_id = ? AND ${vis} AND (d.state = 'held'
-         OR (m.kind IN ${EXPECTING} AND d.state IN ('queued','sent','delivered','seen')))
-       ORDER BY m.created_at, m.id, d.id`,
+      `SELECT d.to_addr, d.to_agent_id, d.state, ${localHold("d")} AS here FROM messages q JOIN deliveries d ON d.message_id = q.id
+       WHERE q.thread_id = ? AND ${vis} AND ((d.state = 'held' AND ${localHold("d")})
+         OR (q.kind IN ${EXPECTING} AND d.state IN ('queued','sent','held','delivered','seen') AND NOT ${taken("q")}))
+       ORDER BY q.created_at, q.id, d.id`,
       threadId,
       ...visParams,
     );
-    const held = rows.filter((d) => d.state === "held").length;
-    const owing = rows.filter((d) => d.state !== "held");
+    // A hold on a teammate's machine is theirs to decide; here it still owes an answer.
+    const isHeld = (d: { state: string; here: number }) => d.state === "held" && d.here === 1;
+    const held = rows.filter(isHeld).length;
+    const owing = rows.filter((d) => !isHeld(d));
     const awaiting = [...new Set(owing.map((d) => d.to_addr))];
     const you = owing.some((d) =>
       "agent" in viewer
@@ -1975,7 +2020,8 @@ export class Mailbox {
       ),
       todo: n(
         `SELECT COUNT(*) AS n FROM deliveries d JOIN messages m ON m.id = d.message_id
-         WHERE ${clause} AND m.kind IN ${EXPECTING} AND d.state IN ('queued','delivered','seen')`,
+         WHERE ${clause} AND m.kind IN ${EXPECTING} AND d.state IN ('queued','delivered','seen')
+           AND NOT ${taken("m")}`,
       ),
     };
   }
@@ -2002,7 +2048,7 @@ export class Mailbox {
     const old = store.all<{ id: string; thread_id: string; busy: number }>(
       `SELECT m.id, m.thread_id, EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND (
          d.state NOT IN ('seen','acked','replied','refused','expired','failed')
-         OR (d.state = 'seen' AND m.kind IN ${EXPECTING}))) AS busy
+         OR (d.state = 'seen' AND m.kind IN ${EXPECTING} AND NOT ${taken("m")}))) AS busy
        FROM messages m WHERE m.created_at < ?`,
       cutoff,
     );
@@ -2085,7 +2131,10 @@ export class Mailbox {
       toState: agent?.state,
       state: d.state,
       method: d.method,
-      note: d.note,
+      note:
+        d.state === "held" && d.method === "relay"
+          ? `${heldRemotely(d)} until a person there approves it`
+          : d.note,
       deliveredAt: d.delivered_at,
       seenAt: d.seen_at,
       ackedAt: d.acked_at,
