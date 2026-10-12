@@ -26,13 +26,13 @@ interface TeamStatus {
   invitedBy?: { handle: string; fingerprint: string };
 }
 
-function printStatus(s: TeamStatus): string {
+export function printStatus(s: TeamStatus): string {
   if (!s.team) {
     return [
       c.dim("Not in a team yet."),
-      "  Start one:   agentlink team create <name> --relay ws://<host>:7700",
-      "  Or join one: agentlink team join <invite>",
-      c.dim("  Need a relay? agentlink relay serve --host 0.0.0.0"),
+      "  Invite someone: agentlink team invite       (starts a team on the community relay)",
+      "  Or join one:    agentlink team join <code>",
+      c.dim("  Own relay? agentlink team create <name> --relay wss://your-host"),
     ].join("\n");
   }
   const t = s.team;
@@ -135,8 +135,7 @@ export const team: Command = async (ctx) => {
         "no-code": { type: "boolean" },
       });
       const ttlMs = parseDuration(String(values.ttl), 24 * 3600_000, "h");
-      if (!(ttlMs > 0))
-        throw new UsageError("--ttl must be more than 0 (e.g. 30m, 24h, 7d is 168h)");
+      if (!(ttlMs > 0)) throw new UsageError("--ttl must be more than 0 (e.g. 30m, 24h, 7d)");
       const uses = Number(values.uses);
       if (!Number.isInteger(uses) || uses < 1 || uses > 100)
         throw new UsageError("--uses must be a whole number from 1 to 100");
@@ -269,7 +268,7 @@ export const relay: Command = async (ctx) => {
     ...(createToken ? { createToken } : {}),
   });
   process.stdout.write(
-    [
+    `${[
       `${c.green("✓")} agentlink relay on ${["0.0.0.0", "::"].includes(String(values.host)) ? `port ${running.port}, all interfaces` : running.url} (data: ${values.data ?? join(ctx.paths.home, "relay")})`,
       c.dim("  It stores and forwards sealed blobs; it cannot read messages. Ctrl-C to stop."),
       String(values.host) === "127.0.0.1"
@@ -279,7 +278,7 @@ export const relay: Command = async (ctx) => {
         : "",
     ]
       .filter(Boolean)
-      .join("\n") + "\n",
+      .join("\n")}\n`,
   );
   await new Promise<void>((resolve) => {
     const stop = () => void running.close().then(resolve);

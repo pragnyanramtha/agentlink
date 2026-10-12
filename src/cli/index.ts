@@ -19,6 +19,13 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   status: async () => (await import("./commands/messaging.ts")).status,
   log: async () => (await import("./commands/messaging.ts")).log,
   watch: async () => (await import("./commands/messaging.ts")).watch,
+  overview: async () => (await import("./commands/history.ts")).overview,
+  dash: async () => (await import("./commands/history.ts")).overview,
+  search: async () => (await import("./commands/history.ts")).search,
+  threads: async () => (await import("./commands/history.ts")).threads,
+  prune: async () => (await import("./commands/history.ts")).prune,
+  notify: async () => (await import("./commands/history.ts")).notify,
+  ui: async () => (await import("./commands/ui.ts")).ui,
   whoami: async () => (await import("./commands/agents.ts")).whoami,
   peers: async () => (await import("./commands/agents.ts")).peers,
   name: async () => (await import("./commands/agents.ts")).name,
@@ -45,7 +52,6 @@ const COMMANDS: Record<string, () => Promise<Command>> = {
   setup: async () => (await import("./commands/setup.ts")).setup,
   team: async () => (await import("./commands/team.ts")).team,
   relay: async () => (await import("./commands/team.ts")).relay,
-  ui: async () => (await import("./commands/ui.ts")).ui,
 };
 
 /** Pulls global flags out of argv (anywhere on the line). */
@@ -82,15 +88,54 @@ function extractGlobals(argv: string[]): {
   return { rest, json, verbose, ...(as ? { as } : {}), ...(home ? { home } : {}) };
 }
 
+/** What failed, for error output: --json, and the most specific help page ("team invite"). */
+const errOut = { json: false, help: undefined as string | undefined };
+
+function fail(code: string, message: string, hint?: string): void {
+  process.stderr.write(
+    errOut.json
+      ? `${JSON.stringify({ error: { code, message } })}\n`
+      : `agentlink: ${message}\n${hint ? `${hint}\n` : ""}`,
+  );
+}
+
 async function main(argv: string[]): Promise<number> {
   // Hooks run on every tool call: keep this path free of heavy imports.
   if (argv[0] === "hook" && !wantsHelp(argv)) {
     const { runHook } = await import("./hook.ts");
     return runHook(resolvePaths(), argv[1] ?? "generic", argv[2] ?? "", argv[3]);
   }
+  const end = argv.indexOf("--");
+  errOut.json = (end >= 0 ? argv.slice(0, end) : argv).includes("--json");
   const globals = extractGlobals(argv);
   if (globals.home) process.env.AGENTLINK_HOME = globals.home;
   const [command, ...rest] = globals.rest;
+  const sub = rest[0] && !rest[0].startsWith("-") ? `${command} ${rest[0]}` : "";
+  errOut.help = commandHelp(sub) ? sub : command && commandHelp(command) ? command : undefined;
+  // Bare `agentlink` in a person's terminal: the dashboard, once agentlink is set up (a fresh
+  // machine gets the help text). Agents (not a terminal) and --json get the help text, as before.
+  if (!command && !globals.json && process.stdout.isTTY) {
+    const { Client } = await import("./client.ts");
+    const paths = resolvePaths();
+    const client = new Client(paths, { ...(globals.as ? { as: globals.as } : {}), clean: true });
+    const { existsSync } = await import("node:fs");
+    const up = existsSync(paths.config) && (await client.ensureDaemon().catch(() => undefined));
+    if (up) {
+      const [{ showOverview }, { c }] = await Promise.all([
+        import("./commands/history.ts"),
+        import("./format.ts"),
+      ]);
+      const footer = `\n\n${c.dim("agentlink --help for all commands")}`;
+      const ctx: CliContext = { paths, client, json: false, argv: [] };
+      if (
+        await showOverview(ctx, footer).then(
+          () => true,
+          () => false,
+        )
+      )
+        return 0;
+    }
+  }
   if (!command || command === "--help" || command === "-h") {
     process.stdout.write(`${OVERVIEW}\n`);
     return 0;
@@ -132,8 +177,10 @@ async function main(argv: string[]): Promise<number> {
   const load = COMMANDS[command];
   if (!load) {
     const guess = closest(command, [...Object.keys(COMMANDS), "mcp", "help", "version"]);
-    process.stderr.write(
-      `agentlink: unknown command "${command}"${guess ? ` (did you mean "${guess}"?)` : ""}\nRun "agentlink --help" for the list.\n`,
+    fail(
+      "unknown_command",
+      `unknown command "${command}"${guess ? ` (did you mean "${guess}"?)` : ""}`,
+      'Run "agentlink --help" for the list.',
     );
     return 2;
   }
@@ -159,11 +206,11 @@ main(process.argv.slice(2))
   .catch(async (error: Error & { code?: string }) => {
     const { UsageError } = await import("./args.ts");
     const usage = error instanceof UsageError;
-    const command = process.argv[2];
-    process.stderr.write(`agentlink: ${error.message}\n`);
-    if (usage && command && commandHelp(command)) {
-      process.stderr.write(`Run "agentlink ${command} --help" for usage.\n`);
-    }
+    fail(
+      usage ? "usage" : (error.code ?? "error"),
+      error.message,
+      usage && errOut.help ? `Run "agentlink ${errOut.help} --help" for usage.` : undefined,
+    );
     // 3 = "no answer (yet)": the daemon restarted mid-wait, but what was sent is kept.
     process.exitCode = usage ? 2 : error.code === "daemon_restarted" ? 3 : 1;
   });

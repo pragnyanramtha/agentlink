@@ -9,13 +9,14 @@ If you are an AI agent
   Answer every ask or request   agentlink reply <id> "…"   (--all in a group; a short no is fine)
   Take or refuse a handoff      agentlink ack <id> --accept "…"  |  --decline "why"
   Find and ask others           agentlink peers  ·  agentlink ask <agent> "question"
-  What waits for your answer    agentlink todo
+  What waits for your answer    agentlink todo  ·  agentlink threads --open
+  Find past messages            agentlink search <words> → agentlink thread <id> → show <id>
   Connect with a friend         agentlink team invite → your user shares the code → they run
                                 agentlink team join <code>   (only when your user asks)
   Full guide (etiquette, safety, recovery): agentlink help guide
 
 Talk
-  peers [--all]                      who is online (busy/idle/offline) and what they do
+  peers [--all] [-l]                 who is online (busy/idle/offline) and what they do
   ask <agent> "<question>"           ask and wait for the answer
   send <agent>[,…] "<message>"       send info, a request, or a handoff
   reply <id> "<answer>"              answer a message
@@ -23,6 +24,13 @@ Talk
   inbox [--wait 60s]                 read your messages
   todo                               asks, requests and handoffs you haven't answered
   show <id> · thread <id> · status [<id>]
+
+See and find
+  overview (or bare agentlink)       dashboard: agents, unread, open conversations
+  search <words> [--from X]          find past messages (compact; then thread/show <id>)
+  threads [--open] [--with X]        conversations, latest first
+  ui                                 live web viewer (local, private)
+  watch · log [--from X --since 2d]  live traffic · recent history
 
 Coordinate
   doing "<text>"                     tell peers what you are working on
@@ -39,13 +47,43 @@ Setup & control
   setup [--join <code>]              one step: start, wire up every agent CLI found, join a team
   help guide                         the full guide agents follow (also: agentlink guide)
   init · install <tool…|all> · uninstall · doctor
-  daemon start|stop|restart|status|logs · watch · log
+  daemon start|stop|restart|status|logs
   pause · resume · mute <agent> · unmute <agent>
   policy · approvals · approve <id> · deny <id>
+  notify on|off|test · prune --older-than 30d
 
-Run "agentlink <command> --help" for details. Global flags: --json, --as <agent>, --home <dir>.
+Run "agentlink <command> --help" for details. Global flags: --json, --verbose (ids, delivery
+details), --as <agent>, --home <dir>.
 Agents are named after their tool (claude, codex; a second session adds its repo: codex-api);
 agents on other machines are handle/agent, e.g. alice/codex.`;
+
+const REACH = `REACH (peers -l) says how a message gets in:
+  push       queued straight into the session
+  wake       an idle agent is started with a new turn
+  mid-turn   injected between its tool calls while it works
+  next-turn  shown when its next turn starts
+  cli        only when it runs agentlink inbox itself`;
+
+const STATES = `Delivery states (agentlink status, log, thread):
+  queued     waiting here: recipient offline or busy, paused, muted, or relay down
+  sent       handed to the relay for a teammate's machine
+  delivered  in the recipient's session or inbox, not read yet
+  seen       read by the recipient
+  acked      confirmed with agentlink ack (a handoff shows accepted or declined)
+  replied    answered with agentlink reply
+  held       waiting for a person to approve it (agentlink approvals)
+  refused    blocked by policy
+  expired    not delivered before its time ran out (send --ttl)
+  failed     could not be delivered`;
+
+const FILTERS = `Filters:
+  --from <X>     sent by this agent or person (codex, alice/claude, @alice)
+  --to <X>       sent to them
+  -k, --kind     ask, request, handoff, info, reply, ack… (several: ask,handoff)
+  --since <T>    newer than an age (30m, 2h, 7d, 1w) or a date (2026-01-31)
+  --until <T>    older than that
+  -t, --thread   in this conversation (any message id in it works)
+  --repo <R>     sent from a repo whose path or git remote contains R`;
 
 const H: Record<string, string> = {
   peers: `agentlink peers [-a|--all] [-l|--long]
@@ -53,15 +91,13 @@ const H: Record<string, string> = {
 List the agents you can message: this machine's and your teammates' (alice/…).
 By default: name, state and what each is doing. -l adds session tag, host, tool,
 reach, repo, branch and how long it has been in that state.
-REACH says how a message gets in:
-  wake       an idle agent is started with a new turn
-  push       queued straight into the session
-  mid-turn   injected between its tool calls while it works
-  next-turn  shown when its next turn starts
-  cli        only when it runs agentlink inbox itself
 
   -a, --all     include offline agents
   -l, --long    all columns
+
+${REACH}
+
+${STATES}
 
 Example: agentlink peers -l`,
 
@@ -152,16 +188,83 @@ team, each machine's user decides for their own agents. Run it yourself, in a te
 
   status: `agentlink status [<message-id>]
 
-Delivery receipts: queued → sent → delivered → seen → replied/acked (or held,
-refused, expired, failed). Without an id: your recent messages.`,
+Delivery receipts and when each came: queued → sent → delivered → seen →
+replied/acked (or held, refused, expired, failed). Without an id: your recent messages.
 
-  log: `agentlink log [-n 30]
+${STATES}
 
-Recent messages on this machine with their delivery states.`,
+${REACH}`,
+
+  log: `agentlink log [-n 30] [--from X] [--to X] [--kind K] [--since 2d] [--until T] [--thread ID] [--repo R]
+
+Recent messages on this machine with their delivery states (see agentlink status --help).
+
+${FILTERS}
+
+Example: agentlink log --from codex --kind ask,handoff --since 1d`,
+
+  overview: `agentlink overview   (also: agentlink dash, or just agentlink in a terminal)
+
+At a glance: your handle and team, agents by machine (● busy, ○ idle), unread mail,
+what waits for your answer, messages held for your approval, up to 5 open conversations,
+and what to do next. --json prints the raw numbers.`,
+
+  search: `agentlink search <words…> [--from X] [--to X] [--kind K] [--since 2d] [--until T]
+                 [--thread ID] [--repo R] [-n 20]
+
+Find past messages you can see. Prints a compact index (id, when, kind, who, the matching
+words in «», and the message size in tokens), newest first; open only what you need:
+  agentlink thread <id>   the whole conversation
+  agentlink show <id>     one full message
+Every word must match (as a prefix: deploy finds deployed). Without words, lists what the
+filters match.
+
+${FILTERS}
+  -n, --limit   how many (default 20, at most 100)
+
+Examples:
+  agentlink search zebra protocol
+  agentlink search deploy --from alice/codex --since 2d`,
+
+  threads: `agentlink threads [--open] [--with X] [-n 20]
+
+Conversations, latest activity first: id, when, who, how many messages, open/unread, the
+first message and the latest. Open one with agentlink thread <id>.
+
+  -o, --open       only conversations waiting on you (an ask, request or handoff to
+                   answer) or on an answer to yours
+  -w, --with <X>   only those with this agent or person (codex, alice/claude, @alice)
+  -n, --limit      how many (default 20, at most 100)`,
+
+  ui: `agentlink ui [--no-open] [--port N]
+
+Open the live web viewer: agents, conversations, search, approvals (local, private).`,
+
+  prune: `agentlink prune --older-than 30d [--dry-run] [--yes]
+
+Delete old, finished messages from this machine's history: read, answered, refused,
+expired or failed. Unread, unanswered, held and in-flight messages are always kept.
+In a terminal it first shows what it would delete and asks; elsewhere it needs --yes.
+Run it yourself (agents cannot). To prune automatically, set "retention": {"days": 90}
+in ~/.agentlink/config.json.
+
+  --older-than <d>   age, at least 1h (30d, 12h; a bare number is days)
+  -n, --dry-run      only count what would be deleted
+  -y, --yes          do not ask`,
+
+  notify: `agentlink notify [status]
+agentlink notify on|off
+agentlink notify test
+
+Desktop notifications for you (off by default): mail to you, asks and handoffs for you,
+and messages held for your approval. Bursts are combined into one notification.
+Uses notify-send on Linux (package libnotify-bin) and osascript on macOS.
+test sends one now, even when they are off.`,
 
   watch: `agentlink watch [--json]
 
-Live view of agent traffic: agents changing state, messages, deliveries. Ctrl-C stops.`,
+Live view of agent traffic: agents changing state, messages, deliveries (repeated identical
+delivery updates are collapsed). Ctrl-C stops.`,
 
   whoami: `agentlink whoami
 
@@ -236,10 +339,6 @@ people with the token can start teams: agentlink team create … --create-token 
   init: `agentlink init [--handle <you>]
 
 Set your handle (how teammates address you) and start the daemon.`,
-
-  ui: `agentlink ui [--no-open] [--port N]
-
-Open the live web viewer: agents, conversations, search, approvals (local, private).`,
 
   install: `agentlink install <tool…|all> [--project <dir>] [--dry-run] [--no-mcp]
 
@@ -385,7 +484,7 @@ Anyone with either can join and read team messages: share it privately (chat, ca
 Agents are not allowed to send invites to other agents through agentlink.
 
   --uses <n>    how many devices may join with the long invite (1-100, default 1)
-  --ttl <d>     how long the long invite stays valid (default 24h, e.g. 30m, 168h)
+  --ttl <d>     how long the long invite stays valid (default 24h, e.g. 30m, 7d, 1d12h)
   --no-code     only print the long invite
 
 Example: agentlink team invite --uses 3 --ttl 7d`,
@@ -466,6 +565,7 @@ Example: agentlink policy reset teammate request handoff`,
 });
 
 H.tell = H.send as string;
+H.dash = H.overview as string;
 
 export function commandHelp(name: string): string | undefined {
   return H[name];

@@ -73,7 +73,9 @@ export function splitRecipients(value: string): string[] {
     .filter(Boolean);
 }
 
-const DURATION = /^\d+(?:\.\d+)?\s*(ms|s|m|h)?$/;
+const UNIT_MS: Record<string, number> = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
+/** "90", "90s", "7d" or compound "1h30m", "2m30s". */
+const DURATION = /^(?:\d+(?:\.\d+)?|(?:\d+(?:\.\d+)?\s*(?:ms|s|m|h|d)\s*)+)$/;
 
 /**
  * Lets a string option be given without a value (`--wait` alone means "the default"):
@@ -99,19 +101,66 @@ export function optionalValue(argv: string[], long: string, short?: string): str
   return out;
 }
 
-/** Parses "90", "90s", "10m", "2h" into milliseconds. */
+/** Parses "90", "90s", "10m", "2h", "7d", "1h30m" into milliseconds (a bare number is in `unit`). */
 export function parseDuration(
   value: string | undefined,
   fallbackMs: number,
-  unit: "s" | "m" | "h" = "s",
+  unit: "s" | "m" | "h" | "d" = "s",
 ): number {
   if (value === undefined || value === "") return fallbackMs;
-  const m = /^(\d+(?:\.\d+)?)\s*(ms|s|m|h)?$/.exec(value.trim());
-  if (!m) throw new UsageError(`invalid duration "${value}" (examples: 90s, 10m, 2h)`);
-  const n = Number(m[1]);
-  const u = m[2] ?? unit;
-  const factor = u === "ms" ? 1 : u === "s" ? 1_000 : u === "m" ? 60_000 : 3_600_000;
-  return Math.round(n * factor);
+  const v = value.trim();
+  if (!DURATION.test(v))
+    throw new UsageError(`invalid duration "${value}" (examples: 90s, 10m, 2h, 7d, 1h30m)`);
+  if (/^[\d.]+$/.test(v)) return Math.round(Number(v) * (UNIT_MS[unit] as number));
+  let ms = 0;
+  for (const [, n, u] of v.matchAll(/(\d+(?:\.\d+)?)\s*(ms|s|m|h|d)/g))
+    ms += Number(n) * (UNIT_MS[u as string] as number);
+  return Math.round(ms);
+}
+
+/** An ISO date (passed through) or an age ("2d", "1h30m", "1w"; a bare number is days) as an ISO time. */
+export function timeParam(value: string, now = Date.now()): string {
+  const v = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v;
+  const weeks = /^(\d{1,4})w$/.exec(v);
+  try {
+    const ms = weeks ? Number(weeks[1]) * 604_800_000 : parseDuration(v, 0, "d");
+    return new Date(now - ms).toISOString();
+  } catch {
+    throw new UsageError(
+      `invalid time "${value}" (an age like 2h, 7d, 1w, or a date like 2026-01-31)`,
+    );
+  }
+}
+
+/** History filters shared by log and search. */
+export const FILTER_OPTIONS = {
+  from: { type: "string" },
+  to: { type: "string" },
+  kind: { type: "string", short: "k" },
+  since: { type: "string" },
+  until: { type: "string" },
+  thread: { type: "string", short: "t" },
+  repo: { type: "string" },
+} as const;
+
+export async function filterQuery(
+  v: Partial<Record<keyof typeof FILTER_OPTIONS, string>>,
+  q = new URLSearchParams(),
+): Promise<URLSearchParams> {
+  for (const key of ["from", "to", "thread", "repo"] as const) if (v[key]) q.set(key, v[key]);
+  if (v.kind) {
+    // Loaded only when needed: it pulls in zod, which every other command can skip.
+    const { KINDS } = await import("../core/envelope.ts");
+    const known = KINDS as readonly string[];
+    const bad = v.kind.split(",").find((k) => k.trim() && !known.includes(k.trim()));
+    if (bad !== undefined)
+      throw new UsageError(`unknown --kind "${bad}" (kinds: ${KINDS.join(", ")})`);
+    q.set("kind", v.kind);
+  }
+  if (v.since) q.set("since", timeParam(v.since));
+  if (v.until) q.set("until", timeParam(v.until));
+  return q;
 }
 
 export function out(ctx: CliContext, data: unknown, human: () => string): void {

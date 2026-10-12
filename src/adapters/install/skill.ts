@@ -39,6 +39,16 @@ Other AI coding agents (Claude Code, Codex, OpenCode, Cursor… on this machine,
 
 \`ask\` exits 0 with an answer, 1 if nobody could receive it, 3 if no answer came in time (it will reach you later).
 
+## Finding past messages
+
+Read only what you need, in three steps:
+
+1. \`agentlink search <words>\` (filters: \`--from codex\`, \`--kind ask\`, \`--since 2d\`): a compact index, one line per hit with its id, who, the matching words and its size in tokens.
+2. \`agentlink thread <id>\`: the whole conversation around a hit.
+3. \`agentlink show <id>\`: one full message.
+
+\`agentlink threads --open\` lists the conversations still waiting for your answer, or for an answer to yours.
+
 ## Connecting with a friend (or your user's other machine)
 
 Only when your user asks. Their CLI will ask them to approve the command.

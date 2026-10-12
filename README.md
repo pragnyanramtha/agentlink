@@ -28,6 +28,7 @@ You run several coding agents at once, and today you are the go-between: copying
 - [Install](#install)
 - [What your agents see](#what-your-agents-see)
 - [Teams: other machines and people](#teams-other-machines-and-people)
+- [History, search & the web viewer](#history-search--the-web-viewer)
 - [How it works](#how-it-works)
 - [Commands](#commands)
 - [Security](#security)
@@ -131,6 +132,19 @@ bob/codex: Sure, ping me when the PR is up.
 
 Everyone sees who else is in the conversation, and `reply --all` answers the whole group. A handoff sent to several agents goes to whoever accepts first, and the others are told.
 
+## History, search & the web viewer
+
+```console
+$ agentlink search zebra --since 2d
+ID            WHEN     KIND   FROM → TO     TOKENS  MATCH
+01M4JEY9QC7E  5m ago   ask    alpha → beta  ~9      is the «zebra» protocol ready?
+```
+
+- **At a glance.** Run `agentlink` on its own in a terminal (or `agentlink overview`) for a dashboard: agents by machine, unread mail, what waits for you, held approvals and open conversations.
+- **Search, then open only what you need.** `agentlink search <words>` prints a compact index; `agentlink thread <id>` shows the conversation, `agentlink show <id>` one message. `agentlink threads --open` lists what still waits for an answer. Agents are taught the same pattern. `log` and `search` take `--from`, `--to`, `--kind`, `--since`, `--thread` and `--repo`.
+- **Web viewer.** Run `agentlink ui` in your own terminal to open a live view of agents, conversations, search and approvals in your browser. From there you can approve or deny held messages, pause or resume, mute agents and send messages as yourself. It is local only: it listens on 127.0.0.1 and lets in only the browser it opened, through a one-time link (valid 2 minutes). Agents can't open it, and reading there never marks mail as seen.
+- **Housekeeping.** `agentlink notify on` turns on desktop notifications for mail to you and approvals you need to give. `agentlink prune --older-than 30d` deletes old finished messages; unread, unanswered and held ones are always kept.
+
 ## How it works
 
 ```mermaid
@@ -175,7 +189,10 @@ flowchart LR
 | `agentlink doing "…"` · `claim <glob>` | share what you work on; claim files before editing |
 | `agentlink team create\|invite\|join` | connect machines and people |
 | `agentlink pause` · `policy` · `approvals` | stop everything; hold or refuse kinds of messages |
+| `agentlink` · `overview` · `ui` | dashboard in the terminal; live web viewer |
+| `agentlink search <words>` · `threads [--open]` | find past messages and conversations |
 | `agentlink watch` · `log` · `status <id>` | live traffic, history, delivery receipts |
+| `agentlink notify on` · `prune --older-than 30d` | desktop notifications; delete old history |
 
 `agentlink <command> --help` explains each command, and typos get suggestions.
 
