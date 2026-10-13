@@ -65,6 +65,10 @@ export const ClientFrameSchema = z.discriminatedUnion("t", [
   }),
   z.object({ t: z.literal("send"), id: z.string().max(64), to: z.string(), blob: SealedSchema }),
   z.object({ t: z.literal("ack"), ids: z.array(z.string()).max(500) }),
+  /** Drop reports (by the sender's own frame ids) the client applied; the relay forgets them. */
+  z.object({ t: z.literal("dropped_ack"), ids: z.array(z.string().max(64)).max(500) }),
+  /** Send these queued messages again (their sender has just appeared in the roster). */
+  z.object({ t: z.literal("replay"), ids: z.array(z.string().max(64)).max(500) }),
   z.object({ t: z.literal("presence"), box: TeamBoxSchema }),
   z.object({ t: z.literal("remove"), deviceId: z.string() }),
   z.object({ t: z.literal("ping") }),
@@ -103,6 +107,12 @@ export const ServerFrameSchema = z.discriminatedUnion("t", [
   z.object({ t: z.literal("presence"), deviceId: Id, box: TeamBoxSchema, at: At }),
   z.object({ t: z.literal("online"), deviceId: Id, online: z.boolean() }),
   z.object({ t: z.literal("sent"), id: Id, queued: z.boolean() }),
+  /** Sent frames (by the sender's `send` id) the relay dropped unread: recipient removed, or expired. */
+  z.object({
+    t: z.literal("dropped"),
+    ids: z.array(Id).max(500),
+    reason: z.enum(["removed", "expired"]),
+  }),
   z.object({ t: z.literal("ok"), op: Id, ref: Id.optional() }),
   z.object({ t: z.literal("pong") }),
   z.object({ t: z.literal("code"), box: TeamBoxSchema }),

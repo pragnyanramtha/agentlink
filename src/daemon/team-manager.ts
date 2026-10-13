@@ -17,7 +17,7 @@ import type { DaemonContext } from "./context.ts";
 import type { DeliveryEngine } from "./delivery.ts";
 import { type Mailbox, remoteHandleOf } from "./mailbox.ts";
 import { isLive, type Registry } from "./registry.ts";
-import { fetchCode, RelayClient } from "./relay-client.ts";
+import { fetchCode, LeaveClient, RelayClient } from "./relay-client.ts";
 import { clearTeam, deviceKeys, loadTeam, saveTeam, type TeamState } from "./team.ts";
 import {
   type AgentRow,
@@ -36,9 +36,12 @@ const RECEIPT_STATES = new Set([
   "expired",
   "failed",
 ]);
-const PARKED_MAX = 1_000;
-const PARKED_MS = 15 * 60_000;
+/** Receipts held while off the team (or for a teammate off the roster), and for how long. */
+const HELD_MAX = 1_000;
+const HELD_MS = 24 * 3600_000;
 type Receipt = Parameters<NonNullable<Mailbox["remote"]>["receipt"]>[1];
+/** A leave that still has to reach its relay: everything a signed hello needs. */
+type PendingLeave = { relay: string; teamId: string; teamName?: string; handle?: string };
 const RANK: Record<string, number> = {
   held: 2,
   delivered: 3,
@@ -57,13 +60,12 @@ export class TeamManager {
   readonly #mailbox: Mailbox;
   readonly #engine: DeliveryEngine;
   readonly #sentReceipts = new Map<number, string>();
-  /** Receipts for a teammate missing from the roster (e.g. re-joining), sent once it is back. */
-  #parked: { handle: string; at: number; r: Receipt }[] = [];
-  #parkDrops = 0;
-  /** The team this machine last left (receipts wait for a re-join), and deliveries changed since. */
+  /** The team this machine last left (receipts wait for a re-join); survives restarts. */
   #left: string | undefined;
-  readonly #later = new Set<number>();
   #client: RelayClient | undefined;
+  /** Retries for leaves that could not reach the relay yet, by team id. */
+  readonly #leavers = new Map<string, LeaveClient>();
+  #stopped = false;
   #heartbeat: NodeJS.Timeout | undefined;
 
   constructor(ctx: DaemonContext, registry: Registry, mailbox: Mailbox, engine: DeliveryEngine) {
@@ -71,6 +73,7 @@ export class TeamManager {
     this.#registry = registry;
     this.#mailbox = mailbox;
     this.#engine = engine;
+    this.#left = ctx.store.getMeta("left_team");
     ctx.events.subscribe((event) => {
       if (event.type === "agent") this.#client?.publishPresence();
       if (event.type === "delivery") this.#maybeReceipt(Number(event.delivery.id));
@@ -81,13 +84,90 @@ export class TeamManager {
     return this.#client;
   }
 
-  /** Reconnects to the team saved on disk, if any. */
+  /** Reconnects to the team saved on disk, if any, and resumes leaves that never reached it. */
   resume(): void {
     const team = loadTeam(this.#ctx.paths);
     if (team)
       void this.#attach(team, { kind: "hello" }).catch((e) =>
         this.#ctx.log.warn("relay attach failed", { error: String(e) }),
       );
+    for (const row of this.#ctx.store.all<{ team_id: string; record: string }>(
+      "SELECT team_id, record FROM pending_leaves",
+    )) {
+      if (row.team_id === team?.teamId) {
+        this.#ctx.store.run("DELETE FROM pending_leaves WHERE team_id = ?", row.team_id);
+        continue; // back on that team already
+      }
+      try {
+        this.#startLeaver(JSON.parse(row.record) as PendingLeave);
+      } catch {
+        this.#ctx.store.run("DELETE FROM pending_leaves WHERE team_id = ?", row.team_id);
+      }
+    }
+  }
+
+  /** Starts (once) the retry that takes a leave to its relay; `onDone` deletes the record. */
+  #startLeaver(leave: PendingLeave): void {
+    if (this.#stopped || this.#leavers.has(leave.teamId)) return;
+    if (!this.#ctx.store.get("SELECT 1 FROM pending_leaves WHERE team_id = ?", leave.teamId))
+      return; // cancelled while it waited to start (e.g. a quick re-join)
+    const leaver = new LeaveClient(this.#ctx, leave, deviceKeys(this.#ctx.paths));
+    leaver.wanted = () =>
+      !!this.#ctx.store.get("SELECT 1 FROM pending_leaves WHERE team_id = ?", leave.teamId);
+    leaver.onDone = () => {
+      this.#leavers.delete(leave.teamId);
+      this.#ctx.store.run("DELETE FROM pending_leaves WHERE team_id = ?", leave.teamId);
+    };
+    this.#leavers.set(leave.teamId, leaver);
+    leaver.start();
+  }
+
+  /** Records a leave that still has to reach the relay (the retry is started by the caller). */
+  #leavePending(team: TeamState): PendingLeave {
+    const leave: PendingLeave = {
+      relay: team.relay,
+      teamId: team.teamId,
+      teamName: team.teamName,
+      handle: team.handle,
+    };
+    this.#ctx.store.run(
+      "INSERT OR REPLACE INTO pending_leaves (team_id, record, at) VALUES (?, ?, ?)",
+      team.teamId,
+      JSON.stringify(leave),
+      new Date().toISOString(),
+    );
+    return leave;
+  }
+
+  /**
+   * Stops a leave retry for `teamId` and deletes its record (the machine joined it again),
+   * returning the record so a failed join can put it back.
+   */
+  #cancelLeave(teamId: string): PendingLeave | undefined {
+    const leaver = this.#leavers.get(teamId);
+    this.#leavers.delete(teamId);
+    leaver?.stop();
+    const row = this.#ctx.store.get<{ record: string }>(
+      "SELECT record FROM pending_leaves WHERE team_id = ?",
+      teamId,
+    );
+    this.#ctx.store.run("DELETE FROM pending_leaves WHERE team_id = ?", teamId);
+    try {
+      return row ? (JSON.parse(row.record) as PendingLeave) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Puts a leave back on record and resumes its retry (a re-join of that team failed). */
+  #oweLeave(leave: PendingLeave): void {
+    this.#ctx.store.run(
+      "INSERT OR REPLACE INTO pending_leaves (team_id, record, at) VALUES (?, ?, ?)",
+      leave.teamId,
+      JSON.stringify(leave),
+      new Date().toISOString(),
+    );
+    this.#startLeaver(leave);
   }
 
   async #attach(
@@ -261,10 +341,10 @@ export class TeamManager {
     }
   }
 
-  /** Our copy for `handle` will never leave this machine: its deliveries fail, authors are told. */
+  /** Our copy for `handle` will never reach its machine: its deliveries fail, authors are told. */
   #failed(messageId: string, handle: string, note: string): void {
     for (const d of this.#ctx.store.all<{ to_addr: string }>(
-      "SELECT to_addr FROM deliveries WHERE message_id = ? AND to_agent_id IS NULL AND (to_addr = ? OR to_addr LIKE ?)",
+      "SELECT to_addr FROM deliveries WHERE message_id = ? AND to_agent_id IS NULL AND (to_addr = ? OR to_addr LIKE ?) AND state IN ('queued', 'sent')",
       messageId,
       `@${handle}`,
       `${handle}/%`,
@@ -298,8 +378,9 @@ export class TeamManager {
     );
     if (d?.m_trust !== "teammate") return;
     if (!this.#client) {
-      // This machine is off the team (e.g. re-joining): reported once it is back.
-      if (this.#later.size < PARKED_MAX) this.#later.add(deliveryId);
+      // This machine is off the team (e.g. re-joining): reported once it is back. The hold
+      // is on disk, so a restart loses neither the receipt nor which team it is for.
+      if (this.#left) this.#hold(deliveryId);
       return;
     }
     // A message released from hold (approved) is reported as delivered.
@@ -324,32 +405,83 @@ export class TeamManager {
     });
   }
 
+  /** Holds `deliveryId`'s receipt for a re-join of the team this machine left. */
+  #hold(deliveryId: number): void {
+    this.#pruneHeld();
+    this.#ctx.store.run(
+      "INSERT OR REPLACE INTO held_receipts (delivery_id, team_id, at) VALUES (?, ?, ?)",
+      deliveryId,
+      this.#left as string,
+      new Date().toISOString(),
+    );
+  }
+
+  /** A receipt for a teammate missing from the roster is held on disk until it is back. */
   #park(handle: string, r: Receipt): void {
-    this.#parked.push({ handle, at: Date.now(), r });
-    if (this.#parked.length > PARKED_MAX && ++this.#parkDrops % 100 === 1)
-      this.#ctx.log.warn("too many receipts for teammates off the team; dropping the oldest");
-    if (this.#parked.length > PARKED_MAX) this.#parked.shift();
+    const teamId = this.#client?.team.teamId ?? this.#left;
+    if (!teamId) return;
+    this.#pruneHeld();
+    this.#ctx.store.run(
+      "INSERT INTO held_receipts (team_id, handle, receipt, at) VALUES (?, ?, ?, ?)",
+      teamId,
+      handle,
+      JSON.stringify(r),
+      new Date().toISOString(),
+    );
+  }
+
+  #pruneHeld(): void {
+    this.#ctx.store.run(
+      "DELETE FROM held_receipts WHERE at < ?",
+      new Date(Date.now() - HELD_MS).toISOString(),
+    );
+    this.#ctx.store.run(
+      `DELETE FROM held_receipts WHERE id IN
+         (SELECT id FROM held_receipts ORDER BY id DESC LIMIT -1 OFFSET ?)`,
+      HELD_MAX,
+    );
   }
 
   #unpark(client: RelayClient): void {
     if (client !== this.#client) return;
-    if (this.#later.size) {
-      const later = [...this.#later];
-      this.#later.clear();
-      for (const id of later) this.#maybeReceipt(id);
+    const teamId = client.team.teamId;
+    for (const row of this.#ctx.store.all<{ id: number; delivery_id: number }>(
+      "SELECT id, delivery_id FROM held_receipts WHERE team_id = ? AND delivery_id IS NOT NULL",
+      teamId,
+    )) {
+      this.#ctx.store.run("DELETE FROM held_receipts WHERE id = ?", row.id);
+      this.#maybeReceipt(row.delivery_id);
     }
-    if (this.#parked.length === 0) return;
     const here = new Set(client.handles());
-    const parked = this.#parked;
-    this.#parked = [];
     let expired = 0;
-    for (const p of parked) {
-      if (Date.now() - p.at > PARKED_MS) expired++;
-      else if (!here.has(p.handle) || client.sendTo(p.handle, { kind: "receipt", ...p.r }) === 0)
-        this.#parked.push(p);
+    for (const row of this.#ctx.store.all<{
+      id: number;
+      handle: string;
+      receipt: string;
+      at: string;
+    }>(
+      "SELECT id, handle, receipt, at FROM held_receipts WHERE team_id = ? AND handle IS NOT NULL ORDER BY id",
+      teamId,
+    )) {
+      const stale = Date.now() - Date.parse(row.at) > HELD_MS;
+      if (stale) expired++;
+      if (
+        stale ||
+        (here.has(row.handle) &&
+          client.sendTo(row.handle, {
+            kind: "receipt",
+            ...(JSON.parse(row.receipt) as Receipt),
+          }) > 0)
+      )
+        this.#ctx.store.run("DELETE FROM held_receipts WHERE id = ?", row.id);
     }
     if (expired)
       this.#ctx.log.info("dropped receipts for teammates that did not come back", { expired });
+    if (teamId === this.#left) {
+      // Back on the team these receipts waited for: nothing is owed to it anymore.
+      this.#left = undefined;
+      this.#ctx.store.setMeta("left_team", undefined);
+    }
   }
 
   /** The name the sender used for this delivery's agent (filed under its new name if renamed). */
@@ -408,7 +540,14 @@ export class TeamManager {
       joinedAt: new Date().toISOString(),
     };
     this.#leftovers(team.teamId);
-    await this.#attach(team, { kind: "create", ...(createToken ? { createToken } : {}) });
+    // Creating that team again makes a pending leave obsolete; if the create fails it is owed.
+    const owed = this.#cancelLeave(team.teamId);
+    try {
+      await this.#attach(team, { kind: "create", ...(createToken ? { createToken } : {}) });
+    } catch (error) {
+      if (owed) this.#oweLeave(owed);
+      throw error;
+    }
     saveTeam(this.#ctx.paths, team);
     this.#announce("created", team);
     return this.status();
@@ -499,7 +638,15 @@ export class TeamManager {
       joinedAt: new Date().toISOString(),
     };
     this.#leftovers(team.teamId);
-    await this.#attach(team, { kind: "join", token: invite.token });
+    // Rejoining makes a pending remove for this team obsolete; the record goes first so a
+    // retry already in flight sees it gone. If the join is refused, the leave is still owed.
+    const owed = this.#cancelLeave(team.teamId);
+    try {
+      await this.#attach(team, { kind: "join", token: invite.token });
+    } catch (error) {
+      if (owed) this.#oweLeave(owed);
+      throw error;
+    }
     saveTeam(this.#ctx.paths, team);
     this.#announce("joined", team);
     return { ...this.status(), invitedBy: invite.by };
@@ -524,11 +671,25 @@ export class TeamManager {
     // Stop this client even if a new one is attached before the timer fires.
     const old = this.#client;
     old?.removeSelf();
-    setTimeout(() => old?.stop(), 300).unref();
+    // The leave may not have reached the relay (outage, backoff): a retry takes it there as
+    // soon as the relay is reachable, even after a restart. It starts once the old client is
+    // down, so the relay does not take its hello for a reconnect and replace the old socket.
+    const pending = team ? this.#leavePending(team) : undefined;
+    setTimeout(() => {
+      old?.stop();
+      try {
+        if (pending) this.#startLeaver(pending);
+      } catch {
+        // daemon is closing: the retry resumes at its next start
+      }
+    }, 300).unref();
     this.#client = undefined;
     this.#mailbox.remote = undefined;
-    // Receipts wait (in the outbox and parked) in case this machine re-joins the same team.
-    this.#left = team?.teamId;
+    // Receipts wait (in the outbox and held) in case this machine re-joins the same team.
+    if (team) {
+      this.#left = team.teamId;
+      this.#ctx.store.setMeta("left_team", team.teamId);
+    }
     clearInterval(this.#heartbeat);
     clearTeam(this.#ctx.paths);
     this.#ctx.store.run("DELETE FROM members");
@@ -542,16 +703,20 @@ export class TeamManager {
   }
 
   stop(): void {
+    this.#stopped = true;
     clearInterval(this.#heartbeat);
     this.#client?.stop();
+    for (const leaver of this.#leavers.values()) leaver.stop();
   }
 
   /** Receipts left from a team this machine left are dropped unless it re-joins that team. */
   #leftovers(teamId: string): void {
     if (teamId === this.#left) return;
     this.#ctx.store.run("DELETE FROM outbox");
-    this.#parked = [];
-    this.#later.clear();
+    this.#ctx.store.run("DELETE FROM sent_frames");
+    this.#ctx.store.run("DELETE FROM held_receipts");
+    this.#left = undefined;
+    this.#ctx.store.setMeta("left_team", undefined);
   }
 
   /** Messages from teammates carry this device's identity in their receipts. */

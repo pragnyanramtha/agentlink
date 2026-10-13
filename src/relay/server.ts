@@ -31,9 +31,14 @@ CREATE TABLE IF NOT EXISTS invites (
 );
 CREATE TABLE IF NOT EXISTS queue (
   id TEXT PRIMARY KEY, team_id TEXT NOT NULL, to_device TEXT NOT NULL, from_device TEXT NOT NULL,
-  blob TEXT NOT NULL, bytes INTEGER NOT NULL, at TEXT NOT NULL
+  blob TEXT NOT NULL, bytes INTEGER NOT NULL, at TEXT NOT NULL, frame_id TEXT
 );
 CREATE INDEX IF NOT EXISTS queue_to ON queue(team_id, to_device, at);
+CREATE TABLE IF NOT EXISTS dropped (
+  team_id TEXT NOT NULL, device_id TEXT NOT NULL, frame_id TEXT NOT NULL, reason TEXT NOT NULL,
+  at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dropped_to ON dropped(team_id, device_id, at);
 CREATE TABLE IF NOT EXISTS presence (
   team_id TEXT NOT NULL, device_id TEXT NOT NULL, box TEXT NOT NULL, at TEXT NOT NULL,
   PRIMARY KEY (team_id, device_id)
@@ -47,9 +52,13 @@ CREATE TABLE IF NOT EXISTS codes (
 const QUEUE_TTL_MS = 7 * 24 * 3600_000;
 const MAX_QUEUE_PER_DEVICE = 5_000;
 const MAX_QUEUE_BYTES_PER_DEVICE = 100 * 1024 * 1024;
+/** Drop reports kept for an offline sender device (oldest forgotten first). */
+const MAX_DROPPED_PER_DEVICE = 5_000;
 const RATE_PER_MINUTE = 600;
 const FRAMES_PER_MINUTE = 1_200;
 const ACKS_PER_MINUTE = 100_000;
+/** Queued messages a device may ask to have sent again (each costs the relay a full send). */
+const REPLAYS_PER_MINUTE = 2_000;
 const BYTES_PER_MINUTE = 50 * 1024 * 1024;
 const MAX_PRESENCE_BYTES = 64 * 1024;
 // Quotas for a public relay (anyone may create a team).
@@ -66,6 +75,7 @@ interface Conn {
   minute: number;
   framesThisMinute: number;
   acksThisMinute: number;
+  replaysThisMinute: number;
   bytesThisMinute: number;
   codeTries: number;
   /** Queued messages sent on this connection and not acked yet (backlog paging). */
@@ -114,6 +124,13 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
   db.exec(SCHEMA);
+  // Queues created before drop reports lack the sender's frame id.
+  if (
+    !(db.prepare("PRAGMA table_info(queue)").all() as { name: string }[]).some(
+      (c) => c.name === "frame_id",
+    )
+  )
+    db.exec("ALTER TABLE queue ADD COLUMN frame_id TEXT");
   const log = opts.logger;
   const conns = new Set<Conn>();
   const q = <T>(sql: string, ...p: (string | number | null)[]) => db.prepare(sql).all(...p) as T[];
@@ -152,6 +169,47 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
   const broadcastRoster = (teamId: string) => {
     const r = roster(teamId);
     for (const c of peersOf(teamId)) send(c, { t: "roster", ...r });
+  };
+  const sendDropped = (c: Conn, ids: string[], reason: "removed" | "expired") => {
+    for (let i = 0; i < ids.length; i += 500)
+      send(c, { t: "dropped", ids: ids.slice(i, i + 500), reason });
+  };
+  // Queued messages dropped unread are reported to their senders by their own frame ids:
+  // metadata the relay holds anyway. Reports are always stored and only the sender's
+  // dropped_ack removes them — one sent to a live socket may still die on the wire.
+  const reportDropped = (
+    teamId: string,
+    rows: { from_device: string; frame_id: string | null }[],
+    reason: "removed" | "expired",
+  ) => {
+    const bySender = new Map<string, string[]>();
+    for (const r of rows) {
+      if (!r.frame_id) continue;
+      const ids = bySender.get(r.from_device) ?? [];
+      ids.push(r.frame_id);
+      bySender.set(r.from_device, ids);
+    }
+    const now = new Date().toISOString();
+    for (const [device, ids] of bySender) {
+      for (const id of ids)
+        run(
+          "INSERT INTO dropped (team_id, device_id, frame_id, reason, at) VALUES (?, ?, ?, ?, ?)",
+          teamId,
+          device,
+          id,
+          reason,
+          now,
+        );
+      run(
+        `DELETE FROM dropped WHERE rowid IN (SELECT rowid FROM dropped WHERE team_id = ? AND device_id = ?
+           ORDER BY at DESC, rowid DESC LIMIT -1 OFFSET ?)`,
+        teamId,
+        device,
+        MAX_DROPPED_PER_DEVICE,
+      );
+      for (const p of peersOf(teamId).filter((p) => p.deviceId === device))
+        sendDropped(p, ids, reason);
+    }
   };
 
   const verifySigned = (
@@ -222,6 +280,16 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         send(other, { t: "online", deviceId: c.deviceId as string, online: true });
         send(c, { t: "online", deviceId: other.deviceId as string, online: true });
       }
+    }
+    // Unacked drop reports go out again at every welcome; dropped_ack deletes them.
+    for (const reason of ["removed", "expired"] as const) {
+      const ids = q<{ frame_id: string }>(
+        "SELECT frame_id FROM dropped WHERE team_id = ? AND device_id = ? AND reason = ? ORDER BY at, rowid",
+        teamId,
+        c.deviceId as string,
+        reason,
+      ).map((r) => r.frame_id);
+      sendDropped(c, ids, reason);
     }
     flushQueue(c);
   };
@@ -482,7 +550,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         const id = ulid();
         const blob = JSON.stringify(frame.blob);
         run(
-          "INSERT INTO queue (id, team_id, to_device, from_device, blob, bytes, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO queue (id, team_id, to_device, from_device, blob, bytes, at, frame_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           id,
           teamId,
           frame.to,
@@ -490,6 +558,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
           blob,
           blob.length,
           now,
+          frame.id,
         );
         const targets = peersOf(teamId).filter((p) => p.deviceId === frame.to);
         for (const t of targets)
@@ -534,6 +603,31 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         if (c.inFlight && c.inFlight.size <= Math.floor((c.pageSize ?? 0) / 10)) flushQueue(c);
         return;
       }
+      case "dropped_ack": {
+        for (const id of frame.ids)
+          run(
+            "DELETE FROM dropped WHERE team_id = ? AND device_id = ? AND frame_id = ?",
+            teamId,
+            c.deviceId,
+            id,
+          );
+        return;
+      }
+      case "replay": {
+        c.replaysThisMinute += frame.ids.length;
+        if (c.replaysThisMinute > REPLAYS_PER_MINUTE)
+          return send(c, { t: "error", code: "rate", message: "too many replays; slow down" });
+        for (const id of frame.ids) {
+          const r = one<{ from_device: string; blob: string; at: string }>(
+            "SELECT from_device, blob, at FROM queue WHERE id = ? AND team_id = ? AND to_device = ?",
+            id,
+            teamId,
+            c.deviceId,
+          );
+          if (r) send(c, { t: "msg", id, from: r.from_device, blob: JSON.parse(r.blob), at: r.at });
+        }
+        return;
+      }
       case "presence": {
         if (frame.box.ct.length > MAX_PRESENCE_BYTES) {
           return send(c, { t: "error", code: "too_large", message: "presence is too large" });
@@ -563,6 +657,15 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
           now,
           teamId,
           frame.deviceId,
+        );
+        reportDropped(
+          teamId,
+          q(
+            "SELECT from_device, frame_id FROM queue WHERE team_id = ? AND to_device = ?",
+            teamId,
+            frame.deviceId,
+          ),
+          "removed",
         );
         run("DELETE FROM queue WHERE team_id = ? AND to_device = ?", teamId, frame.deviceId);
         for (const p of peersOf(teamId))
@@ -605,6 +708,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
       minute: 0,
       framesThisMinute: 0,
       acksThisMinute: 0,
+      replaysThisMinute: 0,
       bytesThisMinute: 0,
       codeTries: 0,
       ip: fromProxy && forwarded ? forwarded : direct,
@@ -617,6 +721,7 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         c.sentThisMinute = 0;
         c.framesThisMinute = 0;
         c.acksThisMinute = 0;
+        c.replaysThisMinute = 0;
         c.bytesThisMinute = 0;
       }
       c.bytesThisMinute += (data as Buffer).length ?? 0;
@@ -630,17 +735,17 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
         }
       }
       // Acks are budgeted by id (catching up on a backlog takes many), other frames by count.
-      if (frame?.t === "ack") c.acksThisMinute += frame.ids.length;
+      if (frame?.t === "ack" || frame?.t === "dropped_ack") c.acksThisMinute += frame.ids.length;
       else c.framesThisMinute++;
       const over =
         c.bytesThisMinute > BYTES_PER_MINUTE ||
-        (frame?.t === "ack"
+        (frame?.t === "ack" || frame?.t === "dropped_ack"
           ? c.acksThisMinute > ACKS_PER_MINUTE
           : c.framesThisMinute > FRAMES_PER_MINUTE);
       if (over) {
         const ref = frame?.t === "send" ? { ref: frame.id } : {};
         send(c, { t: "error", code: "rate", message: "too many frames; slow down", ...ref });
-        if (frame?.t === "ack") c.framesThisMinute++;
+        if (frame?.t === "ack" || frame?.t === "dropped_ack") c.framesThisMinute++;
         if (c.framesThisMinute > FRAMES_PER_MINUTE * 2) ws.close(4008, "rate limited");
         return;
       }
@@ -671,7 +776,18 @@ export async function startRelay(opts: RelayOptions): Promise<RunningRelay> {
 
   const gc = setInterval(() => {
     const cutoff = new Date(Date.now() - QUEUE_TTL_MS).toISOString();
+    const expired = q<{ team_id: string; from_device: string; frame_id: string | null }>(
+      "SELECT team_id, from_device, frame_id FROM queue WHERE at < ?",
+      cutoff,
+    );
+    for (const teamId of new Set(expired.map((r) => r.team_id)))
+      reportDropped(
+        teamId,
+        expired.filter((r) => r.team_id === teamId),
+        "expired",
+      );
     run("DELETE FROM queue WHERE at < ?", cutoff);
+    run("DELETE FROM dropped WHERE at < ?", cutoff);
     run("DELETE FROM seen_nonces WHERE at < ?", Date.now() - 2 * CLOCK_SKEW_MS);
     run("DELETE FROM codes WHERE expires_at < ?", new Date().toISOString());
   }, 60_000);

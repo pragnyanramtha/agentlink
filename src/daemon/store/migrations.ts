@@ -186,4 +186,40 @@ export const MIGRATIONS: string[] = [
   CREATE INDEX runs_agent ON runs(agent_id, created_at);
   CREATE INDEX runs_state ON runs(state);
   `,
+  // 8: frames the relay accepted, until the teammate's machine answers (the relay reports frames
+  // it dropped unread by these ids)
+  `
+  CREATE TABLE sent_frames (
+    id TEXT PRIMARY KEY,                               -- frame id
+    message_id TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    at TEXT NOT NULL
+  );
+  CREATE INDEX sent_frames_message ON sent_frames(message_id);
+  CREATE INDEX sent_frames_at ON sent_frames(at);
+  `,
+  // 9: receipts held while off the team (a restart must not lose them). delivery_id rows are
+  // re-derived on rejoin; handle+receipt rows are frozen receipts for a teammate off the roster.
+  `
+  CREATE TABLE held_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id TEXT NOT NULL,
+    delivery_id INTEGER,                               -- a delivery that owes a receipt
+    handle TEXT,                                       -- teammate a frozen receipt is for
+    receipt TEXT,                                      -- its JSON {messageId, to, state, note}
+    at TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX held_receipts_delivery ON held_receipts(delivery_id)
+    WHERE delivery_id IS NOT NULL;
+  CREATE INDEX held_receipts_team ON held_receipts(team_id);
+  `,
+  // 10: a `team leave` that could not reach the relay yet; the record has everything a signed
+  // hello needs (the device keys are on disk), so the remove still goes out after a restart.
+  `
+  CREATE TABLE pending_leaves (
+    team_id TEXT PRIMARY KEY,
+    record TEXT NOT NULL,                              -- JSON {relay, teamId, teamName, handle}
+    at TEXT NOT NULL
+  );
+  `,
 ];

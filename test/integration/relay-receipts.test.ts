@@ -170,10 +170,73 @@ describe("receipts from a teammate", () => {
     await rejoin(bob);
     expect(await until(() => stateAt(alice, sent.data.message.id) === "seen", 8_000)).toBe(true);
   }, 30_000);
+
+  it("waiting in the outbox survive a restart while this machine is off the team", async () => {
+    const id = await deliveredToBob("read before the restart?");
+    bob.daemon.services.team.client?.stop(); // bob's receipt waits in its outbox
+    await inboxItem(bob, "codex-renamed", "read before the restart?");
+    expect(outbox(bob)).toBeGreaterThan(0);
+    await bob.raw("POST", "/v1/team/leave", {});
+    await restartBob();
+    await rejoin(bob);
+    expect(await until(() => stateAt(alice, id) === "seen", 8_000)).toBe(true);
+  }, 30_000);
+
+  it("for mail read while off the team survive a restart", async () => {
+    const id = await deliveredToBob("read while away, then restarted?");
+    await bob.raw("POST", "/v1/team/leave", {});
+    await inboxItem(bob, "codex-renamed", "read while away, then restarted?");
+    await restartBob();
+    await rejoin(bob);
+    expect(await until(() => stateAt(alice, id) === "seen", 8_000)).toBe(true);
+  }, 30_000);
+
+  it("are dropped when this machine joins a different team", async () => {
+    await register(bob, "codex-two");
+    await deliveredToBob("read before switching teams?");
+    await deliveredToBob("read after leaving, before switching teams?", "codex-two");
+    bob.daemon.services.team.client?.stop();
+    await inboxItem(bob, "codex-renamed", "read before switching teams?");
+    await bob.raw("POST", "/v1/team/leave", {});
+    await inboxItem(bob, "codex-two", "read after leaving, before switching teams?");
+    await restartBob();
+    expect({ outbox: outbox(bob) > 0, held: held(bob) > 0 }).toEqual({ outbox: true, held: true });
+    const carol = await startTestDaemon({ handle: "carol" });
+    try {
+      await carol.raw("POST", "/v1/team/create", { name: "beta", relay: relay.url });
+      const inv = await carol.raw<{ invite: string }>("POST", "/v1/team/invite", { uses: 1 });
+      expect((await bob.raw("POST", "/v1/team/join", { invite: inv.data.invite })).status).toBe(
+        200,
+      );
+      expect({ outbox: outbox(bob), held: held(bob) }).toEqual({ outbox: 0, held: 0 });
+    } finally {
+      await carol.stop();
+    }
+  }, 30_000);
 });
 
+async function deliveredToBob(text: string, agent = "codex-renamed") {
+  expect(await sees(bob, "alice/claude-web")).toBe(true);
+  expect(await sees(alice, `bob/${agent}`)).toBe(true);
+  const sent = await alice.raw<{ message: { id: string } }>(
+    "POST",
+    "/v1/messages",
+    { to: [`bob/${agent}`], kind: "ask", text },
+    { as: "claude-web" },
+  );
+  expect(await until(() => stateAt(alice, sent.data.message.id) === "delivered", 8_000)).toBe(true);
+  return sent.data.message.id;
+}
+async function restartBob() {
+  const home = bob.home;
+  await bob.stop(true);
+  bob = await startTestDaemon({ handle: "bob", home });
+  await register(bob, "codex-renamed");
+}
 const outbox = (t: TestDaemon) =>
   t.daemon.services.ctx.store.get<{ n: number }>("SELECT COUNT(*) AS n FROM outbox")?.n ?? 0;
+const held = (t: TestDaemon) =>
+  t.daemon.services.ctx.store.get<{ n: number }>("SELECT COUNT(*) AS n FROM held_receipts")?.n ?? 0;
 async function rejoin(t: TestDaemon) {
   const inv = await alice.raw<{ invite: string }>("POST", "/v1/team/invite", { uses: 1 });
   expect((await t.raw("POST", "/v1/team/join", { invite: inv.data.invite })).status).toBe(200);

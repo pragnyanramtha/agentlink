@@ -131,6 +131,12 @@ const RESEND_MS = 30_000;
 /** Receipts kept for devices off the team, and for how long. */
 const WAITING_MAX = 1_000;
 const WAITING_MS = 15 * 60_000;
+/** Accepted frames remembered until answered (the relay reports drops by frame id), at most. */
+const SENT_MAX = 50_000;
+const SENT_MS = 8 * 24 * 3600_000;
+/** Messages from devices missing from the roster, held at the relay for at most this long. */
+const UNKNOWN_MAX = 1_000;
+const UNKNOWN_SENDER_MS = 10 * 60_000;
 
 /** Keeps one authenticated WebSocket to the team relay; seals, verifies and routes traffic. */
 export class RelayClient {
@@ -161,10 +167,15 @@ export class RelayClient {
   /** Receipts refused because their device had left the team, oldest first. */
   #waiting: { id: string; frame: string; to: string; at: number }[] = [];
   #ackTimer: NodeJS.Timeout | undefined;
+  /** Messages (relay id) from devices missing from the roster: sender and when first seen. */
+  readonly #unknown = new Map<string, { from: string; at: number }>();
+  #unknownTimer: NodeJS.Timeout | undefined;
+  /** How long a message from a device missing from the roster may wait for it (tests). */
+  unknownSenderMs = UNKNOWN_SENDER_MS;
   onInbound?: (msg: Inbound) => void;
   /** The relay accepted a frame carrying `messageId` for `handle`. */
   onSent?: (messageId: string, handle: string) => void;
-  /** The relay refused a frame carrying `messageId` for `handle` for good. */
+  /** The relay refused (or dropped unread) a frame carrying `messageId` for `handle` for good. */
   onFailed?: (messageId: string, handle: string, note: string) => void;
   onRoster?: () => void;
   presenceSource?: () => Omit<RemoteAgent, "member" | "deviceId" | "at">[];
@@ -253,6 +264,8 @@ export class RelayClient {
     this.#stopped = true;
     clearInterval(this.#tick);
     clearTimeout(this.#pumpTimer);
+    clearTimeout(this.#unknownTimer);
+    this.#unknownTimer = undefined;
     this.#flushAcks();
     this.#ws?.close();
   }
@@ -320,6 +333,7 @@ export class RelayClient {
       this.#online.clear();
       this.#pending.clear();
       this.#acks = [];
+      if (this.#stopped) return;
       if (wasReady) this.#ctx.log.info("relay disconnected");
       if (code === 4000) {
         // The relay keeps one connection per device: another daemon with this device key took over.
@@ -327,8 +341,8 @@ export class RelayClient {
           "another agentlink daemon is using this device's relay connection; this one stops",
         );
         this.#stopped = true;
+        return;
       }
-      if (this.#stopped) return;
       setTimeout(() => this.#connect(), this.#backoff).unref();
       this.#backoff = Math.min(this.#backoff * 2, 30_000);
     });
@@ -367,6 +381,7 @@ export class RelayClient {
       case "roster":
         this.#setRoster(frame.roster);
         this.#pump(); // receipts waiting for a device that is back
+        this.#replay(); // messages waiting for their sender to appear (a welcome resends them all)
         return;
       case "online":
         if (frame.online) this.#online.add(frame.deviceId);
@@ -431,8 +446,39 @@ export class RelayClient {
         this.#ctx.store.run("DELETE FROM outbox WHERE id = ?", frame.id);
         this.#pending.delete(frame.id);
         if (Date.now() >= this.#holdUntil) this.#rateBackoff = 0;
-        if (row?.message_id && row.handle) this.onSent?.(row.message_id, row.handle);
+        if (row?.message_id && row.handle) {
+          this.#ctx.store.run(
+            "INSERT OR REPLACE INTO sent_frames (id, message_id, handle, at) VALUES (?, ?, ?, ?)",
+            frame.id,
+            row.message_id,
+            row.handle,
+            new Date().toISOString(),
+          );
+          this.onSent?.(row.message_id, row.handle);
+        }
         this.#pump();
+        return;
+      }
+      case "dropped": {
+        // Applied reports are acked so the relay forgets them; the rest come back at the
+        // next welcome (each is a no-op once its sent_frames row is gone).
+        for (const id of frame.ids) {
+          const row = this.#ctx.store.get<{ message_id: string; handle: string }>(
+            "SELECT message_id, handle FROM sent_frames WHERE id = ?",
+            id,
+          );
+          if (!row) continue;
+          this.#ctx.store.run("DELETE FROM sent_frames WHERE id = ?", id);
+          this.onFailed?.(
+            row.message_id,
+            row.handle,
+            frame.reason === "removed"
+              ? `not delivered: ${row.handle}'s device left the team before reading it`
+              : `not delivered: ${row.handle}'s device did not collect it from the relay within 7 days`,
+          );
+        }
+        if (this.#ws?.readyState === WebSocket.OPEN)
+          this.#ws.send(JSON.stringify({ t: "dropped_ack", ids: frame.ids }));
         return;
       }
       default:
@@ -514,9 +560,56 @@ export class RelayClient {
     if (gone) this.#ctx.log.info("dropped receipts for devices that left the team", { gone });
   }
 
+  /** Sends again the held messages whose sender the roster now lists. */
+  #replay(): void {
+    const ids = [...this.#unknown].filter(([, u]) => this.#members.has(u.from)).map(([id]) => id);
+    for (let i = 0; i < ids.length && this.#ws?.readyState === WebSocket.OPEN; i += 500)
+      this.#ws.send(JSON.stringify({ t: "replay", ids: ids.slice(i, i + 500) }));
+  }
+
+  /**
+   * A message from a device missing from the roster stays at the relay (it can't be verified yet)
+   * until the roster lists the device; one that is still unknown after `unknownSenderMs` is dropped.
+   */
+  #hold(frame: Extract<ServerFrame, { t: "msg" }>): void {
+    if (!this.#unknown.has(frame.id)) {
+      if (this.#unknown.size >= UNKNOWN_MAX) return; // waits for the next connection
+      this.#unknown.set(frame.id, { from: frame.from, at: Date.now() });
+    }
+    this.#unknownTimer ??= setTimeout(() => this.#expireUnknown(), this.unknownSenderMs);
+    this.#unknownTimer.unref();
+  }
+
+  #expireUnknown(): void {
+    this.#unknownTimer = undefined;
+    let next = Number.POSITIVE_INFINITY;
+    let dropped = 0;
+    for (const [id, u] of this.#unknown) {
+      const wait = u.at + this.unknownSenderMs - Date.now();
+      if (wait > 0 || !this.#ready) next = Math.min(next, wait > 0 ? wait : 1_000);
+      else if (this.#members.has(u.from)) {
+        this.#unknown.delete(id); // a replay went missing: the next connection brings it
+      } else {
+        this.#unknown.delete(id);
+        this.#ack(id);
+        dropped++;
+      }
+    }
+    if (dropped)
+      this.#ctx.log.warn("dropped messages from devices that never joined the team", { dropped });
+    if (next < Number.POSITIVE_INFINITY) {
+      this.#unknownTimer = setTimeout(() => this.#expireUnknown(), next);
+      this.#unknownTimer.unref();
+    }
+  }
+
   #onMsg(frame: Extract<ServerFrame, { t: "msg" }>): void {
     const member = this.#members.get(frame.from);
-    if (!member) return; // unknown sender: leave it queued until the roster explains it
+    if (!member) {
+      this.#hold(frame);
+      return;
+    }
+    this.#unknown.delete(frame.id);
     let raw: Record<string, unknown>;
     let inner: Sealable;
     try {
@@ -544,6 +637,12 @@ export class RelayClient {
       if (inner.kind === "envelope")
         this.onInbound?.({ kind: "envelope", envelope: inner.envelope, from: member });
       else {
+        // Its device has our frame, so the relay can no longer drop it.
+        this.#ctx.store.run(
+          "DELETE FROM sent_frames WHERE message_id = ? AND handle = ?",
+          inner.messageId,
+          member.handle,
+        );
         this.onInbound?.({
           kind: "receipt",
           messageId: inner.messageId,
@@ -656,11 +755,19 @@ export class RelayClient {
     this.#pump();
   }
 
-  /** Sends again what the relay never answered (e.g. dropped as over its frame budget). */
+  /** Sends again what the relay never answered (e.g. dropped as over its frame budget); prunes. */
   #resendStale(): void {
     for (const [id, at] of this.#pending)
       if (Date.now() - at >= RESEND_MS) this.#pending.delete(id);
     this.#pump();
+    this.#ctx.store.run(
+      "DELETE FROM sent_frames WHERE at < ?",
+      new Date(Date.now() - SENT_MS).toISOString(),
+    );
+    this.#ctx.store.run(
+      "DELETE FROM sent_frames WHERE id IN (SELECT id FROM sent_frames ORDER BY at DESC LIMIT -1 OFFSET ?)",
+      SENT_MAX,
+    );
   }
 
   /** Seals a signed payload to every device of `handle`; returns how many devices it went to. */
@@ -743,7 +850,94 @@ export class RelayClient {
   }
 
   removeSelf(): void {
-    this.#ws?.send(JSON.stringify({ t: "remove", deviceId: this.#keys.deviceId }));
+    if (this.#ws?.readyState === WebSocket.OPEN)
+      this.#ws.send(JSON.stringify({ t: "remove", deviceId: this.#keys.deviceId }));
+  }
+}
+
+/**
+ * Says goodbye for a team this machine left while the relay was unreachable: connects with a
+ * signed hello, sends `remove` for this device, and keeps retrying (backoff, and across daemon
+ * restarts via the caller's record) until the relay says the device is gone — then `onDone`.
+ */
+export class LeaveClient {
+  readonly #ctx: DaemonContext;
+  readonly #leave: { relay: string; teamId: string; teamName?: string };
+  readonly #keys: DeviceKeys;
+  #ws: WebSocket | undefined;
+  #stopped = false;
+  #backoff = 1_000;
+  /** The relay took the remove (or the device was already gone): the record can be deleted. */
+  onDone?: () => void;
+  /** Checked before sending remove (a re-join of this team makes the leave obsolete). */
+  wanted?: () => boolean;
+
+  constructor(
+    ctx: DaemonContext,
+    leave: { relay: string; teamId: string; teamName?: string },
+    keys: DeviceKeys,
+  ) {
+    this.#ctx = ctx;
+    this.#leave = leave;
+    this.#keys = keys;
+  }
+
+  start(): void {
+    this.#stopped = false;
+    this.#connect();
+  }
+
+  stop(): void {
+    this.#stopped = true;
+    this.#ws?.close();
+  }
+
+  #connect(): void {
+    if (this.#stopped) return;
+    const ws = new WebSocket(this.#leave.relay, {
+      handshakeTimeout: 10_000,
+      maxPayload: 1024 * 1024,
+    });
+    this.#ws = ws;
+    ws.on("open", () => {
+      const frame = {
+        t: "hello",
+        teamId: this.#leave.teamId,
+        ts: Date.now(),
+        nonce: randomToken(12),
+        deviceId: this.#keys.deviceId,
+      };
+      ws.send(JSON.stringify({ ...frame, sig: signJson(this.#keys, authPayload(frame)) }));
+    });
+    ws.on("message", (data) => {
+      if (ws !== this.#ws) return;
+      let frame: ServerFrame;
+      try {
+        frame = ServerFrameSchema.parse(JSON.parse(String(data)));
+      } catch {
+        return;
+      }
+      if (frame.t === "welcome") {
+        if (this.wanted && !this.wanted()) return this.#finish(); // re-joined meanwhile
+        ws.send(JSON.stringify({ t: "remove", deviceId: this.#keys.deviceId }));
+      } else if (frame.t === "ok" && frame.op === "remove") this.#finish();
+      else if (frame.t === "error") frame.code === "unknown_device" ? this.#finish() : ws.close();
+    });
+    ws.on("close", (code) => {
+      if (ws !== this.#ws || this.#stopped) return;
+      if (code === 4001) return this.#finish(); // the relay removed this device
+      setTimeout(() => this.#connect(), this.#backoff).unref();
+      this.#backoff = Math.min(this.#backoff * 2, 30_000);
+    });
+    ws.on("error", () => undefined); // the close event follows
+  }
+
+  #finish(): void {
+    if (this.#stopped) return;
+    this.#stopped = true;
+    this.#ctx.log.info("leave reached the relay", { team: this.#leave.teamName });
+    this.#ws?.close();
+    this.onDone?.();
   }
 }
 

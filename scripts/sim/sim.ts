@@ -40,6 +40,7 @@ const QUIESCE_S = Number(opt("--quiesce", "90"));
 const PRELOAD = Number(opt("--preload", "0")); // history messages per machine before the workload
 const STORM_EVERY = Number(opt("--storm-every", "0")); // seconds between concurrent-hook storms
 const SLOW_GIT = Number(opt("--slow-git-ms", "0")); // every git call on the machines takes this long
+const CHURN_EVERY = Number(opt("--churn-every", "0")); // seconds between team leave/rejoins (≥3 machines)
 mkdirSync(OUT, { recursive: true });
 
 const R = rng(SEED);
@@ -877,14 +878,17 @@ async function restartDaemon(m: Machine, kill: boolean) {
   for (const a of agents.filter((x) => x.m === m && x.sse && x.state !== "offline"))
     await m.w.call("agentCall", { key: a.key, op: "sse" });
 }
+let relayUp = true;
 async function relayOutage() {
   const w = workers[0] as WorkerApi;
   const kill = R.chance(0.4);
   chaos(`relay ${kill ? "SIGKILL" : "stop"}`);
   const t = Date.now();
+  relayUp = false;
   await w.call("relayStop", { signal: kill ? "SIGKILL" : "SIGTERM" });
   await sleep(R.int(4_000, 20_000));
   await w.call("relayRestart");
+  relayUp = true;
   relayDown.push([t, Date.now()]);
   chaos("relay back");
 }
@@ -913,12 +917,34 @@ async function renameOne() {
     a.name = r.data.agent.name;
   }
 }
+let churning = false;
 async function teamChurn() {
-  if (machines.length < 3) return;
+  if (machines.length < 3 || churning) return;
+  churning = true;
+  try {
+    await churnOnce();
+  } finally {
+    churning = false;
+  }
+}
+async function churnOnce() {
   const m = machines[machines.length - 2] as Machine;
+  // A daemon restarting or off the relay at that moment would fail the call (a harness artifact;
+  // a leave while disconnected never reaches the relay).
+  const connected = async (x: Machine) =>
+    x.up &&
+    !!((await human(x, "GET", "/v1/team")).data as { team?: { connected?: boolean } }).team
+      ?.connected;
+  const up = async (...ms: Machine[]) => {
+    const ready = async () => relayUp && (await Promise.all(ms.map(connected))).every(Boolean);
+    for (let i = 0; i < 600 && !(await ready()); i++) await sleep(200);
+  };
+  await up(m);
   chaos(`${m.name} leaves the team`);
   await human(m, "POST", "/v1/team/leave", {});
   await sleep(R.int(3_000, 8_000));
+  await up(machines[0] as Machine);
+  while (!m.up) await sleep(200);
   const inv = await human(machines[0] as Machine, "POST", "/v1/team/invite", {
     uses: 1,
     code: false,
@@ -1050,6 +1076,14 @@ async function stormLoop() {
     if (stopping || noNew) break;
     const m = R.pick(machines.filter((x) => x.up));
     if (m) await hookStorm(m).catch((e) => log("storm failed", String(e)));
+  }
+}
+async function churnLoop() {
+  if (!CHURN_EVERY) return;
+  while (!stopping && !noNew) {
+    await sleep(CHURN_EVERY * 1000);
+    if (stopping || noNew) break;
+    await teamChurn().catch((e) => log("churn failed", String(e)));
   }
 }
 
@@ -1640,7 +1674,7 @@ async function main() {
     await setup();
     await preload();
     const loops = agents.map((a) => agentLoop(a));
-    const bg = [chaosLoop(), approvalsLoop(), stormLoop()];
+    const bg = [chaosLoop(), approvalsLoop(), stormLoop(), churnLoop()];
     const end = T0 + MINUTES * 60_000;
     while (Date.now() < end) {
       await sleep(10_000);
