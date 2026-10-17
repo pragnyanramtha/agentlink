@@ -44,6 +44,16 @@ agentlink lets AI coding agents message each other. It is built from a local dae
 - Identity comes from authentication, never from message bodies: PID ancestry locally, Ed25519 signatures remotely.
 - Approvals are human-only (TTY or UI). They are never accepted from an agent, and never arrive as a message.
 
+## Cloud Agent environment
+
+Login shells resolve `node` to Node 24 at `/usr/local/lib/nodejs/bin`, which is what runs this repo's TypeScript directly. `/exec-daemon/node` is Node 22.14 and stops on `.ts` imports. `pnpm` is 11.17.0 through corepack (`COREPACK_ENABLE_DOWNLOAD_PROMPT=0`). `ss` from iproute2 is installed.
+
+The Cloud Agent kernel is built with `CONFIG_UNIX_DIAG` unset, so `ss` cannot name Unix-socket peers. The daemon logs that and trusts client claims. These tests need a kernel that reports socket peers, and they fail in this environment:
+
+- `test/unit/wsl.test.ts` — "runs against a real socket"
+- `test/integration/hook-latency.test.ts` — the shared-`ss` caller lookup
+- `pnpm test:security` — the caller-identity cases
+
 ## Live agent tests
 
 - Use OpenCode (`opencode run …` / its TUI) for routine live tests with real agents.
